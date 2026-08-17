@@ -1,0 +1,28 @@
+[Unit]
+Description=TCPeer stateful VPN server
+Documentation=https://github.com/tcppeer/tcppeer
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=tcppeer
+Group=tcppeer
+ExecStart=/usr/local/bin/tcppeer-server --config /etc/tcppeer/server.toml
+Restart=on-failure
+RestartSec=3s
+StandardOutput=journal
+StandardError=journal
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=true
+PrivateTmp=true
+RuntimeDirectory=tcppeer
+RuntimeDirectoryMode=0750
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/tcppeer
+DeviceAllow=/dev/net/tun rw
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">TCPeer</string>
+    <string name="notification_channel_name">VPN connection</string>
+    <string name="notification_channel_description">TCPeer direct connection status</string>
+</resources>

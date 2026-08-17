@@ -1,0 +1,18 @@
+# Example only. The Secret Key is verified with HMAC-SHA256 challenge response.
+[listen]
+ipv4 = "0.0.0.0"
+ipv6 = "::"
+port = 7443
+
+[auth.networks]
+home = "replace-this-cleartext-secret"
+
+[peernet_hosting]
+enabled = true
+hosts = ["main-server"]
+state_db = "/var/lib/tcppeer/coordinator/state.db"
+
+[runtime]
+log_level = "INFO"
+max_message_size = 16384
+keepalive_seconds = 30

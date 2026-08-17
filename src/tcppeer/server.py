@@ -1,0 +1,601 @@
+"""Stateful TCPeer Linux server."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import fcntl
+import ipaddress
+import logging
+import os
+from pathlib import Path
+import socket
+import struct
+import sys
+import time
+import uuid
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from tcppeer.config import ConfigurationError, ServerConfig
+from tcppeer.auth import authentication_proof
+from tcppeer.dhcp import DhcpServer
+from tcppeer.dns import discover_upstream_dns
+from tcppeer.exit_node import ExitNodeFirewall
+from tcppeer.packet import build_dhcp_packet, extract_dhcp_payload
+from tcppeer.protocol import ControlMessage, ProtocolError, encode_data, read_control, read_data
+from tcppeer.ra import ALL_NODES, build_router_advertisement, is_router_solicitation
+from tcppeer.state import StateStore
+from tcppeer.tpp import ECHO_REQUEST, build_reply as build_tpp_reply, parse_tpp
+from tcppeer.transport import (
+    DirectConnectionError,
+    DirectConnector,
+    Endpoint,
+    choose_family,
+    is_usable_ipv6,
+    resolve_tcp_endpoints,
+)
+from tcppeer.tun import TunDevice
+
+LOG = logging.getLogger("tcppeer.server")
+
+
+def public_address(address: str | None) -> str | None:
+    if not address:
+        return None
+    try:
+        parsed = ipaddress.ip_address(address.split("%", 1)[0])
+    except ValueError:
+        return None
+    return str(parsed) if parsed.is_global else None
+
+
+def discover_direct_ipv4(excluded_interfaces: set[str] | None = None) -> str | None:
+    """Find an active non-loopback IPv4 address using TCP socket ioctls."""
+    excluded = excluded_interfaces or set()
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        for _index, name in socket.if_nameindex():
+            if name in excluded or name.startswith(("lo", "tun", "tap", "tailscale", "docker", "veth")):
+                continue
+            request = struct.pack("256s", name.encode("ascii", "ignore")[:15])
+            try:
+                flags = struct.unpack("H", fcntl.ioctl(probe.fileno(), 0x8913, request)[16:18])[0]
+                if not flags & 0x1 or not flags & 0x40:  # IFF_UP and IFF_RUNNING
+                    continue
+                packed = fcntl.ioctl(probe.fileno(), 0x8915, request)[20:24]
+            except OSError:
+                continue
+            address = socket.inet_ntoa(packed)
+            parsed = ipaddress.ip_address(address)
+            if not parsed.is_loopback and not parsed.is_link_local and not parsed.is_unspecified:
+                return address
+    finally:
+        probe.close()
+    return None
+
+
+class Server:
+    """Own the TUN device, address services, state, and direct peer streams."""
+
+    def __init__(self, config: ServerConfig):
+        self.config = config
+        self.store = StateStore(config.state_db)
+        self.dns = config.dns or discover_upstream_dns({config.tun_name})
+        self.dhcp = DhcpServer(
+            self.store, config.ipv4_subnet, config.server_ipv4,
+            config.pool_start, config.pool_end, config.lease_seconds, self.dns,
+        )
+        self.tun = TunDevice(config.tun_name, config.mtu)
+        self.direct_writer = None
+        self.direct_peer_id: str | None = None
+        self._tasks: set[asyncio.Task] = set()
+        self._listeners: list[asyncio.AbstractServer] = []
+        self._direct_bind_ipv4 = config.direct_ipv4 or discover_direct_ipv4({config.tun_name})
+        self._direct_bind_ipv6 = config.direct_ipv6
+        self._registered_ipv4 = public_address(self._direct_bind_ipv4)
+        self._registered_ipv6 = public_address(config.direct_ipv6)
+        self._registered_port_ipv4: int | None = config.direct_port if self._registered_ipv4 else None
+        self._registered_port_ipv6: int | None = config.direct_port if self._registered_ipv6 else None
+        self._direct_candidates: dict[socket.AddressFamily, socket.socket] = {}
+        self._byte_counters: dict[tuple[str, str], int] = {}
+        self._coordinator_writer = None
+        self._admin_queue: asyncio.Queue[str] = asyncio.Queue()
+        self._admin_server: asyncio.AbstractServer | None = None
+        self.exit_node = ExitNodeFirewall(config, config.tun_name)
+
+    async def run(self) -> None:
+        self.tun.open()
+        self.tun.configure(
+            str(self.config.server_ipv4), self.config.ipv4_subnet.prefixlen,
+            str(self.config.server_ipv6), self.config.ipv6_prefix.prefixlen,
+        )
+        self.exit_node.interface = self.tun.name
+        self.exit_node.apply()
+        try:
+            self._prepare_direct_candidates()
+            await self._start_direct_listeners()
+            if self.config.peernet_hosting:
+                await self._start_admin_listener()
+            self._tasks = {
+                asyncio.create_task(self._control_loop(), name="control"),
+                asyncio.create_task(self._tun_loop(), name="tun"),
+                asyncio.create_task(self._ra_loop(), name="router-advertisement"),
+                asyncio.create_task(self._statistics_loop(), name="statistics"),
+            }
+            if self.config.peernet_hosting:
+                self._tasks.add(asyncio.create_task(self._admin_forward_loop(), name="peernet-admin"))
+            done, pending = await asyncio.wait(self._tasks, return_when=asyncio.FIRST_EXCEPTION)
+            for task in pending:
+                task.cancel()
+            for task in done:
+                task.result()
+        finally:
+            for task in self._tasks:
+                task.cancel()
+            for listener in self._listeners:
+                listener.close()
+            if self._admin_server is not None:
+                self._admin_server.close()
+            for candidate in self._direct_candidates.values():
+                candidate.close()
+            self._direct_candidates.clear()
+            await asyncio.gather(*(listener.wait_closed() for listener in self._listeners), return_exceptions=True)
+            if self._admin_server is not None:
+                await self._admin_server.wait_closed()
+                self._admin_server = None
+            if self.config.peernet_hosting:
+                self.config.admin_socket.unlink(missing_ok=True)
+            self.tun.close()
+            self.exit_node.close()
+            self._flush_byte_counters()
+            self.store.close()
+
+    def _prepare_direct_candidates(self) -> None:
+        """Pre-bind ICE-TCP simultaneous-open candidates before listen()."""
+        for family, address in (
+            (socket.AF_INET6, self._direct_bind_ipv6 or "::"),
+            (socket.AF_INET, self._direct_bind_ipv4 or "0.0.0.0"),
+        ):
+            candidate = socket.socket(family, socket.SOCK_STREAM, socket.IPPROTO_TCP)
+            candidate.setblocking(False)
+            candidate.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if hasattr(socket, "SO_REUSEPORT"):
+                candidate.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            try:
+                candidate.bind((address, self.config.direct_port))
+            except OSError:
+                candidate.close()
+                continue
+            self._direct_candidates[family] = candidate
+
+    async def _start_direct_listeners(self) -> None:
+        candidates = []
+        if self.config.direct_ipv6:
+            candidates.append((self.config.direct_ipv6, socket.AF_INET6))
+        if self.config.direct_ipv4:
+            candidates.append((self.config.direct_ipv4, socket.AF_INET))
+        if not candidates:
+            candidates = [("::", socket.AF_INET6), ("0.0.0.0", socket.AF_INET)]
+        for address, family in candidates:
+            listener = await asyncio.start_server(
+                self._accept_direct, address, self.config.direct_port,
+                family=family, reuse_port=True,
+            )
+            self._listeners.append(listener)
+
+    async def _accept_direct(self, reader, writer) -> None:
+        try:
+            direct_socket = writer.get_extra_info("socket")
+            direct_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+            direct_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+            info = await read_control(reader)
+            if info.command != "PEER-INFO" or info.get("Network") != self.config.network:
+                raise ProtocolError("invalid direct peer handshake")
+            peer_id = info.get("Peer-ID") or "unknown"
+            required_family = choose_family(
+                [self._registered_ipv6 or ""], [info.get("IPv6") or ""],
+            )
+            actual_family = direct_socket.family
+            if actual_family != required_family:
+                raise ProtocolError("direct connection family violates IPv6-first policy")
+            writer.write(ControlMessage("PEER-INFO", {
+                "Network": self.config.network, "Peer-ID": self.config.peer_id,
+                "IPv4": self._registered_ipv4 or "", "IPv6": self._registered_ipv6 or "",
+            }).encode())
+            await writer.drain()
+            endpoint = writer.get_extra_info("peername") or ("unknown", 0)
+            await self._adopt_direct(reader, writer, peer_id, actual_family, f"{endpoint[0]}:{endpoint[1]}")
+        except (ProtocolError, ConnectionError, asyncio.IncompleteReadError) as exc:
+            LOG.warning("Rejected direct connection: %s", exc)
+            writer.close()
+
+    async def _control_loop(self) -> None:
+        reader, writer = await self._open_coordinator_connection()
+        self._coordinator_writer = writer
+        writer.write(ControlMessage("AUTH", {
+            "Network": self.config.network,
+            "Peer-ID": self.config.peer_id,
+        }).encode())
+        await writer.drain()
+        challenge = await read_control(reader)
+        if challenge.command != "AUTH-CHALLENGE":
+            raise ProtocolError(challenge.get("Reason", "coordinator did not issue an authentication challenge"))
+        nonce = challenge.get("Nonce") or ""
+        writer.write(ControlMessage("AUTH-PROOF", {
+            "Proof": authentication_proof(self.config.secret, self.config.network, self.config.peer_id, nonce),
+        }).encode())
+        await writer.drain()
+        response = await read_control(reader)
+        if response.command != "AUTH-OK":
+            raise ProtocolError(response.get("Reason", "authentication failed"))
+        observed = await read_control(reader)
+        if observed.command != "ENDPOINT-INFO":
+            raise ProtocolError("coordinator did not report the observed endpoint")
+        observed_address = observed.get("Address") or ""
+        try:
+            observed_version = ipaddress.ip_address(observed_address).version
+        except ValueError:
+            observed_version = 0
+        if observed_version == 4:
+            self._registered_ipv4 = observed_address
+            self._registered_port_ipv4 = int(observed.get("Port") or self.config.direct_port)
+        if observed_version == 6:
+            self._registered_ipv6 = observed_address
+            self._registered_port_ipv6 = int(observed.get("Port") or self.config.direct_port)
+        other_family = socket.AF_INET if observed_version == 6 else socket.AF_INET6
+        other_observed = await self._query_observed_endpoint(other_family)
+        if other_observed:
+            other_address, other_port = other_observed
+            if other_family == socket.AF_INET:
+                self._registered_ipv4 = other_address
+                self._registered_port_ipv4 = other_port
+            else:
+                self._registered_ipv6 = other_address
+                self._registered_port_ipv6 = other_port
+        LOG.info(
+            "Registering direct endpoints IPv4=%s IPv6=%s",
+            self._registered_ipv4 or "none",
+            self._registered_ipv6 or "none",
+        )
+        writer.write(ControlMessage("REGISTER", {
+            "Peer-ID": self.config.peer_id,
+            "IPv4": self._registered_ipv4 or "",
+            "IPv6": self._registered_ipv6 or "",
+            "Mapped-IPv4-Port": str(self._registered_port_ipv4 or ""),
+            "Mapped-IPv6-Port": str(self._registered_port_ipv6 or ""),
+            "Local-IPv4": self._direct_bind_ipv4 or "",
+            "Local-IPv6": self._direct_bind_ipv6 or "",
+            "Port": str(self.config.direct_port),
+            "Role": "Exit-Node",
+            "Platform": "Linux",
+            "Overlay-IPv4": str(self.config.server_ipv4),
+            "Overlay-IPv6": str(self.config.server_ipv6),
+            "PeerNet-Hosting": "yes" if self.config.peernet_hosting else "no",
+        }).encode())
+        if self.config.target_peer:
+            writer.write(ControlMessage("PUNCH-READY", {"Peer-ID": self.config.target_peer}).encode())
+        await writer.drain()
+        while True:
+            try:
+                message = await asyncio.wait_for(read_control(reader), timeout=30)
+            except TimeoutError:
+                writer.write(ControlMessage("KEEPALIVE", {}).encode())
+                await writer.drain()
+                continue
+            if message.command == "PING":
+                writer.write(ControlMessage("PONG", {}).encode())
+                await writer.drain()
+            elif message.command == "PUNCH-GO":
+                task = asyncio.create_task(self._connect_direct(message), name="direct-connect")
+                self._tasks.add(task)
+                task.add_done_callback(self._tasks.discard)
+            elif message.command == "PEER-INFO" and message.get("Action") == "Punch-Request":
+                requested_peer = message.get("Peer-ID")
+                if requested_peer:
+                    writer.write(ControlMessage("PUNCH-READY", {"Peer-ID": requested_peer}).encode())
+                    await writer.drain()
+            elif message.command == "ERROR":
+                LOG.warning("Coordinator error: %s", message.get("Reason", "unspecified error"))
+            elif message.command in {"DISCONNECT", "AUTH-ERROR"}:
+                raise ConnectionError(message.get("Reason", "coordinator disconnected"))
+
+    async def _start_admin_listener(self) -> None:
+        self.config.admin_socket.parent.mkdir(parents=True, exist_ok=True)
+        self.config.admin_socket.unlink(missing_ok=True)
+        self._admin_server = await asyncio.start_unix_server(
+            self._handle_admin_client, path=self.config.admin_socket,
+        )
+        self.config.admin_socket.chmod(0o660)
+
+    async def _handle_admin_client(self, reader, writer) -> None:
+        try:
+            line = (await asyncio.wait_for(reader.readline(), timeout=5)).decode("ascii").strip()
+            command, separator, target = line.partition(" ")
+            if command != "DELETE" or not separator or not target or any(ord(char) > 127 for char in target):
+                writer.write(b"ERROR expected: DELETE <peer-id>\n")
+            elif target == self.config.peer_id:
+                writer.write(b"ERROR the PeerNet host cannot delete itself\n")
+            else:
+                self.store.delete_client(target)
+                if self.direct_peer_id == target and self.direct_writer is not None:
+                    self.direct_writer.close()
+                await self._admin_queue.put(target)
+                writer.write(f"OK delete request queued for {target}\n".encode("ascii"))
+            await writer.drain()
+        except (TimeoutError, UnicodeError, ConnectionError):
+            pass
+        finally:
+            writer.close()
+
+    async def _admin_forward_loop(self) -> None:
+        while True:
+            target = await self._admin_queue.get()
+            while self._coordinator_writer is None or self._coordinator_writer.is_closing():
+                await asyncio.sleep(0.25)
+            self._coordinator_writer.write(ControlMessage("PEER-INFO", {
+                "Action": "Delete-Client", "Peer-ID": target,
+            }).encode())
+            await self._coordinator_writer.drain()
+
+    async def _query_observed_endpoint(self, family: socket.AddressFamily) -> tuple[str, int] | None:
+        local_address = self._direct_bind_ipv6 if family == socket.AF_INET6 else self._direct_bind_ipv4
+        if not local_address:
+            return None
+        results = await resolve_tcp_endpoints(self.config.coordinator_address, self.config.coordinator_port)
+        loop = asyncio.get_running_loop()
+        for candidate_family, socktype, protocol, _name, address in results:
+            if candidate_family != family:
+                continue
+            sock = socket.socket(candidate_family, socktype, protocol)
+            sock.setblocking(False)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if hasattr(socket, "SO_REUSEPORT"):
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            try:
+                sock.bind((local_address, self.config.direct_port))
+                await asyncio.wait_for(loop.sock_connect(sock, address), timeout=5)
+                reader, writer = await asyncio.open_connection(sock=sock)
+                writer.write(ControlMessage("ENDPOINT-QUERY", {}).encode())
+                await writer.drain()
+                response = await asyncio.wait_for(read_control(reader), timeout=5)
+                writer.close()
+                await asyncio.gather(writer.wait_closed(), return_exceptions=True)
+                if response.command == "ENDPOINT-INFO":
+                    address_value = response.get("Address") or ""
+                    port_value = int(response.get("Port") or 0)
+                    if address_value and port_value:
+                        return address_value, port_value
+            except (OSError, TimeoutError, ProtocolError, asyncio.IncompleteReadError):
+                sock.close()
+        return None
+
+    async def _open_coordinator_connection(self):
+        """Use the direct local TCP port so the observed mapping is relevant."""
+        loop = asyncio.get_running_loop()
+        results = await resolve_tcp_endpoints(
+            self.config.coordinator_address,
+            self.config.coordinator_port,
+        )
+        # Try TCP6 first even when no address was configured explicitly. Binding
+        # to :: lets the kernel select the usable local source address. The
+        # coordinator's observed public address is advertised separately.
+        preferred = [socket.AF_INET6, socket.AF_INET]
+        last_error: OSError | None = None
+        for family in preferred:
+            local_address = self._direct_bind_ipv6 if family == socket.AF_INET6 else self._direct_bind_ipv4
+            local_address = local_address or ("::" if family == socket.AF_INET6 else "0.0.0.0")
+            for candidate_family, socktype, protocol, _name, address in results:
+                if candidate_family != family:
+                    continue
+                sock = socket.socket(candidate_family, socktype, protocol)
+                sock.setblocking(False)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if hasattr(socket, "SO_REUSEPORT"):
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                try:
+                    sock.bind((local_address, self.config.direct_port))
+                    await loop.sock_connect(sock, address)
+                    selected_address = str(sock.getsockname()[0]).split("%", 1)[0]
+                    if family == socket.AF_INET6 and is_usable_ipv6(selected_address):
+                        self._direct_bind_ipv6 = selected_address
+                        LOG.info("Automatically selected local IPv6 bind address %s", selected_address)
+                    elif family == socket.AF_INET and selected_address != "0.0.0.0":
+                        self._direct_bind_ipv4 = selected_address
+                        self._registered_ipv4 = public_address(selected_address)
+                    return await asyncio.open_connection(sock=sock)
+                except OSError as exc:
+                    last_error = exc
+                    sock.close()
+        raise ConnectionError("cannot establish the TCP coordinator connection") from last_error
+
+    async def _connect_direct(self, message: ControlMessage) -> None:
+        family_text = message.get("Family")
+        family = socket.AF_INET6 if family_text == "IPv6" else socket.AF_INET
+        local_address = self._direct_bind_ipv6 if family == socket.AF_INET6 else self._direct_bind_ipv4
+        if not local_address:
+            local_address = "::" if family == socket.AF_INET6 else "0.0.0.0"
+        remote = Endpoint(message.get("Address") or "", int(message.get("Port") or 0), family)
+        local = Endpoint(local_address, self.config.direct_port, family)
+        start_ms = int(message.get("Start-Ms") or 0)
+        delay = start_ms / 1000 - time.time()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        peer_id = message.get("Peer-ID") or "unknown"
+        try:
+            candidate = self._direct_candidates.pop(family, None)
+            reader, writer = await DirectConnector().connect(
+                local, remote, family, prebound_socket=candidate,
+            )
+        except DirectConnectionError:
+            self.store.update_peer(peer_id, transport="No Direct Connection")
+            raise
+        writer.write(ControlMessage("PEER-INFO", {
+            "Network": self.config.network, "Peer-ID": self.config.peer_id,
+            "IPv4": self._registered_ipv4 or "", "IPv6": self._registered_ipv6 or "",
+        }).encode())
+        await writer.drain()
+        peer_info = await read_control(reader)
+        if peer_info.command != "PEER-INFO" or peer_info.get("Network") != self.config.network:
+            writer.close()
+            raise ProtocolError("invalid direct peer handshake")
+        required_family = choose_family(
+            [self._registered_ipv6 or ""], [peer_info.get("IPv6") or ""],
+        )
+        if required_family != family:
+            writer.close()
+            raise ProtocolError("coordinator selected a family that violates IPv6-first policy")
+        await self._adopt_direct(reader, writer, peer_id, family, f"{remote.address}:{remote.port}")
+
+    async def _adopt_direct(self, reader, writer, peer_id: str, family: socket.AddressFamily, endpoint: str) -> None:
+        if self.direct_writer is not None:
+            self.direct_writer.close()
+        self.direct_writer = writer
+        self.direct_peer_id = peer_id
+        label = "TCP6 Direct" if family == socket.AF_INET6 else "TCP4 Direct"
+        self.store.update_peer(peer_id, transport=label, endpoint=endpoint, connected_at=int(time.time()))
+        session_id = str(uuid.uuid4())
+        started_at = int(time.time())
+        with self.store.connection:
+            self.store.connection.execute(
+                "INSERT INTO sessions(session_id, peer_id, family, endpoint, state, started_at) VALUES(?, ?, ?, ?, 'connected', ?)",
+                (session_id, peer_id, 6 if family == socket.AF_INET6 else 4, endpoint, started_at),
+            )
+        try:
+            while True:
+                packet = await read_data(reader)
+                self._add_bytes(peer_id, "rx_bytes", len(packet))
+                await self._handle_peer_packet(packet, writer, peer_id)
+        finally:
+            if self.direct_writer is writer:
+                self.direct_writer = None
+                self.direct_peer_id = None
+                self.store.update_peer(peer_id, transport="Disconnected")
+            with self.store.connection:
+                self.store.connection.execute(
+                    "UPDATE sessions SET state='disconnected', ended_at=? WHERE session_id=?",
+                    (int(time.time()), session_id),
+                )
+            writer.close()
+
+    def _add_bytes(self, peer_id: str, column: str, amount: int) -> None:
+        if column not in {"rx_bytes", "tx_bytes"}:
+            raise ValueError("invalid counter")
+        key = (peer_id, column)
+        self._byte_counters[key] = self._byte_counters.get(key, 0) + amount
+
+    def _flush_byte_counters(self) -> None:
+        pending, self._byte_counters = self._byte_counters, {}
+        if not pending:
+            return
+        with self.store.connection:
+            for (peer_id, column), amount in pending.items():
+                self.store.connection.execute(
+                    f"UPDATE peers SET {column} = {column} + ?, updated_at = ? WHERE peer_id = ?",
+                    (amount, int(time.time()), peer_id),
+                )
+
+    async def _statistics_loop(self) -> None:
+        while True:
+            await asyncio.sleep(1)
+            self._flush_byte_counters()
+
+    @staticmethod
+    async def _write_data(writer, packet: bytes) -> None:
+        writer.write(encode_data(packet))
+        transport = writer.transport
+        if transport is not None and transport.get_write_buffer_size() >= 256 * 1024:
+            await writer.drain()
+
+    async def _tun_loop(self) -> None:
+        while True:
+            packet = await self._read_tun()
+            if self.direct_writer is not None and self.direct_peer_id is not None:
+                await self._write_data(self.direct_writer, packet)
+                self._add_bytes(self.direct_peer_id, "tx_bytes", len(packet))
+
+    async def _read_tun(self) -> bytes:
+        if self.tun.fd is None:
+            raise RuntimeError("TUN interface is closed")
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                return os.read(self.tun.fd, 65535)
+            except BlockingIOError:
+                ready = loop.create_future()
+                def mark_ready() -> None:
+                    if not ready.done():
+                        ready.set_result(None)
+                loop.add_reader(self.tun.fd, mark_ready)
+                try:
+                    await ready
+                finally:
+                    loop.remove_reader(self.tun.fd)
+
+    async def _handle_peer_packet(self, packet: bytes, writer, peer_id: str) -> None:
+        tpp = parse_tpp(packet)
+        if tpp is not None and tpp.kind == ECHO_REQUEST and tpp.destination == self.config.server_ipv6:
+            response = build_tpp_reply(packet)
+            if response is not None:
+                await self._write_data(writer, response)
+                self._add_bytes(peer_id, "tx_bytes", len(response))
+            return
+        payload = extract_dhcp_payload(packet)
+        if payload is not None:
+            reply = self.dhcp.handle(payload)
+            if reply is not None:
+                response = build_dhcp_packet(
+                    reply, self.config.server_ipv4,
+                    ipaddress.ip_address("255.255.255.255"),
+                )
+                await self._write_data(writer, response)
+                self._add_bytes(peer_id, "tx_bytes", len(response))
+            return
+        if is_router_solicitation(packet):
+            response = self._ra_packet()
+            await self._write_data(writer, response)
+            self._add_bytes(peer_id, "tx_bytes", len(response))
+            return
+        self.tun.write(packet)
+
+    def _ra_packet(self) -> bytes:
+        return build_router_advertisement(
+            self.config.server_ipv6, self.config.ipv6_prefix,
+            self.config.router_lifetime_seconds,
+            self.config.preferred_lifetime_seconds,
+            self.config.valid_lifetime_seconds,
+            self.dns,
+            ALL_NODES,
+        )
+
+    async def _ra_loop(self) -> None:
+        while True:
+            if self.direct_writer is not None and self.direct_peer_id is not None:
+                packet = self._ra_packet()
+                await self._write_data(self.direct_writer, packet)
+                self._add_bytes(self.direct_peer_id, "tx_bytes", len(packet))
+            await asyncio.sleep(self.config.ra_interval_seconds)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run the TCPeer stateful VPN server")
+    parser.add_argument("--config", default="/etc/tcppeer/server.toml")
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    try:
+        config = ServerConfig.from_file(args.config)
+    except (OSError, ConfigurationError) as exc:
+        raise SystemExit(f"Configuration error: {exc}") from exc
+    logging.basicConfig(level=config.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    try:
+        asyncio.run(Server(config).run())
+    except KeyboardInterrupt:
+        LOG.info("Server stopped")
+
+
+if __name__ == "__main__":
+    main()

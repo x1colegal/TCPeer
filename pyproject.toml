@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tcppeer"
+version = "0.1.0"
+description = "A cleartext, TCP-only, direct peer-to-peer VPN"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "Apache-2.0"}
+authors = [{name = "TCPeer contributors"}]
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=7.2"]
+
+[project.scripts]
+tcppeer = "tcppeer.cli:main"
+tcppeer-configure = "tcppeer.configurator:main"
+tcppeer-coordinator = "tcppeer.coordinator:main"
+tcppeer-server = "tcppeer.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+tcppeer = ["systemd/*.service"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+pythonpath = ["src"]

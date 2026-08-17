@@ -1,0 +1,22 @@
+[Unit]
+Description=TCPeer control-plane coordinator
+Documentation=https://github.com/tcppeer/tcppeer
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=tcppeer
+Group=tcppeer
+ExecStart=/usr/local/bin/tcppeer-coordinator --config /etc/tcppeer/coordinator.toml
+Restart=on-failure
+RestartSec=3s
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
