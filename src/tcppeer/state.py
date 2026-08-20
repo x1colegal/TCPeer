@@ -154,6 +154,7 @@ class StateStore:
     def delete_client(self, peer_id: str) -> None:
         with self.connection:
             self.connection.execute("DELETE FROM leases WHERE client_id = ?", (peer_id,))
+            self.connection.execute("DELETE FROM sessions WHERE peer_id = ?", (peer_id,))
             self.connection.execute("DELETE FROM peers WHERE peer_id = ?", (peer_id,))
 
     def list_table(self, table: str) -> list[sqlite3.Row]:
