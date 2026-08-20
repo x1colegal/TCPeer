@@ -145,24 +145,3 @@ def test_same_ula_is_used_only_behind_same_observed_public_address():
         assert b"Address: fd00::" not in left_writer.buffer
 
     asyncio.run(scenario())
-
-
-def test_linux_peernet_host_can_delete_and_revoke_client(tmp_path):
-    async def scenario():
-        coordinator = Coordinator(CoordinatorConfig(
-            networks={"home": "secret"}, peernet_hosting=True,
-            hosting_peer_ids=("main-server",), hosting_state_db=tmp_path / "hosting.db",
-        ))
-        writer = MemoryWriter()
-        host = RegisteredPeer(
-            "home", "main-server", writer, "2001:db8::1", 7444,
-            platform="Linux", peernet_hosting=True,
-        )
-        coordinator.known_peers[("home", "phone")] = KnownPeer("home", "phone")
-        await coordinator._delete_client(host, "phone")
-        assert ("home", "phone") not in coordinator.known_peers
-        assert coordinator.hosting_store.is_revoked("home", "phone")
-        assert b"Action: Delete-OK" in writer.buffer
-        await coordinator.close()
-
-    asyncio.run(scenario())

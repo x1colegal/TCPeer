@@ -19,7 +19,6 @@ if __package__ in {None, ""}:
 
 from tcppeer.config import CoordinatorConfig, ConfigurationError
 from tcppeer.auth import proof_matches
-from tcppeer.hosting import HostingStore
 from tcppeer.protocol import ControlMessage, ProtocolError, read_control
 from tcppeer.transport import is_usable_ipv6
 
@@ -42,7 +41,6 @@ class RegisteredPeer:
     listen_port: int | None = None
     role: str = "Client"
     platform: str = "Unknown"
-    peernet_hosting: bool = False
     ready_for: set[str] = field(default_factory=set)
     connected_at: float = field(default_factory=time.monotonic)
 
@@ -71,9 +69,10 @@ class Coordinator:
         self.peers: dict[tuple[str, str], RegisteredPeer] = {}
         self.known_peers: dict[tuple[str, str], KnownPeer] = {}
         self.servers: list[asyncio.AbstractServer] = []
-        self.hosting_store = HostingStore(config.hosting_state_db) if config.peernet_hosting else None
+        self.admin_server: asyncio.AbstractServer | None = None
 
     async def start(self) -> None:
+        await self._start_admin_listener()
         if self.config.listen_ipv6:
             self.servers.append(await asyncio.start_server(
                 self.handle_client, self.config.listen_ipv6, self.config.port,
@@ -94,13 +93,16 @@ class Coordinator:
         await asyncio.gather(*(server.serve_forever() for server in self.servers))
 
     async def close(self) -> None:
+        if self.admin_server is not None:
+            self.admin_server.close()
+            await self.admin_server.wait_closed()
+            self.admin_server = None
+            Path("/run/tcppeer/coordinator-admin.sock").unlink(missing_ok=True)
+
         for server in self.servers:
             server.close()
         await asyncio.gather(*(server.wait_closed() for server in self.servers), return_exceptions=True)
         self.servers.clear()
-        if self.hosting_store is not None:
-            self.hosting_store.close()
-            self.hosting_store = None
 
     async def send(self, writer, command: str, **fields: str) -> None:
         writer.write(ControlMessage(command, fields).encode())
@@ -130,9 +132,6 @@ class Coordinator:
                 secret, network, peer_id, nonce, proof.get("Proof") or "",
             ):
                 await self.send(writer, "AUTH-ERROR", Reason="invalid credentials")
-                return
-            if self.hosting_store is not None and self.hosting_store.is_revoked(network, peer_id):
-                await self.send(writer, "AUTH-ERROR", Reason="client was deleted by the PeerNet host")
                 return
             key = (network, peer_id)
             old = self.peers.get(key)
@@ -189,12 +188,6 @@ class Coordinator:
             peer.listen_port = int(port) if port else peer.observed_port
             peer.role = message.get("Role") or "Client"
             peer.platform = message.get("Platform") or "Unknown"
-            peer.peernet_hosting = (
-                self.config.peernet_hosting
-                and peer.platform == "Linux"
-                and peer.peer_id in self.config.hosting_peer_ids
-                and message.get("PeerNet-Hosting") == "yes"
-            )
             known = self.known_peers[(peer.network, peer.peer_id)]
             known.role = peer.role
             known.platform = peer.platform
@@ -214,8 +207,6 @@ class Coordinator:
             known.overlay_ipv4 = message.get("Overlay-IPv4") or ""
             known.overlay_ipv6 = message.get("Overlay-IPv6") or ""
             known.last_seen = int(time.time())
-        elif message.command == "PEER-INFO" and message.get("Action") == "Delete-Client":
-            await self._delete_client(peer, message.get("Peer-ID") or "")
         elif message.command in {"PING", "KEEPALIVE"}:
             await self.send(peer.writer, "PONG")
         elif message.command == "PUNCH-READY":
@@ -237,21 +228,78 @@ class Coordinator:
         else:
             await self.send(peer.writer, "ERROR", Reason=f"unexpected command: {message.command}")
 
-    async def _delete_client(self, host: RegisteredPeer, target_id: str) -> None:
-        if not host.peernet_hosting or self.hosting_store is None:
-            await self.send(host.writer, "ERROR", Reason="PeerNet Hosting permission is required")
-            return
-        if not target_id or target_id == host.peer_id:
-            await self.send(host.writer, "ERROR", Reason="invalid client deletion target")
-            return
-        self.hosting_store.revoke(host.network, target_id)
-        target = self.peers.get((host.network, target_id))
+    async def _start_admin_listener(self) -> None:
+        admin_socket = Path("/run/tcppeer/coordinator-admin.sock")
+        admin_socket.parent.mkdir(parents=True, exist_ok=True)
+        admin_socket.unlink(missing_ok=True)
+
+        self.admin_server = await asyncio.start_unix_server(
+            self._handle_admin_client,
+            path=admin_socket,
+        )
+        admin_socket.chmod(0o660)
+        LOG.info("Coordinator admin socket listening on %s", admin_socket)
+
+    async def _handle_admin_client(self, reader, writer) -> None:
+        try:
+            line = (
+                await asyncio.wait_for(reader.readline(), timeout=5)
+            ).decode("ascii").strip()
+
+            parts = line.split()
+
+            if len(parts) != 3 or parts[0] != "DELETE":
+                writer.write(
+                    b"ERROR expected: DELETE <network> <peer-id>\\n"
+                )
+                await writer.drain()
+                return
+
+            _command, network, peer_id = parts
+
+            if any(ord(char) > 127 for char in network + peer_id):
+                writer.write(b"ERROR invalid network or peer-id\\n")
+                await writer.drain()
+                return
+
+            await self._delete_client_direct(network, peer_id)
+
+            writer.write(
+                f"OK deleted {peer_id} from {network}\\n".encode("ascii")
+            )
+            await writer.drain()
+
+        except (TimeoutError, UnicodeError, ConnectionError):
+            pass
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    async def _delete_client_direct(
+        self,
+        network: str,
+        target_id: str,
+    ) -> None:
+        if not target_id:
+            raise ValueError("invalid client deletion target")
+
+        target = self.peers.get((network, target_id))
+
         if target is not None:
-            await self.send(target.writer, "DISCONNECT", Reason="deleted by the PeerNet host")
+            await self.send(
+                target.writer,
+                "DISCONNECT",
+                Reason="deleted by coordinator administrator",
+            )
             target.writer.close()
-        self.known_peers.pop((host.network, target_id), None)
-        LOG.info("PeerNet host %s deleted client %s from %s", host.peer_id, target_id, host.network)
-        await self.send(host.writer, "PEER-INFO", Action="Delete-OK", **{"Peer-ID": target_id})
+
+        self.known_peers.pop((network, target_id), None)
+
+        LOG.info(
+            "Coordinator administrator deleted peer %s from %s",
+            target_id,
+            network,
+        )
 
     async def _send_device_list(self, peer: RegisteredPeer) -> None:
         devices = sorted(

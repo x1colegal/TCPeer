@@ -17,7 +17,7 @@ The repository includes:
 - an interactive Linux configurator and hardened systemd units;
 - a native Android `VpnService` client with a Material 3/Material You UI;
 - DHCPv4, IPv6 SLAAC/RA, automatic upstream DNS, NAT44/NAT66, and forwarding;
-- a device list, Linux-only PeerNet Hosting administration, and IPv6 TPP ping.
+- a synchronized device list, coordinator-local administration, and IPv6 TPP ping.
 
 The complete wire-level contract is in
 [docs/technical-specification.md](docs/technical-specification.md).
@@ -261,7 +261,7 @@ The Android Clients screen provides a **Ping client** action. It opens a
 continuous latency view with a scrolling line chart and displays the connected
 overlay IPv6 address and current round-trip time.
 
-## Devices and PeerNet Hosting
+## Devices
 
 The Android Clients screen shows known devices and their current metadata:
 
@@ -272,15 +272,19 @@ The Android Clients screen shows known devices and their current metadata:
 - public and overlay IPv4/IPv6 addresses;
 - endpoint and last-seen information.
 
-PeerNet Hosting is optional and Linux-only. The coordinator must enable it and
-explicitly list allowed Linux host peer IDs. An authorized host can revoke and
-disconnect a client from the Android UI or with:
+Device administration is performed locally on the coordinator. The coordinator
+provides a Unix-domain administrative socket at
+`/run/tcppeer/coordinator-admin.sock`. Deleting a peer immediately removes it
+from the coordinator device list and disconnects it when currently connected.
 
-```console
-tcppeer --config /etc/tcppeer/server.toml delete-client PEER_ID
+The administrative protocol accepts:
+
+```text
+DELETE NETWORK PEER_ID
 ```
 
-Revocations are stored in the coordinator SQLite database.
+This interface is local to the coordinator and is not exposed through a Linux
+VPN server or Android peer.
 
 ## Operational CLI
 
@@ -309,7 +313,6 @@ re-established automatically.
 |---|---|---|
 | `listen` | `ipv4`, `ipv6`, `port` | Control-plane listen endpoints |
 | `auth.networks` | network-name keys | Shared Secret Key per network |
-| `peernet_hosting` | `enabled`, `hosts`, `state_db` | Authorized Linux administrators and revocation state |
 | `runtime` | `log_level`, `max_message_size`, `keepalive_seconds` | Coordinator limits and logging |
 
 ### Server
@@ -321,7 +324,6 @@ re-established automatically.
 | `direct` | `ipv4`, `ipv6`, `port`, `target_peer` | Local candidates and coordinated source port |
 | `interface` | `name`, `mtu` | Linux TUN settings |
 | `exit_node` | `enabled`, `nat44`, `nat66`, `software_flow_offload` | Forwarding and nftables behavior |
-| `peernet_hosting` | `enabled`, `admin_socket` | Linux-only client administration |
 | `ipv4` | subnet, server, pool, lease | Stateful DHCPv4 settings |
 | `ipv6` | prefix, server, RA lifetimes, DNS | SLAAC and RDNSS settings |
 | `paths` | `state_db` | Persistent server SQLite database |
@@ -416,7 +418,6 @@ carrier permits simultaneous-open; validate that on the intended networks.
 - Endpoint metadata, device metadata, control messages, DNS traffic, and
   tunneled IP packets are cleartext on the direct TCP stream.
 - There is no server identity certificate or TLS authentication.
-- PeerNet Hosting can revoke identities but does not encrypt their traffic.
 
 Use application-layer encryption such as HTTPS or SSH inside TCPeer whenever
 confidentiality or server authentication matters.

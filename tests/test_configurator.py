@@ -18,7 +18,7 @@ def test_server_configuration_writes_exit_node_masquerade(monkeypatch):
         "", "INFO", "/tmp/tcppeer-state.db",
     ])
     monkeypatch.setattr(configurator, "ask", lambda *_args, **_kwargs: next(answers))
-    yes_no = iter([True, True, True, True, True])
+    yes_no = iter([True, True, True, True])
     monkeypatch.setattr(configurator, "ask_yes_no", lambda *_args, **_kwargs: next(yes_no))
     content, _state = configurator.server_text()
     assert "[exit_node]" in content
@@ -26,7 +26,5 @@ def test_server_configuration_writes_exit_node_masquerade(monkeypatch):
     assert "nat44 = true" in content
     assert "nat66 = true" in content
     assert "software_flow_offload = true" in content
-    assert "[peernet_hosting]" in content
-    assert "enabled = true" in content
     assert "routed_subnets" not in content
     assert "dns = []" in content

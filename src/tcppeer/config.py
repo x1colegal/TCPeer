@@ -40,16 +40,6 @@ class CoordinatorConfig:
     log_level: str = "INFO"
     max_message_size: int = 16384
     keepalive_seconds: int = 30
-    peernet_hosting: bool = False
-    hosting_peer_ids: tuple[str, ...] = ()
-    hosting_state_db: Path = Path("/var/lib/tcppeer/coordinator/state.db")
-
-    def __post_init__(self) -> None:
-        if self.peernet_hosting and not sys.platform.startswith("linux"):
-            raise ConfigurationError("PeerNet Hosting is available only on Linux")
-        if self.peernet_hosting and not self.hosting_peer_ids:
-            raise ConfigurationError("PeerNet Hosting requires at least one Linux host peer ID")
-
     @classmethod
     def from_file(cls, path: str | Path) -> "CoordinatorConfig":
         with Path(path).open("rb") as source:
@@ -57,7 +47,6 @@ class CoordinatorConfig:
         listen = _table(data, "listen")
         auth = _table(data, "auth")
         runtime = _table(data, "runtime")
-        hosting = _table(data, "peernet_hosting")
         networks = auth.get("networks", {})
         if not isinstance(networks, dict) or not networks:
             raise ConfigurationError("auth.networks must contain at least one network secret")
@@ -69,9 +58,6 @@ class CoordinatorConfig:
             log_level=str(runtime.get("log_level", "INFO")).upper(),
             max_message_size=int(runtime.get("max_message_size", 16384)),
             keepalive_seconds=int(runtime.get("keepalive_seconds", 30)),
-            peernet_hosting=bool(hosting.get("enabled", False)),
-            hosting_peer_ids=tuple(str(item) for item in hosting.get("hosts", [])),
-            hosting_state_db=Path(hosting.get("state_db", "/var/lib/tcppeer/coordinator/state.db")),
         )
 
 
@@ -106,12 +92,8 @@ class ServerConfig:
     nat44: bool = True
     nat66: bool = True
     software_flow_offload: bool = True
-    peernet_hosting: bool = False
-    admin_socket: Path = Path("/run/tcppeer/admin.sock")
 
     def __post_init__(self) -> None:
-        if self.peernet_hosting and not sys.platform.startswith("linux"):
-            raise ConfigurationError("PeerNet Hosting is available only on Linux")
         if not self.coordinator_address.strip():
             raise ConfigurationError("coordinator DNS name or IP address is required")
         if "://" in self.coordinator_address:
@@ -146,7 +128,6 @@ class ServerConfig:
         paths = _table(data, "paths")
         runtime = _table(data, "runtime")
         exit_node = _table(data, "exit_node")
-        hosting = _table(data, "peernet_hosting")
         try:
             return cls(
                 coordinator_address=str(coordinator["address"]),
@@ -178,8 +159,6 @@ class ServerConfig:
                 nat44=bool(exit_node.get("nat44", True)),
                 nat66=bool(exit_node.get("nat66", True)),
                 software_flow_offload=bool(exit_node.get("software_flow_offload", True)),
-                peernet_hosting=bool(hosting.get("enabled", False)),
-                admin_socket=Path(hosting.get("admin_socket", "/run/tcppeer/admin.sock")),
             )
         except KeyError as exc:
             raise ConfigurationError(f"missing required setting: {exc.args[0]}") from exc

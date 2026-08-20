@@ -6,7 +6,6 @@ import argparse
 import datetime as dt
 from pathlib import Path
 import sqlite3
-import socket
 import sys
 import time
 
@@ -33,19 +32,6 @@ def _print_table(rows: list[sqlite3.Row], columns: list[str]) -> None:
 
 
 def run_command(config: ServerConfig, command: str, peer_id: str | None = None) -> None:
-    if command == "delete-client":
-        if not config.peernet_hosting:
-            raise ConfigurationError("PeerNet Hosting is not enabled on this Linux server")
-        if not peer_id:
-            raise ConfigurationError("delete-client requires a peer ID")
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.connect(str(config.admin_socket))
-            client.sendall(f"DELETE {peer_id}\n".encode("ascii"))
-            response = client.recv(4096).decode("ascii").strip()
-        print(response)
-        if not response.startswith("OK "):
-            raise ConfigurationError(response)
-        return
     connection = sqlite3.connect(f"file:{config.state_db}?mode=ro", uri=True)
     try:
         if command in {"status", "peers", "addresses", "transport", "stats"}:
@@ -74,7 +60,7 @@ def run_command(config: ServerConfig, command: str, peer_id: str | None = None) 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Inspect TCPeer server state")
     parser.add_argument("--config", default="/etc/tcppeer/server.toml")
-    parser.add_argument("command", choices=("status", "peers", "leases", "sessions", "addresses", "transport", "stats", "delete-client"))
+    parser.add_argument("command", choices=("status", "peers", "leases", "sessions", "addresses", "transport", "stats"))
     parser.add_argument("peer_id", nargs="?")
     return parser
 

@@ -101,8 +101,6 @@ class Server:
         self._direct_candidates: dict[socket.AddressFamily, socket.socket] = {}
         self._byte_counters: dict[tuple[str, str], int] = {}
         self._coordinator_writer = None
-        self._admin_queue: asyncio.Queue[str] = asyncio.Queue()
-        self._admin_server: asyncio.AbstractServer | None = None
         self.exit_node = ExitNodeFirewall(config, config.tun_name)
 
     async def run(self) -> None:
@@ -116,16 +114,12 @@ class Server:
         try:
             self._prepare_direct_candidates()
             await self._start_direct_listeners()
-            if self.config.peernet_hosting:
-                await self._start_admin_listener()
             self._tasks = {
                 asyncio.create_task(self._control_loop(), name="control"),
                 asyncio.create_task(self._tun_loop(), name="tun"),
                 asyncio.create_task(self._ra_loop(), name="router-advertisement"),
                 asyncio.create_task(self._statistics_loop(), name="statistics"),
             }
-            if self.config.peernet_hosting:
-                self._tasks.add(asyncio.create_task(self._admin_forward_loop(), name="peernet-admin"))
             done, pending = await asyncio.wait(self._tasks, return_when=asyncio.FIRST_EXCEPTION)
             for task in pending:
                 task.cancel()
@@ -136,17 +130,10 @@ class Server:
                 task.cancel()
             for listener in self._listeners:
                 listener.close()
-            if self._admin_server is not None:
-                self._admin_server.close()
             for candidate in self._direct_candidates.values():
                 candidate.close()
             self._direct_candidates.clear()
             await asyncio.gather(*(listener.wait_closed() for listener in self._listeners), return_exceptions=True)
-            if self._admin_server is not None:
-                await self._admin_server.wait_closed()
-                self._admin_server = None
-            if self.config.peernet_hosting:
-                self.config.admin_socket.unlink(missing_ok=True)
             self.tun.close()
             self.exit_node.close()
             self._flush_byte_counters()
@@ -272,11 +259,34 @@ class Server:
             "Platform": "Linux",
             "Overlay-IPv4": str(self.config.server_ipv4),
             "Overlay-IPv6": str(self.config.server_ipv6),
-            "PeerNet-Hosting": "yes" if self.config.peernet_hosting else "no",
         }).encode())
         if self.config.target_peer:
             writer.write(ControlMessage("PUNCH-READY", {"Peer-ID": self.config.target_peer}).encode())
         await writer.drain()
+
+        device_list_peers: set[str] = set()
+        device_list_in_progress = False
+
+        async def refresh_device_list() -> None:
+            nonlocal device_list_in_progress
+            while True:
+                await asyncio.sleep(5)
+                if device_list_in_progress:
+                    continue
+                device_list_peers.clear()
+                device_list_in_progress = True
+                writer.write(ControlMessage("PEER-INFO", {
+                    "Action": "List",
+                }).encode())
+                await writer.drain()
+
+        refresh_task = asyncio.create_task(
+            refresh_device_list(),
+            name="device-list-refresh",
+        )
+        self._tasks.add(refresh_task)
+        refresh_task.add_done_callback(self._tasks.discard)
+
         while True:
             try:
                 message = await asyncio.wait_for(read_control(reader), timeout=30)
@@ -296,48 +306,27 @@ class Server:
                 if requested_peer:
                     writer.write(ControlMessage("PUNCH-READY", {"Peer-ID": requested_peer}).encode())
                     await writer.drain()
+            elif message.command == "PEER-INFO" and message.get("Action") == "Device":
+                peer_id = message.get("Peer-ID") or ""
+                if peer_id:
+                    device_list_peers.add(peer_id)
+                    self.store.update_peer(
+                        peer_id,
+                        overlay_ipv4=message.get("Overlay-IPv4") or None,
+                        overlay_ipv6=message.get("Overlay-IPv6") or None,
+                        transport=message.get("Transport") or "Disconnected",
+                        endpoint=message.get("Endpoint") or None,
+                    )
+            elif message.command == "PEER-INFO" and message.get("Action") == "List-End":
+                for row in self.store.list_table("peers"):
+                    peer_id = row["peer_id"]
+                    if peer_id != self.config.peer_id and peer_id not in device_list_peers:
+                        self.store.delete_client(peer_id)
+                device_list_in_progress = False
             elif message.command == "ERROR":
                 LOG.warning("Coordinator error: %s", message.get("Reason", "unspecified error"))
             elif message.command in {"DISCONNECT", "AUTH-ERROR"}:
                 raise ConnectionError(message.get("Reason", "coordinator disconnected"))
-
-    async def _start_admin_listener(self) -> None:
-        self.config.admin_socket.parent.mkdir(parents=True, exist_ok=True)
-        self.config.admin_socket.unlink(missing_ok=True)
-        self._admin_server = await asyncio.start_unix_server(
-            self._handle_admin_client, path=self.config.admin_socket,
-        )
-        self.config.admin_socket.chmod(0o660)
-
-    async def _handle_admin_client(self, reader, writer) -> None:
-        try:
-            line = (await asyncio.wait_for(reader.readline(), timeout=5)).decode("ascii").strip()
-            command, separator, target = line.partition(" ")
-            if command != "DELETE" or not separator or not target or any(ord(char) > 127 for char in target):
-                writer.write(b"ERROR expected: DELETE <peer-id>\n")
-            elif target == self.config.peer_id:
-                writer.write(b"ERROR the PeerNet host cannot delete itself\n")
-            else:
-                self.store.delete_client(target)
-                if self.direct_peer_id == target and self.direct_writer is not None:
-                    self.direct_writer.close()
-                await self._admin_queue.put(target)
-                writer.write(f"OK delete request queued for {target}\n".encode("ascii"))
-            await writer.drain()
-        except (TimeoutError, UnicodeError, ConnectionError):
-            pass
-        finally:
-            writer.close()
-
-    async def _admin_forward_loop(self) -> None:
-        while True:
-            target = await self._admin_queue.get()
-            while self._coordinator_writer is None or self._coordinator_writer.is_closing():
-                await asyncio.sleep(0.25)
-            self._coordinator_writer.write(ControlMessage("PEER-INFO", {
-                "Action": "Delete-Client", "Peer-ID": target,
-            }).encode())
-            await self._coordinator_writer.drain()
 
     async def _query_observed_endpoint(self, family: socket.AddressFamily) -> tuple[str, int] | None:
         local_address = self._direct_bind_ipv6 if family == socket.AF_INET6 else self._direct_bind_ipv4

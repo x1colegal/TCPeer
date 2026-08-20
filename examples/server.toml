@@ -30,10 +30,6 @@ software_flow_offload = true
 # Every IPv4 and IPv6 source network arriving through the TUN is forwarded and
 # masqueraded automatically; no source-subnet list is required.
 
-[peernet_hosting]
-enabled = true
-admin_socket = "/run/tcppeer/admin.sock"
-
 [ipv4]
 subnet = "10.50.0.0/24"
 server = "10.50.0.1"

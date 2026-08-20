@@ -45,22 +45,12 @@ def coordinator_text() -> str:
     port = int(ask("TCP listen port", "7443"))
     network = ask("Network name", "home")
     secret = ask("Network secret", secret=True)
-    peernet_hosting = ask_yes_no("Enable Linux-only PeerNet Hosting administration", False)
-    hosting_peer_ids = []
-    hosting_state_db = Path("/var/lib/tcppeer/coordinator/state.db")
-    if peernet_hosting:
-        hosting_peer_ids = [item.strip() for item in ask("Linux host peer IDs, comma-separated").split(",") if item.strip()]
-        hosting_state_db = Path(ask("PeerNet Hosting state path", str(hosting_state_db)))
     log_level = ask("Log level", "INFO").upper()
     config = CoordinatorConfig(
         ipv4, ipv6, port, {network: secret}, log_level,
-        peernet_hosting=peernet_hosting,
-        hosting_peer_ids=tuple(hosting_peer_ids),
-        hosting_state_db=hosting_state_db,
     )
     if not 1 <= config.port <= 65535:
         raise ValueError("TCP port must be between 1 and 65535")
-    hosts_text = ", ".join(quote(item) for item in hosting_peer_ids)
     return f"""# TCPeer coordinator configuration. Only the Secret Key proof is protected.
 [listen]
 ipv4 = {quote(ipv4)}
@@ -69,11 +59,6 @@ port = {port}
 
 [auth.networks]
 {quote(network)} = {quote(secret)}
-
-[peernet_hosting]
-enabled = {str(peernet_hosting).lower()}
-hosts = [{hosts_text}]
-state_db = {quote(str(hosting_state_db))}
 
 [runtime]
 log_level = {quote(log_level)}
@@ -117,7 +102,6 @@ def server_text() -> tuple[str, Path]:
     nat44 = ask_yes_no("Enable nftables NAT44 masquerade", True)
     nat66 = ask_yes_no("Enable nftables NAT66 masquerade", True)
     software_flow_offload = ask_yes_no("Enable nftables software flow offloading", True)
-    peernet_hosting = ask_yes_no("Enable Linux-only PeerNet Hosting control", False)
     log_level = ask("Log level", "INFO").upper()
     state_db = Path(ask("SQLite state path", "/var/lib/tcppeer/server/state.db"))
     ServerConfig(
@@ -134,7 +118,6 @@ def server_text() -> tuple[str, Path]:
         target_peer=target_peer or None,
         exit_node_enabled=exit_node_enabled, nat44=nat44, nat66=nat66,
         software_flow_offload=software_flow_offload,
-        peernet_hosting=peernet_hosting,
     )
     dns_text = ", ".join(quote(item) for item in dns)
     content = f"""# TCPeer server configuration. Only the Secret Key proof is protected.
@@ -162,10 +145,6 @@ enabled = {str(exit_node_enabled).lower()}
 nat44 = {str(nat44).lower()}
 nat66 = {str(nat66).lower()}
 software_flow_offload = {str(software_flow_offload).lower()}
-
-[peernet_hosting]
-enabled = {str(peernet_hosting).lower()}
-admin_socket = "/run/tcppeer/admin.sock"
 
 [ipv4]
 subnet = {quote(str(subnet))}

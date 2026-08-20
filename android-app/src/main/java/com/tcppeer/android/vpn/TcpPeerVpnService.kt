@@ -311,12 +311,108 @@ class TcpPeerVpnService : VpnService() {
             detail = "Direct cleartext TCP connection. No relay and no encryption.",
         ) }
         updateNotification(status)
-        exchangePackets(
-            descriptor,
-            BufferedInputStream(directInput, DIRECT_STREAM_BUFFER_BYTES),
-            BufferedOutputStream(directOutput, DIRECT_STREAM_BUFFER_BYTES),
-            addresses.second.address,
-        )
+
+        coroutineScope {
+            val coordinatorControlJob = launch(Dispatchers.IO) {
+                val devices = mutableListOf<NetworkDevice>()
+                var listInProgress = false
+
+                while (true) {
+                    if (!listInProgress) {
+                        devices.clear()
+                        listInProgress = true
+                        TcpPeerProtocol.writeControl(
+                            controlOutput,
+                            ControlMessage("PEER-INFO", mapOf("Action" to "List")),
+                        )
+                    }
+
+                    try {
+                        coordinator.soTimeout = DEVICE_REFRESH_INTERVAL_MS.toInt()
+                        val message = TcpPeerProtocol.readControl(controlInput)
+
+                        when (message.command) {
+                            "PEER-INFO" -> when (message.field("Action")) {
+                                "Device" -> devices += NetworkDevice(
+                                    peerId = message.field("Peer-ID") ?: "unknown",
+                                    online = message.field("Online") == "yes",
+                                    role = message.field("Role") ?: "Client",
+                                    platform = message.field("Platform") ?: "Unknown",
+                                    transport = message.field("Transport") ?: "None",
+                                    ipv4 = message.field("IPv4").orEmpty().ifBlank { "-" },
+                                    ipv6 = message.field("IPv6").orEmpty().ifBlank { "-" },
+                                    overlayIpv4 = message.field("Overlay-IPv4").orEmpty().ifBlank { "-" },
+                                    overlayIpv6 = message.field("Overlay-IPv6").orEmpty().ifBlank { "-" },
+                                )
+
+                                "List-End" -> {
+                                    TcpPeerRuntime.update { state ->
+                                        state.copy(
+                                            devices = devices.sortedWith(
+                                                compareByDescending<NetworkDevice> { it.online }
+                                                    .thenBy { it.peerId },
+                                            ),
+                                        )
+                                    }
+                                    listInProgress = false
+                                    delay(DEVICE_REFRESH_INTERVAL_MS)
+                                }
+
+                                "Punch-Request" -> {
+                                    TcpPeerProtocol.writeControl(
+                                        controlOutput,
+                                        ControlMessage(
+                                            "PUNCH-READY",
+                                            mapOf(
+                                                "Peer-ID" to (
+                                                    message.field("Peer-ID")
+                                                        ?: config.targetPeerId
+                                                ),
+                                            ),
+                                        ),
+                                    )
+                                }
+                            }
+
+                            "PING", "KEEPALIVE" -> {
+                                TcpPeerProtocol.writeControl(
+                                    controlOutput,
+                                    ControlMessage("PONG"),
+                                )
+                            }
+
+                            "AUTH-ERROR", "DISCONNECT" -> {
+                                throw ProtocolException(
+                                    message.field("Reason")
+                                        ?: "Coordinator disconnected",
+                                )
+                            }
+
+                            "ERROR" -> {
+                                throw ProtocolException(
+                                    message.field("Reason")
+                                        ?: "Coordinator rejected the request",
+                                )
+                            }
+                        }
+                    } catch (_: SocketTimeoutException) {
+                        // Keep waiting for the current list. Do not start
+                        // another List request until List-End arrives.
+                    }
+                }
+            }
+
+            try {
+                exchangePackets(
+                    descriptor,
+                    BufferedInputStream(directInput, DIRECT_STREAM_BUFFER_BYTES),
+                    BufferedOutputStream(directOutput, DIRECT_STREAM_BUFFER_BYTES),
+                    addresses.second.address,
+                )
+            } finally {
+                coordinatorControlJob.cancel()
+            }
+        }
     }
 
     private fun awaitPunchGo(input: java.io.InputStream, output: java.io.OutputStream, config: VpnConfiguration): ControlMessage {
@@ -818,6 +914,7 @@ class TcpPeerVpnService : VpnService() {
         private const val DIRECT_SOCKET_BUFFER_BYTES = 4 * 1024 * 1024
         private const val DIRECT_STREAM_BUFFER_BYTES = 512 * 1024
         private const val DIRECT_FLUSH_INTERVAL_MS = 2L
+        private const val DEVICE_REFRESH_INTERVAL_MS = 5_000L
         private const val TAG = "TCPeerVpnService"
     }
 }
