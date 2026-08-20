@@ -77,24 +77,46 @@ class DirectConnector:
     ):
         if local.family != required_family or remote.family != required_family:
             raise DirectConnectionError("endpoint family violates transport policy")
-        sock = prebound_socket or socket.socket(required_family, socket.SOCK_STREAM, socket.IPPROTO_TCP)
-        sock.setblocking(False)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
-        if hasattr(socket, "SO_REUSEPORT"):
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        try:
-            if prebound_socket is None:
-                sock.bind((local.address, local.port))
-            loop = asyncio.get_running_loop()
-            await asyncio.wait_for(loop.sock_connect(sock, (remote.address, remote.port)), self.timeout)
-            reader, writer = await asyncio.open_connection(sock=sock)
-            return reader, writer
-        except Exception as exc:
-            sock.close()
-            family_name = "TCP6" if required_family == socket.AF_INET6 else "TCP4"
-            raise DirectConnectionError(f"{family_name} direct connection failed") from exc
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 60.0
+        last_exc = None
+
+        while loop.time() < deadline:
+            sock = prebound_socket or socket.socket(required_family, socket.SOCK_STREAM, socket.IPPROTO_TCP)
+            sock.setblocking(False)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+            if hasattr(socket, "SO_REUSEPORT"):
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+
+            try:
+                if prebound_socket is None:
+                    sock.bind((local.address, local.port))
+
+                remaining = deadline - loop.time()
+                attempt_timeout = min(self.timeout, remaining)
+                await asyncio.wait_for(
+                    loop.sock_connect(sock, (remote.address, remote.port)),
+                    attempt_timeout,
+                )
+
+                reader, writer = await asyncio.open_connection(sock=sock)
+                return reader, writer
+
+            except Exception as exc:
+                last_exc = exc
+                sock.close()
+
+                if prebound_socket is not None:
+                    break
+
+                await asyncio.sleep(0.1)
+
+        family_name = "TCP6" if required_family == socket.AF_INET6 else "TCP4"
+        raise DirectConnectionError(
+            f"{family_name} direct connection failed after retry window"
+        ) from last_exc
 
     # No alternate-family attempt exists here by design. Callers must treat an
     # exception as final when IPv6 was selected.
