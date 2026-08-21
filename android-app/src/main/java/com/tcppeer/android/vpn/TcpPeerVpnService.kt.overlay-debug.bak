@@ -344,21 +344,11 @@ class TcpPeerVpnService : VpnService() {
 
         updateConnecting("Negotiating VPN IPv4 and IPv6 addresses.")
         val addresses = negotiateAddresses(directInput, directOutput, config)
-        Log.i(
-            TAG,
-            "Negotiated overlay addresses: IPv4=${addresses.first.address.hostAddress} " +
-                "IPv6=${addresses.second.address.hostAddress}"
-        )
-
-        Log.i(TAG, "Sending Overlay-Update to coordinator")
-
         TcpPeerProtocol.writeControl(controlOutput, ControlMessage("PEER-INFO", linkedMapOf(
             "Action" to "Overlay-Update",
             "Overlay-IPv4" to (addresses.first.address.hostAddress ?: ""),
             "Overlay-IPv6" to (addresses.second.address.hostAddress ?: ""),
         )))
-
-        Log.i(TAG, "Overlay-Update sent to coordinator")
         val descriptor = establishTunnel(config, addresses.first, addresses.second)
             ?: throw IllegalStateException("Android refused to establish the VPN interface")
         tunnel = descriptor

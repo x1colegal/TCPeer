@@ -447,7 +447,7 @@ private fun DeviceCard(device: NetworkDevice, isSelf: Boolean, onPing: () -> Uni
                     Column {
                         Text(device.peerId, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                         Text(
-                            device.role,
+                            listOf(device.overlayIpv6, device.transport).filter { it != "-" }.joinToString(" - "),
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -471,24 +471,6 @@ private fun DeviceCard(device: NetworkDevice, isSelf: Boolean, onPing: () -> Uni
                     DetailRow("Public IPv6", device.ipv6)
                     DetailRow("TCPeer IPv4", device.overlayIpv4)
                     DetailRow("TCPeer IPv6", device.overlayIpv6)
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        Button(
-                            onClick = { copyAddress("TCPeer IPv4", device.overlayIpv4) },
-                            enabled = device.overlayIpv4 != "-",
-                            modifier = Modifier.weight(1f),
-                        ) { Text("Copy IPv4") }
-
-                        Button(
-                            onClick = { copyAddress("TCPeer IPv6", device.overlayIpv6) },
-                            enabled = device.overlayIpv6 != "-",
-                            modifier = Modifier.weight(1f),
-                        ) { Text("Copy IPv6") }
-                    }
-
                     if (!isSelf) {
                         Button(
                             onClick = onPing,

@@ -250,81 +250,30 @@ class TcpPeerVpnService : VpnService() {
         if (registration.command != "ENDPOINT-INFO") throw ProtocolException("Coordinator did not accept registration")
         TcpPeerProtocol.writeControl(controlOutput, ControlMessage("PEER-INFO", mapOf("Action" to "List")))
         readDeviceList(controlInput)
-        var family: DirectFamily
-        var address: InetAddress
-        var peerPort: Int
-        var direct: Socket
+        updateConnecting("Waiting for ${config.targetPeerId} to become ready.")
+        TcpPeerProtocol.writeControl(controlOutput, ControlMessage("PUNCH-READY", mapOf(
+            "Peer-ID" to config.targetPeerId,
+        )))
 
-        while (true) {
-            updateConnecting("Waiting for ${config.targetPeerId} to become ready.")
-            TcpPeerProtocol.writeControl(controlOutput, ControlMessage("PUNCH-READY", mapOf(
-                "Peer-ID" to config.targetPeerId,
-            )))
-
-            val punch = awaitPunchGo(controlInput, controlOutput, config)
-
-            family = when (punch.field("Family")) {
-                "IPv6" -> DirectFamily.IPV6
-                "IPv4" -> DirectFamily.IPV4
-                else -> throw ProtocolException("Coordinator returned an invalid direct family")
-            }
-
-            address = InetAddress.getByName(
-                punch.field("Address")
-                    ?: throw ProtocolException("PUNCH-GO has no address")
-            )
-
-            if (family == DirectFamily.IPV6 && address !is Inet6Address)
-                throw ProtocolException("TCP6 requires an IPv6 endpoint")
-
-            if (family == DirectFamily.IPV4 && address !is Inet4Address)
-                throw ProtocolException("TCP4 requires an IPv4 endpoint")
-
-            if (
-                family == DirectFamily.IPV4 &&
-                localIpv6.isNotEmpty() &&
-                TransportPolicy.isUsableIpv6(address)
-            ) {
-                throw ProtocolException("TCP4 is forbidden when both peers have usable IPv6")
-            }
-
-            val startMillis = punch.field("Start-Ms")?.toLongOrNull() ?: 0L
-            val waitMillis = startMillis - System.currentTimeMillis()
-            if (waitMillis > 0)
-                kotlinx.coroutines.delay(waitMillis)
-
-            peerPort = punch.field("Port")?.toIntOrNull()
-                ?: throw ProtocolException("PUNCH-GO has no valid port")
-
-            updateConnecting(
-                "Opening a direct ${family.name.replace("IPV", "TCP")} connection."
-            )
-
-            try {
-                direct = openDirect(
-                    address,
-                    peerPort,
-                    config.directPort,
-                    family,
-                ).also { directSocket = it }
-
-                break
-            } catch (error: Exception) {
-                directSocket = null
-
-                updateConnecting(
-                    "Attempt to direct connection timed out; retrying"
-                )
-
-                Log.w(
-                    TAG,
-                    "Direct connection attempt failed; requesting a new punch",
-                    error,
-                )
-
-                kotlinx.coroutines.delay(1_000)
-            }
+        val punch = awaitPunchGo(controlInput, controlOutput, config)
+        val family = when (punch.field("Family")) {
+            "IPv6" -> DirectFamily.IPV6
+            "IPv4" -> DirectFamily.IPV4
+            else -> throw ProtocolException("Coordinator returned an invalid direct family")
         }
+        val address = InetAddress.getByName(punch.field("Address") ?: throw ProtocolException("PUNCH-GO has no address"))
+        if (family == DirectFamily.IPV6 && address !is Inet6Address) throw ProtocolException("TCP6 requires an IPv6 endpoint")
+        if (family == DirectFamily.IPV4 && address !is Inet4Address) throw ProtocolException("TCP4 requires an IPv4 endpoint")
+        if (family == DirectFamily.IPV4 && localIpv6.isNotEmpty() && TransportPolicy.isUsableIpv6(address)) {
+            throw ProtocolException("TCP4 is forbidden when both peers have usable IPv6")
+        }
+
+        val startMillis = punch.field("Start-Ms")?.toLongOrNull() ?: 0L
+        val waitMillis = startMillis - System.currentTimeMillis()
+        if (waitMillis > 0) kotlinx.coroutines.delay(waitMillis)
+        val peerPort = punch.field("Port")?.toIntOrNull() ?: throw ProtocolException("PUNCH-GO has no valid port")
+        updateConnecting("Opening a direct ${family.name.replace("IPV", "TCP")} connection.")
+        val direct = openDirect(address, peerPort, config.directPort, family).also { directSocket = it }
         val directInput = direct.getInputStream()
         val directOutput = direct.getOutputStream()
         TcpPeerProtocol.writeControl(directOutput, ControlMessage("PEER-INFO", linkedMapOf(
@@ -344,21 +293,11 @@ class TcpPeerVpnService : VpnService() {
 
         updateConnecting("Negotiating VPN IPv4 and IPv6 addresses.")
         val addresses = negotiateAddresses(directInput, directOutput, config)
-        Log.i(
-            TAG,
-            "Negotiated overlay addresses: IPv4=${addresses.first.address.hostAddress} " +
-                "IPv6=${addresses.second.address.hostAddress}"
-        )
-
-        Log.i(TAG, "Sending Overlay-Update to coordinator")
-
         TcpPeerProtocol.writeControl(controlOutput, ControlMessage("PEER-INFO", linkedMapOf(
             "Action" to "Overlay-Update",
             "Overlay-IPv4" to (addresses.first.address.hostAddress ?: ""),
             "Overlay-IPv6" to (addresses.second.address.hostAddress ?: ""),
         )))
-
-        Log.i(TAG, "Overlay-Update sent to coordinator")
         val descriptor = establishTunnel(config, addresses.first, addresses.second)
             ?: throw IllegalStateException("Android refused to establish the VPN interface")
         tunnel = descriptor
@@ -851,27 +790,13 @@ class TcpPeerVpnService : VpnService() {
                 val packet = TcpPeerProtocol.readData(directInput)
                 pendingRxBytes.addAndGet(packet.size.toLong())
                 val tpp = TppProtocol.parse(packet)
-                when (tpp?.type) {
-                    TppProtocol.ECHO_REQUEST -> {
-                        if (tpp.destination == overlayIpv6) {
-                            val reply = TppProtocol.reply(tpp)
-                            synchronized(directOutput) {
-                                TcpPeerProtocol.writeData(directOutput, reply)
-                            }
-                            outputPending.set(true)
-                            pendingTxBytes.addAndGet(reply.size.toLong())
-                        } else {
-                            tunOutput.write(packet)
-                        }
+                if (tpp?.type == TppProtocol.ECHO_REPLY) {
+                    pendingPings.remove(tpp.identifier)?.let { (peerId, sentAt) ->
+                        val latencyMillis = ((System.nanoTime() - sentAt) / 1_000_000.0)
+                        TcpPeerRuntime.recordPing(peerId, latencyMillis)
                     }
-                    TppProtocol.ECHO_REPLY -> {
-                        pendingPings.remove(tpp.identifier)?.let { (peerId, sentAt) ->
-                            val latencyMillis =
-                                ((System.nanoTime() - sentAt) / 1_000_000.0)
-                            TcpPeerRuntime.recordPing(peerId, latencyMillis)
-                        }
-                    }
-                    else -> tunOutput.write(packet)
+                } else {
+                    tunOutput.write(packet)
                 }
             }
         }

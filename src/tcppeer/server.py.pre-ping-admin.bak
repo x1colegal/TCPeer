@@ -27,7 +27,7 @@ from tcppeer.packet import build_dhcp_packet, extract_dhcp_payload
 from tcppeer.protocol import ControlMessage, ProtocolError, encode_data, read_control, read_data
 from tcppeer.ra import ALL_NODES, build_router_advertisement, is_router_solicitation
 from tcppeer.state import StateStore
-from tcppeer.tpp import ECHO_REQUEST, ECHO_REPLY, build_tpp, build_reply as build_tpp_reply, parse_tpp
+from tcppeer.tpp import ECHO_REQUEST, build_reply as build_tpp_reply, parse_tpp
 from tcppeer.transport import (
     DirectConnectionError,
     DirectConnector,
@@ -101,7 +101,6 @@ class Server:
         self._direct_candidates: dict[socket.AddressFamily, socket.socket] = {}
         self._byte_counters: dict[tuple[str, str], int] = {}
         self._coordinator_writer = None
-        self._pending_tpp_pings: dict[int, asyncio.Future] = {}
         self.exit_node = ExitNodeFirewall(config, config.tun_name)
 
     async def run(self) -> None:
@@ -115,7 +114,6 @@ class Server:
         try:
             self._prepare_direct_candidates()
             await self._start_direct_listeners()
-            await self._start_admin_listener()
             self._tasks = {
                 asyncio.create_task(self._control_loop(), name="control"),
                 asyncio.create_task(self._tun_loop(), name="tun"),
@@ -499,108 +497,6 @@ class Server:
         if transport is not None and transport.get_write_buffer_size() >= 256 * 1024:
             await writer.drain()
 
-    async def _start_admin_listener(self) -> None:
-        admin_socket = Path("/run/tcppeer/server-admin.sock")
-        admin_socket.parent.mkdir(parents=True, exist_ok=True)
-        admin_socket.unlink(missing_ok=True)
-
-        listener = await asyncio.start_unix_server(
-            self._handle_admin_client,
-            path=admin_socket,
-        )
-        admin_socket.chmod(0o660)
-        self._listeners.append(listener)
-        LOG.info("Server admin socket listening on %s", admin_socket)
-
-    async def _handle_admin_client(self, reader, writer) -> None:
-        try:
-            line = (
-                await asyncio.wait_for(reader.readline(), timeout=5)
-            ).decode("ascii").strip()
-
-            parts = line.split()
-            if len(parts) != 2 or parts[0] != "PING":
-                writer.write(b"ERROR expected: PING <peer-id>\n")
-                await writer.drain()
-                return
-
-            peer_id = parts[1]
-
-            if any(ord(char) > 127 for char in peer_id):
-                writer.write(b"ERROR invalid peer-id\n")
-                await writer.drain()
-                return
-
-            if self.direct_writer is None or self.direct_peer_id != peer_id:
-                writer.write(
-                    f"ERROR peer {peer_id} is not directly connected\n".encode("ascii")
-                )
-                await writer.drain()
-                return
-
-            row = self.store.connection.execute(
-                "SELECT overlay_ipv6 FROM peers WHERE peer_id = ?",
-                (peer_id,),
-            ).fetchone()
-
-            if row is None or not row[0] or row[0] == "-":
-                writer.write(
-                    f"ERROR peer {peer_id} has no TCPeer IPv6 address\n".encode("ascii")
-                )
-                await writer.drain()
-                return
-
-            source = ipaddress.IPv6Address(self.config.server_ipv6)
-            destination = ipaddress.IPv6Address(row[0])
-
-            sequence = 0
-            while True:
-                sequence += 1
-                identifier = (
-                    ((os.getpid() & 0xffffffff) << 32)
-                    | (uuid.uuid4().int & 0xffffffff)
-                )
-                sent_ns = time.monotonic_ns()
-
-                future = asyncio.get_running_loop().create_future()
-                self._pending_tpp_pings[identifier] = future
-
-                packet = build_tpp(
-                    source,
-                    destination,
-                    ECHO_REQUEST,
-                    identifier,
-                    sent_ns,
-                )
-
-                await self._write_data(self.direct_writer, packet)
-                self._add_bytes(peer_id, "tx_bytes", len(packet))
-
-                try:
-                    await asyncio.wait_for(future, timeout=3.0)
-                except asyncio.TimeoutError:
-                    writer.write(
-                        f"timeout from {destination}: seq={sequence}\n".encode("ascii")
-                    )
-                else:
-                    elapsed = (time.monotonic_ns() - sent_ns) / 1_000_000
-                    writer.write(
-                        f"reply from {destination}: seq={sequence} "
-                        f"time={elapsed:.1f} ms\n".encode("ascii")
-                    )
-                finally:
-                    self._pending_tpp_pings.pop(identifier, None)
-
-                await writer.drain()
-
-                await asyncio.sleep(1.0)
-
-        except (TimeoutError, UnicodeError, ConnectionError, asyncio.CancelledError):
-            pass
-        finally:
-            writer.close()
-            await writer.wait_closed()
-
     async def _tun_loop(self) -> None:
         while True:
             packet = await self._read_tun()
@@ -628,16 +524,6 @@ class Server:
 
     async def _handle_peer_packet(self, packet: bytes, writer, peer_id: str) -> None:
         tpp = parse_tpp(packet)
-        if (
-            tpp is not None
-            and tpp.kind == ECHO_REPLY
-            and tpp.destination == self.config.server_ipv6
-        ):
-            future = self._pending_tpp_pings.get(tpp.identifier)
-            if future is not None and not future.done():
-                future.set_result(tpp)
-            return
-
         if tpp is not None and tpp.kind == ECHO_REQUEST and tpp.destination == self.config.server_ipv6:
             response = build_tpp_reply(packet)
             if response is not None:

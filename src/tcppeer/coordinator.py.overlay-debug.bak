@@ -207,13 +207,6 @@ class Coordinator:
             known.overlay_ipv4 = message.get("Overlay-IPv4") or ""
             known.overlay_ipv6 = message.get("Overlay-IPv6") or ""
             known.last_seen = int(time.time())
-
-            LOG.info(
-                "Peer %s overlay updated: IPv4=%s IPv6=%s",
-                peer.peer_id,
-                known.overlay_ipv4 or "-",
-                known.overlay_ipv6 or "-",
-            )
         elif message.command in {"PING", "KEEPALIVE"}:
             await self.send(peer.writer, "PONG")
         elif message.command == "PUNCH-READY":

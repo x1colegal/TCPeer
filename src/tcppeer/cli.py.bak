@@ -62,89 +62,87 @@ def run_command(config: ServerConfig, command: str, peer_id: str | None = None) 
 
 
 def _run_ping(config: ServerConfig, peer_id: str) -> None:
-    import re
-    import socket
-    import statistics
-
-    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-
-    transmitted = 0
-    received = 0
-    rtts: list[float] = []
-
+    connection = sqlite3.connect(f"file:{config.state_db}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
     try:
-        client.connect("/run/tcppeer/server-admin.sock")
-        client.sendall(f"PING {peer_id}\n".encode("ascii"))
-
-        print(f"TPP ping {peer_id} - IPv6 Next Header 99")
-
-        try:
-            with client.makefile("r", encoding="ascii") as stream:
-                for line in stream:
-                    line = line.rstrip("\n")
-
-                    if line.startswith("ERROR "):
-                        raise SystemExit(line[6:])
-
-                    match = re.search(
-                        r"seq=(\d+)\s+time=([0-9.]+)\s+ms",
-                        line,
-                    )
-
-                    if match:
-                        sequence = int(match.group(1))
-                        rtt = float(match.group(2))
-
-                        transmitted = max(transmitted, sequence)
-                        received += 1
-                        rtts.append(rtt)
-
-                    elif line.startswith("timeout "):
-                        match = re.search(r"seq=(\d+)", line)
-                        if match:
-                            transmitted = max(
-                                transmitted,
-                                int(match.group(1)),
-                            )
-
-                    print(line)
-
-        except KeyboardInterrupt:
-            print()
-
+        row = connection.execute(
+            "SELECT overlay_ipv6 FROM peers WHERE peer_id = ?",
+            (peer_id,),
+        ).fetchone()
     finally:
-        client.close()
+        connection.close()
 
-        if transmitted > 0:
-            lost = transmitted - received
-            loss = (lost / transmitted) * 100.0
+    if row is None:
+        raise SystemExit(f"Unknown peer: {peer_id}")
 
-            print(f"--- {peer_id} TPP ping statistics ---")
-            print(
-                f"{transmitted} packets transmitted, "
-                f"{received} received, "
-                f"{loss:.1f}% packet loss"
+    destination_text = row["overlay_ipv6"]
+    if not destination_text or destination_text == "-":
+        raise SystemExit(f"Peer {peer_id} has no TCPeer IPv6 address")
+
+    import ipaddress
+
+    source = ipaddress.IPv6Address(config.server_ipv6)
+    destination = ipaddress.IPv6Address(destination_text)
+
+    tun_path = f"/dev/net/tun"
+    fd = os.open(tun_path, os.O_RDWR)
+
+    # Attach to the existing persistent TUN interface.
+    import fcntl
+    IFF_TUN = 0x0001
+    IFF_NO_PI = 0x1000
+    TUNSETIFF = 0x400454ca
+    ifr = struct.pack("16sH", config.tun_name.encode("ascii"), IFF_TUN | IFF_NO_PI)
+    fcntl.ioctl(fd, TUNSETIFF, ifr)
+
+    print(f"TPP ping {peer_id} ({destination}) - IPv6 Next Header 99")
+
+    sequence = 0
+    try:
+        while True:
+            sequence += 1
+            identifier = ((os.getpid() & 0xffffffff) << 32) | (sequence & 0xffffffff)
+            sent_ns = time.monotonic_ns()
+            packet = build_tpp(
+                source,
+                destination,
+                1,
+                identifier,
+                sent_ns,
             )
+            os.write(fd, packet)
 
-            if rtts:
-                minimum = min(rtts)
-                average = statistics.fmean(rtts)
-                maximum = max(rtts)
+            deadline = time.monotonic() + 3.0
+            replied = False
 
-                if len(rtts) >= 2:
-                    jitter = statistics.fmean(
-                        abs(current - previous)
-                        for previous, current in zip(rtts, rtts[1:])
+            while time.monotonic() < deadline:
+                remaining = deadline - time.monotonic()
+                ready, _, _ = select.select([fd], [], [], remaining)
+                if not ready:
+                    break
+
+                incoming = os.read(fd, 65535)
+                message = parse_tpp(incoming)
+                if (
+                    message is not None
+                    and message.kind == ECHO_REPLY
+                    and message.identifier == identifier
+                    and message.source == destination
+                ):
+                    elapsed = (time.monotonic_ns() - sent_ns) / 1_000_000
+                    print(
+                        f"reply from {destination}: "
+                        f"seq={sequence} time={elapsed:.1f} ms"
                     )
-                else:
-                    jitter = 0.0
+                    replied = True
+                    break
 
-                print(
-                    "rtt min/avg/max/jitter = "
-                    f"{minimum:.1f}/{average:.1f}/"
-                    f"{maximum:.1f}/{jitter:.1f} ms"
-                )
+            if not replied:
+                print(f"timeout from {destination}: seq={sequence}")
 
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        print()
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Inspect TCPeer server state")
@@ -158,12 +156,7 @@ def main() -> None:
     args = build_parser().parse_args()
     try:
         config = ServerConfig.from_file(args.config)
-        if args.command == "ping":
-            if not args.peer_id:
-                raise SystemExit("Usage: tcppeer ping <peer-id>")
-            _run_ping(config, args.peer_id)
-        else:
-            run_command(config, args.command, args.peer_id)
+        run_command(config, args.command, args.peer_id)
     except (OSError, ConfigurationError, sqlite3.Error) as exc:
         raise SystemExit(f"Cannot read TCPeer state: {exc}") from exc
 

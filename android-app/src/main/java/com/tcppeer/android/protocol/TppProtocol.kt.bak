@@ -28,15 +28,6 @@ object TppProtocol {
         timestampNanos: Long,
     ): ByteArray = build(source, destination, ECHO_REQUEST, identifier, timestampNanos)
 
-    fun reply(request: TppMessage): ByteArray =
-        build(
-            request.destination,
-            request.source,
-            ECHO_REPLY,
-            request.identifier,
-            request.timestampNanos,
-        )
-
     fun parse(packet: ByteArray): TppMessage? {
         if (
             packet.size < 40 + PAYLOAD_SIZE || (packet[0].toInt() ushr 4) != 6 ||
