@@ -149,39 +149,20 @@ class TcpPeerVpnService : VpnService() {
                 }
             } finally {
                 closeResources()
-
-                val networkRestart = restartRequested.getAndSet(false)
-
-                if (disconnectRequested.get()) {
+                val shouldRestart = restartRequested.getAndSet(false) && !disconnectRequested.get()
+                if (shouldRestart) {
                     connectionJob = null
+                    serviceScope.launch {
+                        delay(750)
+                        if (!disconnectRequested.get()) connect()
+                    }
+                } else if (disconnectRequested.get()) {
                     TcpPeerRuntime.replace(VpnRuntimeState())
                     stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
                 } else {
-                    connectionJob = null
-
-                    TcpPeerRuntime.update {
-                        it.copy(
-                            status = ConnectionStatus.CONNECTING,
-                            detail = if (networkRestart) {
-                                "Underlying network changed. Reconnecting."
-                            } else {
-                                "Connection lost. Reconnecting."
-                            },
-                            connectedAtMillis = null,
-                            devices = emptyList(),
-                        )
-                    }
-                    updateNotification(ConnectionStatus.CONNECTING)
-
-                    serviceScope.launch {
-                        delay(750)
-                        if (!disconnectRequested.get() &&
-                            connectionJob?.isActive != true
-                        ) {
-                            connect()
-                        }
-                    }
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
                 }
             }
         }
