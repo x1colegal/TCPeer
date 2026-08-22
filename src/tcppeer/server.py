@@ -26,6 +26,7 @@ from tcppeer.exit_node import ExitNodeFirewall
 from tcppeer.packet import build_dhcp_packet, extract_dhcp_payload
 from tcppeer.protocol import ControlMessage, ProtocolError, encode_data, read_control, read_data
 from tcppeer.ra import ALL_NODES, build_router_advertisement, is_router_solicitation
+from tcppeer.pd import PrefixDelegationClient, discover_ipv6_upstream, router_address, slaac_subnet
 from tcppeer.state import StateStore
 from tcppeer.tpp import ECHO_REQUEST, ECHO_REPLY, build_tpp, build_reply as build_tpp_reply, parse_tpp
 from tcppeer.transport import (
@@ -103,12 +104,19 @@ class Server:
         self._coordinator_writer = None
         self._pending_tpp_pings: dict[int, asyncio.Future] = {}
         self.exit_node = ExitNodeFirewall(config, config.tun_name)
+        self._active_ipv6_prefix = config.ipv6_prefix
+        self._active_server_ipv6 = config.server_ipv6
+        self._pd_active = False
+        self._pd_interface: str | None = None
 
     async def run(self) -> None:
         self.tun.open()
+
+        await self._configure_initial_ipv6()
+
         self.tun.configure(
             str(self.config.server_ipv4), self.config.ipv4_subnet.prefixlen,
-            str(self.config.server_ipv6), self.config.ipv6_prefix.prefixlen,
+            str(self._active_server_ipv6), self._active_ipv6_prefix.prefixlen,
         )
         self.exit_node.interface = self.tun.name
         self.exit_node.apply()
@@ -121,6 +129,7 @@ class Server:
                 asyncio.create_task(self._tun_loop(), name="tun"),
                 asyncio.create_task(self._ra_loop(), name="router-advertisement"),
                 asyncio.create_task(self._statistics_loop(), name="statistics"),
+                asyncio.create_task(self._pd_loop(), name="prefix-delegation"),
             }
             done, pending = await asyncio.wait(self._tasks, return_when=asyncio.FIRST_EXCEPTION)
             for task in pending:
@@ -260,7 +269,7 @@ class Server:
             "Role": "Exit-Node",
             "Platform": "Linux",
             "Overlay-IPv4": str(self.config.server_ipv4),
-            "Overlay-IPv6": str(self.config.server_ipv6),
+            "Overlay-IPv6": str(self._active_server_ipv6),
         }).encode())
         if self.config.target_peer:
             writer.write(ControlMessage("PUNCH-READY", {"Peer-ID": self.config.target_peer}).encode())
@@ -550,7 +559,7 @@ class Server:
                 await writer.drain()
                 return
 
-            source = ipaddress.IPv6Address(self.config.server_ipv6)
+            source = ipaddress.IPv6Address(self._active_server_ipv6)
             destination = ipaddress.IPv6Address(row[0])
 
             sequence = 0
@@ -631,14 +640,14 @@ class Server:
         if (
             tpp is not None
             and tpp.kind == ECHO_REPLY
-            and tpp.destination == self.config.server_ipv6
+            and tpp.destination == self._active_server_ipv6
         ):
             future = self._pending_tpp_pings.get(tpp.identifier)
             if future is not None and not future.done():
                 future.set_result(tpp)
             return
 
-        if tpp is not None and tpp.kind == ECHO_REQUEST and tpp.destination == self.config.server_ipv6:
+        if tpp is not None and tpp.kind == ECHO_REQUEST and tpp.destination == self._active_server_ipv6:
             response = build_tpp_reply(packet)
             if response is not None:
                 await self._write_data(writer, response)
@@ -662,9 +671,112 @@ class Server:
             return
         self.tun.write(packet)
 
+    async def _configure_initial_ipv6(self) -> None:
+        interface = discover_ipv6_upstream({self.config.tun_name})
+        self._pd_interface = interface
+
+        if interface is None:
+            LOG.warning("No IPv6 upstream interface found; using NAPT66 fallback")
+            self._use_ipv6_fallback()
+            return
+
+        delegated = await PrefixDelegationClient(interface).acquire()
+        if delegated is None:
+            LOG.info(
+                "Upstream %s provided no DHCPv6-PD; using NAPT66 fallback",
+                interface,
+            )
+            self._use_ipv6_fallback()
+            return
+
+        subnet = slaac_subnet(delegated.prefix)
+        if subnet is None:
+            LOG.warning(
+                "Delegated prefix %s is narrower than /64; using NAPT66 fallback",
+                delegated.prefix,
+            )
+            self._use_ipv6_fallback()
+            return
+
+        self._active_ipv6_prefix = subnet
+        self._active_server_ipv6 = router_address(subnet)
+        self._pd_active = True
+        self.exit_node.nat66_enabled = False
+
+        LOG.info(
+            "Using delegated IPv6 prefix %s for TCPeer SLAAC; NAT66 disabled",
+            subnet,
+        )
+
+    def _use_ipv6_fallback(self) -> None:
+        self._active_ipv6_prefix = self.config.ipv6_prefix
+        self._active_server_ipv6 = self.config.server_ipv6
+        self._pd_active = False
+        self.exit_node.nat66_enabled = self.config.nat66
+
+    async def _pd_loop(self) -> None:
+        while True:
+            await asyncio.sleep(60)
+
+            interface = discover_ipv6_upstream({self.tun.name})
+            if interface is None:
+                if self._pd_active:
+                    LOG.warning("IPv6 upstream disappeared; enabling NAPT66 fallback")
+                    await self._switch_to_ipv6_fallback()
+                continue
+
+            delegated = await PrefixDelegationClient(interface).acquire()
+            subnet = slaac_subnet(delegated.prefix) if delegated else None
+
+            if subnet is None:
+                if self._pd_active:
+                    LOG.warning(
+                        "DHCPv6-PD is no longer available; enabling NAPT66 fallback"
+                    )
+                    await self._switch_to_ipv6_fallback()
+                continue
+
+            if self._pd_active and subnet == self._active_ipv6_prefix:
+                continue
+
+            LOG.info("Switching TCPeer SLAAC to delegated prefix %s", subnet)
+
+            self._active_ipv6_prefix = subnet
+            self._active_server_ipv6 = router_address(subnet)
+            self._pd_active = True
+            self._pd_interface = interface
+
+            self.tun.configure(
+                str(self.config.server_ipv4),
+                self.config.ipv4_subnet.prefixlen,
+                str(self._active_server_ipv6),
+                self._active_ipv6_prefix.prefixlen,
+            )
+
+            self.exit_node.nat66_enabled = False
+            self.exit_node.apply()
+
+            if self.direct_writer is not None:
+                await self._write_data(self.direct_writer, self._ra_packet())
+
+    async def _switch_to_ipv6_fallback(self) -> None:
+        self._use_ipv6_fallback()
+
+        self.tun.configure(
+            str(self.config.server_ipv4),
+            self.config.ipv4_subnet.prefixlen,
+            str(self._active_server_ipv6),
+            self._active_ipv6_prefix.prefixlen,
+        )
+
+        self.exit_node.apply()
+
+        if self.direct_writer is not None:
+            await self._write_data(self.direct_writer, self._ra_packet())
+
     def _ra_packet(self) -> bytes:
         return build_router_advertisement(
-            self.config.server_ipv6, self.config.ipv6_prefix,
+            self._active_server_ipv6, self._active_ipv6_prefix,
             self.config.router_lifetime_seconds,
             self.config.preferred_lifetime_seconds,
             self.config.valid_lifetime_seconds,

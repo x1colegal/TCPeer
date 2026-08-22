@@ -34,6 +34,7 @@ class ExitNodeFirewall:
             raise ExitNodeError("invalid TUN interface name for nftables")
         self.config = config
         self.interface = interface
+        self.nat66_enabled = config.nat66
 
     def apply(self) -> None:
         if self.config.exit_node_enabled:
@@ -67,7 +68,7 @@ class ExitNodeFirewall:
         self._ensure_host_input_accepts()
         LOG.info(
             "Enabled forwarding with NAT44=%s NAT66=%s software-flow-offload=%s on %s",
-            self.config.nat44, self.config.nat66, bool(upstream), self.interface,
+            self.config.nat44, self.nat66_enabled, bool(upstream), self.interface,
         )
 
     def close(self) -> None:
@@ -111,7 +112,7 @@ class ExitNodeFirewall:
     iifname "{tun}" oifname != "{tun}" masquerade
   }}
 }}''')
-        if self.config.nat66:
+        if self.nat66_enabled:
             sections.append(f'''table ip6 tcppeer_nat66 {{
   chain postrouting {{
     type nat hook postrouting priority srcnat; policy accept;
