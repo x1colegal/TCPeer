@@ -1,202 +1,736 @@
 # TCPeer
 
-TCPeer is an experimental, dual-stack, peer-to-peer layer-3 VPN whose outer
-transport is always a direct TCP connection. A small coordinator authenticates
-peers, discovers their public TCP mappings, exchanges candidates, and
-synchronizes TCP simultaneous-open. The coordinator never relays VPN traffic.
+TCPeer is an experimental dual-stack Layer 3 peer-to-peer VPN built around direct TCP connections.
+
+TCP is the outer transport used for VPN traffic. A lightweight coordinator provides authentication, peer discovery, endpoint registration, device synchronization, and coordinated TCP simultaneous-open.
+
+The coordinator does **not** relay tunneled traffic.
+
+Once a direct connection is established, IPv4 and IPv6 packets are transferred directly between peers as their original raw IP bytes.
+
+**TCPeer adds 0 bytes of TCPeer-specific framing overhead to the data plane.**
 
 > [!WARNING]
-> TCPeer is not an encrypted VPN. Only possession of the Secret Key is proven
-> with HMAC-SHA256; control metadata and tunneled IPv4/IPv6 packets are sent in
-> cleartext. Do not use TCPeer for confidential traffic.
+> TCPeer is not an encrypted VPN.
+>
+> Authentication proves possession of the configured Secret Key using HMAC-SHA256, but the direct TCP stream itself is cleartext.
+>
+> Applications should use their own encryption, such as HTTPS or SSH, when confidentiality is required.
 
-The repository includes:
+---
 
-- a Python coordinator for the control plane;
-- a stateful Linux VPN server and exit node;
-- an interactive Linux configurator and hardened systemd units;
-- a native Android `VpnService` client with a Material 3/Material You UI;
-- DHCPv4, IPv6 SLAAC/RA, automatic upstream DNS, NAT44/NAT66, and forwarding;
-- a synchronized device list, coordinator-local administration, and IPv6 TPP ping.
+## Features
 
-The complete wire-level contract is in
-[docs/technical-specification.md](docs/technical-specification.md).
+TCPeer currently provides:
 
-## How it works
+- Direct peer-to-peer TCP transport
+- TCP over IPv4 and IPv6
+- Coordinator-assisted peer discovery
+- Separate IPv4 and IPv6 endpoint registration
+- TCP simultaneous-open / TCP hole punching
+- HMAC-SHA256 Secret Key authentication
+- Raw IPv4 and IPv6 Layer 3 tunneling
+- **0-byte TCPeer data-plane framing**
+- Linux TUN interface
+- Native Android `VpnService` client
+- IPv4 DHCP support
+- IPv6 SLAAC and Router Advertisements
+- DHCPv6 Prefix Delegation support
+- Automatic upstream DNS discovery
+- RDNSS advertisement
+- IPv4 and IPv6 forwarding
+- NAT44
+- NAT66
+- nftables integration
+- Optional nftables software flow offload
+- Linux exit-node operation
+- Persistent SQLite state
+- Device/peer synchronization
+- Automatic Android reconnection
+- TPP / TCPPeerPing
+- Coordinator-local administration
+- Interactive Linux configuration
+- systemd services
 
-```mermaid
-flowchart LR
-    A[Android client] -- TCP control --> C[Coordinator]
-    S[Linux server / exit node] -- TCP control --> C
-    C -. endpoints + synchronized PUNCH-GO .-> A
-    C -. endpoints + synchronized PUNCH-GO .-> S
-    A == direct TCP4 or TCP6<br/>cleartext IP frames ==> S
-    S --> T[TUN tcppeer0]
-    T --> L[LAN and routed subnets]
-    T --> N[Internet through NAT44 / NAT66]
+---
+
+# Architecture
+
+A normal TCPeer deployment consists of:
+
+1. A coordinator
+2. A Linux server / exit node
+3. An Android client
+
+```text
+                         CONTROL PLANE
+
+                   +----------------------+
+                   |     Coordinator      |
+                   |                      |
+                   | Authentication       |
+                   | Peer discovery       |
+                   | Endpoint discovery   |
+                   | Connection sync      |
+                   | Device state         |
+                   +----------+-----------+
+                              |
+                    TCP control connections
+                         /            \
+                        /              \
+                       /                \
+          +-----------+----+       +----+-------------+
+          | Android Client |       | Linux Server     |
+          | VpnService     |       | / Exit Node      |
+          +-----------+----+       +----+-------------+
+                      \                 /
+                       \               /
+                        \             /
+                    direct TCP4 / TCP6
+                             |
+                             |
+                         DATA PLANE
+                             |
+                   raw IPv4 / IPv6
+                             |
+                   0 bytes of TCPeer
+                       framing
 ```
 
-The coordinator observes and registers a public address and mapped port for
-each available IP family. At a shared start time both peers connect from the
-same local TCP port used to create that mapping. This allows TCP
-simultaneous-open through compatible NATs.
+The coordinator participates only in the control plane.
 
-The direct TCP stream carries framed raw IPv4 and IPv6 packets. The family of
-the outer connection does not restrict the inner packets: a TCP6 connection
-can transport both IPv4 and IPv6 traffic.
+Actual VPN packets travel directly between peers.
 
-### Transport rules
+There is no coordinator traffic relay.
 
-- TCP is the only outer socket transport. There is no UDP tunnel, QUIC,
-  WebRTC, TLS, or DERP-style relay.
-- The coordinator carries ASCII control blocks only and never carries VPN
-  packets.
-- Direct-connect failure is final because TCPeer has no relay fallback.
-- Globally reachable IPv6 is preferred when both peers have it.
-- ULA, link-local, and private addresses are not advertised as public
-  endpoints. A local candidate is used only when both peers are behind the
-  same observed public address and share the corresponding local prefix.
-- TCP4 is selected when a usable public TCP6 path is unavailable.
-- Public address discovery and direct connect use the same configured source
-  port. Separate IPv4 and IPv6 mapped ports are registered with the
-  coordinator.
+---
 
-TCP hole punching requires endpoint-independent NAT mapping and support for
-simultaneous-open. Symmetric/endpoint-dependent NAT, CGNAT policy, aggressive
-firewalls, or source-port rewriting can make a direct connection impossible.
+# Direct transport
 
-## Requirements
+TCPeer uses **TCP** as its outer transport.
 
-### Coordinator
+It does not use an outer:
 
-- Python 3.11 or newer;
-- a reachable TCP port, `7443` by default;
-- a DNS name, IPv4 address, or IPv6 address is accepted by clients.
+- UDP tunnel
+- QUIC tunnel
+- HTTP/3 tunnel
+- WebRTC tunnel
+- WireGuard transport
+- coordinator packet relay
 
-### Linux server
+A direct connection can use:
 
-- Linux with `/dev/net/tun`;
-- Python 3.11 or newer;
-- `nft`, `ip`, and `sysctl`;
-- root for configuration and `CAP_NET_ADMIN` at runtime;
-- TCP ports `7443` and `7444` are the defaults for coordinator and direct
-  connectivity, but both are configurable.
-
-### Android client
-
-- Android 8.0/API 26 or newer;
-- Android VPN permission;
-- JDK 17 and Android SDK 36 to build the application.
-
-## Quick start
-
-The examples below use `coordinator.example.net`, network `home`, coordinator
-port `7443`, and direct port `7444`. Replace them with your own values and use a
-strong Secret Key shared only by peers in the same TCPeer network.
-
-### 1. Install the Python package
-
-On Debian 12 and similar externally-managed Python installations:
-
-```console
-sudo python3 -m pip install --break-system-packages .
+```text
+TCP4
 ```
 
-This installs `tcppeer-coordinator`, `tcppeer-server`, `tcppeer-configure`, and
-`tcppeer`. The root-level `coordinator.py`, `server.py`, `configure.py`, and
-`cli.py` wrappers can also be run directly from the source tree.
+or:
 
-### 2. Configure the coordinator
-
-Run the configurator as root and choose `Coordinator`:
-
-```console
-sudo python3 configure.py
+```text
+TCP6
 ```
 
-It writes `/etc/tcppeer/coordinator.toml`, installs
-`tcppeer-coordinator.service`, reloads systemd, and can enable/start the
-service. A minimal manual configuration is available at
-[examples/coordinator.toml](examples/coordinator.toml).
+The IP family of the outer TCP connection is independent of the IP family of the tunneled packet.
 
-```console
-sudo systemctl status tcppeer-coordinator --no-pager -l
-sudo journalctl -u tcppeer-coordinator -f
+For example:
+
+```text
+Outer connection:
+
+IPv6
+  |
+ TCP
+  |
+  +-- raw IPv4 packet
+  +-- raw IPv6 packet
+  +-- raw IPv4 packet
+  +-- raw IPv6 packet
 ```
 
-### 3. Configure the Linux server
+---
 
-Install the same package on the Linux exit node, then run:
+# RAW IP data plane
 
-```console
-sudo python3 configure.py
+The current TCPeer data plane does **not** use TCPD or another TCPeer-specific per-packet frame.
+
+There is:
+
+```text
+NO TCPD
+NO DATA magic
+NO TCPeer packet-length prefix
+NO ASCII packet metadata
+NO binary TCPeer DATA header
+NO transport-header conversion
+NO TCP/UDP/SCTP/DCCP header reconstruction
+NO TCPeer checksum field
 ```
 
-Choose `Server` and provide the same network name and Secret Key used by the
-coordinator. The configurator writes `/etc/tcppeer/server.toml` and installs
-`tcppeer-server.service`. It must run with `sudo`; execution as an unprivileged
-user is rejected. A complete annotated configuration is available at
-[examples/server.toml](examples/server.toml).
+The direct TCP stream contains the original IP packets.
 
-```console
-sudo systemctl status tcppeer-server --no-pager -l
-sudo journalctl -u tcppeer-server -f
-ip address show tcppeer0
+Conceptually:
+
+```text
+<IPv6 packet><IPv4 packet><IPv6 packet><IPv6 packet>...
 ```
 
-### 4. Build and install Android
+If a packet obtained from the TUN starts with:
 
-Set the Android SDK path and build from a terminal:
-
-```console
-export ANDROID_HOME="$HOME/Android"
-./gradlew :android-app:testDebugUnitTest :android-app:assembleDebug
-adb install -r android-app/build/outputs/apk/debug/android-app-debug.apk
+```text
+60 00 00 00 00 28 06 40 ...
 ```
 
-Open TCPeer, grant VPN permission, and configure:
+those bytes are written directly to the direct TCP connection.
 
-- Coordinator Address: DNS name, IPv4, or IPv6 without `http://` or brackets;
-- Coordinator Port: `7443` by default;
-- Network and Secret Key: must match the coordinator;
-- Peer ID: unique Android device name;
-- Target Peer ID: the Linux server peer ID;
-- Direct Port: `7444` by default;
-- MTU: `1400` by default.
+TCPeer does not prepend a TCPD header or any other data-plane header.
 
-Tap **Connect**. Disconnect by using the switch at the top of the main screen.
+Therefore:
 
-## Android routing and local-network access
+```text
+TCPeer-specific framing overhead = 0 bytes per IP packet
+```
 
-Android installs IPv4 and IPv6 default routes through TCPeer, so ordinary
-internet traffic uses the Linux exit node. The coordinator and direct sockets
-are protected with `VpnService.protect()` to prevent routing loops.
+This does **not** mean the network itself has zero overhead.
 
-Directly connected physical prefixes are excluded automatically, preserving
-access to devices on the current Wi-Fi, Ethernet, or cellular local network.
-Android 13 and newer use `VpnService.Builder.excludeRoute()`. Android 8 through
-12 receive an equivalent set of split default routes calculated around the
-local prefixes. If a physical prefix overlaps a TCPeer overlay prefix, the VPN
-overlay wins because both routes cannot represent different networks at the
-same destination.
+The normal headers still exist:
 
-The service watches the underlying Android network. A Wi-Fi/LTE or address
-change restarts endpoint discovery instead of continuing to advertise a stale
-mapping.
+```text
+Outer IP
+Outer TCP
+Inner IP
+Inner transport protocol
+Application data
+```
 
-## Exit node, forwarding, NAT, and DNS
+The zero-byte statement refers specifically to additional **TCPeer data-plane framing**.
 
-When `[exit_node].enabled = true`, the Linux server:
+---
 
-- enables IPv4 and IPv6 kernel forwarding;
-- forwards every source subnet arriving through `tcppeer0`, including networks
-  routed behind the peer;
-- applies NAT44 and NAT66 masquerade when enabled;
-- discovers active IPv4/IPv6 upstream interfaces automatically;
-- enables nftables software flow offloading when supported and falls back to
-  normal forwarding otherwise;
-- discovers DNS servers associated with active upstream default routes when
-  no explicit DNS list is configured.
+# Packet boundaries over TCP
+
+TCP is a byte stream.
+
+It does not preserve application `write()` boundaries.
+
+For example, a sender may perform:
+
+```text
+write(packetA)
+write(packetB)
+write(packetC)
+```
+
+but the receiver must not assume that three corresponding TCP `read()` calls will return exactly those three packets.
+
+TCPeer therefore derives packet boundaries from information already contained in each raw IP packet.
+
+No additional TCPeer framing bytes are required.
+
+---
+
+## IPv4 packet boundaries
+
+The first nibble identifies IPv4:
+
+```text
+Version = 4
+```
+
+The IPv4 header contains the 16-bit:
+
+```text
+Total Length
+```
+
+field.
+
+That value describes the complete IPv4 packet.
+
+Conceptually:
+
+```text
++----------------------+
+| IPv4 header          |
+|                      |
+| Total Length = N     |
++----------------------+
+| Remaining IPv4 data  |
+|                      |
++----------------------+
+
+Complete packet = N bytes
+```
+
+TCPeer can therefore determine where the current IPv4 packet ends and where the next packet begins without adding its own length field.
+
+IPv4 options are naturally included because `Total Length` covers the complete IPv4 packet.
+
+---
+
+## IPv6 packet boundaries
+
+IPv6 uses a fixed 40-byte base header.
+
+The base header contains:
+
+```text
+Payload Length
+```
+
+For ordinary IPv6 packets, the complete packet length is therefore:
+
+```text
+40 + Payload Length
+```
+
+Conceptually:
+
+```text
++----------------------+ 40 bytes
+| IPv6 base header     |
+|                      |
+| Payload Length = N   |
++----------------------+
+| IPv6 payload         | N bytes
++----------------------+
+
+Complete packet = 40 + N bytes
+```
+
+The next byte after that packet belongs to the next raw IP packet in the TCP stream.
+
+---
+
+# Inner protocols
+
+The raw data plane is not limited to TCP payloads.
+
+TCPeer carries complete Layer 3 packets.
+
+Examples include:
+
+```text
+IPv4 / TCP
+IPv4 / UDP
+IPv4 / ICMP
+IPv4 / SCTP
+IPv4 / DCCP
+
+IPv6 / TCP
+IPv6 / UDP
+IPv6 / ICMPv6
+IPv6 / SCTP
+IPv6 / DCCP
+IPv6 / TPP
+```
+
+TCPeer does not need to convert the inner transport header into separate metadata.
+
+For example, an IPv6/TCP packet remains:
+
+```text
++-------------------+
+| IPv6 header       |
++-------------------+
+| TCP header        |
++-------------------+
+| TCP payload       |
++-------------------+
+```
+
+The complete byte sequence is transferred as the inner raw IPv6 packet.
+
+The same principle applies to UDP, ICMP, ICMPv6, SCTP, DCCP, TPP, DHCP, DNS, and other protocols carried inside IPv4 or IPv6.
+
+---
+
+# Packet path
+
+## Android -> Linux
+
+```text
+Android application
+        |
+        v
+Android IP stack
+        |
+        v
+VpnService TUN
+        |
+        v
+raw IP packet
+        |
+        v
+direct TCP connection
+        |
+        v
+raw IP packet
+        |
+        v
+Linux tcppeer0
+        |
+        +------> routed network
+        |
+        +------> exit-node forwarding
+        |
+        +------> Internet
+```
+
+No TCPeer DATA/TCPD header is inserted between the two TUN endpoints.
+
+---
+
+## Linux -> Android
+
+```text
+Linux tcppeer0
+        |
+        v
+raw IP packet
+        |
+        v
+direct TCP connection
+        |
+        v
+raw IP packet
+        |
+        v
+Android VpnService TUN
+        |
+        v
+Android IP stack
+```
+
+---
+
+# Control plane vs data plane
+
+TCPeer intentionally separates the control plane from the data plane.
+
+## Control plane
+
+The coordinator is responsible for information such as:
+
+```text
+Authentication
+Peer registration
+Peer discovery
+Endpoint discovery
+Device synchronization
+Direct-connection coordination
+Keepalive
+Administration
+```
+
+Control-plane messages have their own protocol.
+
+They are not raw IP packets.
+
+## Data plane
+
+After direct connectivity is established, the peer-to-peer data stream carries:
+
+```text
+raw IP packets
+```
+
+There is no TCPD layer between outer TCP and the inner IP packets.
+
+---
+
+# Coordinator
+
+The coordinator handles TCPeer's control plane.
+
+Its responsibilities include:
+
+- Network authentication
+- Peer authentication
+- Peer registration
+- Public endpoint observation
+- IPv4 candidate registration
+- IPv6 candidate registration
+- Peer discovery
+- Direct-connection coordination
+- Device information synchronization
+- Online/offline state
+- Coordinator-local administration
+
+The coordinator does **not** become the VPN data path.
+
+If peers cannot establish the required direct connection, the coordinator does not become a packet relay.
+
+---
+
+# Authentication
+
+Peers belonging to the same TCPeer network share a Secret Key.
+
+The Secret Key itself is not transmitted as the authentication proof.
+
+TCPeer uses HMAC-SHA256 challenge/response authentication.
+
+A fresh coordinator nonce is used in authentication.
+
+This proves possession of the shared Secret Key.
+
+It does **not** encrypt the direct TCP stream.
+
+---
+
+# TCP simultaneous-open
+
+TCPeer can coordinate TCP simultaneous-open for direct connectivity through compatible NAT implementations.
+
+Conceptually:
+
+```text
+Peer A                           Peer B
+  |                                |
+  | endpoint registration          |
+  |------------------------------->|
+  |                                |
+  |        Coordinator             |
+  |             |                  |
+  |        synchronization         |
+  |             |                  |
+  |<------------+----------------->|
+  |                                |
+  |---- TCP SYN ----------->        |
+  |        <----------- TCP SYN ----|
+  |                                |
+  |====== direct TCP stream =======|
+```
+
+Actual success depends on:
+
+- NAT behavior
+- Firewall behavior
+- Source-port preservation
+- Endpoint mapping behavior
+- CGNAT behavior
+- TCP simultaneous-open support
+- Reachability between both peers
+
+Restrictive or endpoint-dependent NAT implementations can prevent a direct connection.
+
+---
+
+# IPv4 and IPv6 direct connectivity
+
+TCPeer tracks IPv4 and IPv6 direct endpoints independently.
+
+A direct connection may therefore be:
+
+```text
+TCP4
+```
+
+or:
+
+```text
+TCP6
+```
+
+When a usable IPv6 path exists, TCPeer can use a direct TCP6 connection.
+
+TCP4 remains available for networks where direct IPv6 connectivity is unavailable.
+
+The inner VPN remains dual-stack regardless of which outer family is selected.
+
+For example:
+
+```text
+TCP6 outer connection
+        |
+        +--- IPv4 inner traffic
+        |
+        +--- IPv6 inner traffic
+```
+
+is valid.
+
+Likewise:
+
+```text
+TCP4 outer connection
+        |
+        +--- IPv4 inner traffic
+        |
+        +--- IPv6 inner traffic
+```
+
+is valid.
+
+---
+
+# Linux server
+
+The Linux component provides the server side of the TCPeer Layer 3 tunnel.
+
+It normally creates:
+
+```text
+tcppeer0
+```
+
+as a TUN interface.
+
+The server can also operate as an Internet exit node.
+
+Typical requirements:
+
+- Linux
+- Python 3.11+
+- `/dev/net/tun`
+- `ip`
+- `nft`
+- `sysctl`
+- systemd for the provided service setup
+- sufficient network privileges
+
+---
+
+# Android client
+
+The Android application is a native TCPeer client built around Android `VpnService`.
+
+The Android client handles:
+
+- Coordinator connection
+- Authentication
+- Peer discovery
+- Direct TCP4/TCP6 establishment
+- TUN/VPN configuration
+- IPv4 routing
+- IPv6 routing
+- Raw IP packet transfer
+- Automatic reconnect
+- Network-change handling
+- Device information
+- Traffic statistics
+- TPP ping
+
+The VPN socket used for TCPeer itself must remain outside the VPN route to prevent recursive tunneling.
+
+Android's `VpnService.protect()` is used for this purpose.
+
+---
+
+# Android routing
+
+TCPeer can install IPv4 and IPv6 routes through the Android VPN.
+
+This allows the Linux peer to operate as an exit node.
+
+Conceptually:
+
+```text
+Android application
+       |
+       v
+default VPN route
+       |
+       v
+TCPeer VpnService
+       |
+       v
+protected direct TCP socket
+       |
+       v
+physical Android network
+       |
+       v
+Linux TCPeer server
+       |
+       v
+Internet
+```
+
+The direct TCP socket itself is protected from the VPN so that TCPeer does not tunnel its own transport through itself.
+
+---
+
+# IPv4 addressing
+
+TCPeer can provide IPv4 addressing to clients.
+
+DHCPv4 traffic is transported **inside** the VPN as normal raw IPv4/UDP packets.
+
+There is no special outer UDP DHCP tunnel.
+
+Conceptually:
+
+```text
+IPv4
+  |
+ UDP
+  |
+DHCP
+```
+
+is simply another raw IPv4 packet inside the TCPeer data plane.
+
+IPv4 leases can be persisted in SQLite.
+
+---
+
+# IPv6 addressing
+
+TCPeer supports IPv6 configuration using:
+
+- Router Solicitation
+- Router Advertisement
+- SLAAC
+- RDNSS
+
+ICMPv6 packets remain ordinary raw IPv6 packets.
+
+For example:
+
+```text
+IPv6
+  |
+ICMPv6
+  |
+Router Solicitation
+```
+
+and:
+
+```text
+IPv6
+  |
+ICMPv6
+  |
+Router Advertisement
+```
+
+travel through the same raw IP data path as any other IPv6 packet.
+
+---
+
+# DHCPv6 Prefix Delegation
+
+The Linux TCPeer server can obtain an IPv6 prefix from its upstream network using DHCPv6 Prefix Delegation.
+
+A delegated prefix can then be used for TCPeer's IPv6 network.
+
+This allows TCPeer to provide routed IPv6 connectivity to VPN clients using upstream-delegated address space.
+
+When a routable delegated prefix is available, IPv6 can operate without NAT66.
+
+When the configured topology requires translation, NAT66 can be enabled instead.
+
+The exact behavior depends on the server configuration and upstream network.
+
+---
+
+# Exit node
+
+The Linux server can operate as a TCPeer exit node.
+
+Example configuration:
 
 ```toml
 [exit_node]
@@ -204,239 +738,1254 @@ enabled = true
 nat44 = true
 nat66 = true
 software_flow_offload = true
+```
 
+When enabled, TCPeer can configure:
+
+- IPv4 forwarding
+- IPv6 forwarding
+- forwarding from `tcppeer0`
+- NAT44
+- NAT66
+- upstream-interface detection
+- nftables rules
+- optional software flow offload
+
+If clients use directly routed IPv6 space, NAT66 can be disabled.
+
+---
+
+# NAT44 and NAT66
+
+TCPeer uses nftables for forwarding and NAT.
+
+TCPeer-managed tables may include:
+
+```text
+tcppeer_forward
+tcppeer_nat44
+tcppeer_nat66
+```
+
+NAT rules apply to traffic arriving through the TCPeer TUN according to the configured exit-node behavior.
+
+This also allows routed traffic behind a TCPeer peer to be handled where supported by the deployment.
+
+---
+
+# Software flow offload
+
+TCPeer can optionally configure nftables software flow offloading.
+
+Example:
+
+```toml
+[exit_node]
+software_flow_offload = true
+```
+
+When supported by the kernel and current networking topology, eligible forwarded flows can enter an nftables flowtable.
+
+If software flow offload cannot be used, normal forwarding remains available.
+
+---
+
+# DNS
+
+TCPeer can discover DNS servers from the Linux server's active upstream network.
+
+IPv6 Router Advertisements can advertise DNS servers through RDNSS.
+
+An empty configured DNS list can be used when automatic discovery is desired.
+
+Example:
+
+```toml
 [ipv6]
-# An empty list enables dual-stack upstream DNS discovery.
 dns = []
 ```
 
-The server owns the nftables tables `tcppeer_forward`, `tcppeer_nat44`, and
-`tcppeer_nat66`. NAT matches traffic by TUN input interface rather than by one
-hard-coded source subnet.
+DNS itself receives no special TCPeer data framing.
 
-### Host input firewall behavior
+A DNS packet remains an ordinary IPv4 or IPv6 packet in the tunnel.
 
-Server startup creates `tcppeer_input` and also inserts a rule at the beginning
-of existing priority-filter `INPUT` base chains. The inserted rule is tagged
-`tcppeer-open-input` and accepts:
+---
 
-- all TCP ports;
-- all UDP ports;
-- ICMP for IPv4;
-- ICMPv6 for IPv6.
+# TPP / TCPPeerPing
 
-Insertion into the existing chains is necessary because an accept verdict in
-one nftables base chain does not prevent a later base chain from dropping the
-same packet. The tag prevents duplicate insertion after service restarts.
+TCPPeerPing, abbreviated **TPP**, is TCPeer's latency protocol.
 
-> [!CAUTION]
-> This intentionally exposes every listening TCP/UDP service on every server
-> interface. A port with no listening process will still report `closed`; the
-> firewall rule only prevents it from reporting `filtered` because of an input
-> drop. Apply a narrower host firewall if this behavior is unsuitable.
+TPP uses IPv6 Next Header:
 
-```console
-sudo nft -a list table inet tcppeer_input
-sudo nft -a list ruleset | grep -C 2 tcppeer-open-input
+```text
+99
 ```
 
-## Address assignment
+and the protocol magic:
 
-The Linux server owns a dual-stack layer-3 TUN interface:
+```text
+TPP1
+```
 
-- DHCPv4 messages are raw inner UDP/IP packets transported inside the direct
-  TCP stream. TCPeer never opens an outer UDP socket for DHCP.
-- IPv4 leases are persistent in SQLite and allocated transactionally.
-- IPv6 uses Router Solicitation/Advertisement and SLAAC with a `/64` prefix.
-- Router Advertisements can carry RDNSS information.
-- The same direct TCP stream transports both address families.
+TPP requests and replies contain timing information used to calculate round-trip latency.
 
-## TPP: TCPPeerPing
+A TPP packet is an ordinary inner IPv6 packet:
 
-TCPPeerPing is TCPeer's IPv6-only latency protocol. It uses IPv6 Next Header
-`99`, magic `TPP1`, and request/reply timestamps. It is transported as an inner
-IPv6 packet through the VPN rather than as an operating-system ICMP socket.
+```text
++----------------------+
+| IPv6 header          |
+| Next Header = 99     |
++----------------------+
+| TPP                  |
+| Magic = TPP1         |
++----------------------+
+```
 
-The Android Clients screen provides a **Ping client** action. It opens a
-continuous latency view with a scrolling line chart and displays the connected
-overlay IPv6 address and current round-trip time.
+Because the TCPeer data plane carries raw IPv6 packets, no special TCPD handling is required for TPP.
 
-## Devices
+The Android application can provide continuous TPP latency measurements for connected peers.
 
-The Android Clients screen shows known devices and their current metadata:
+---
 
-- online/offline state;
-- client or exit-node role;
-- Linux or Android platform;
-- TCP4 or TCP6 direct transport;
-- public and overlay IPv4/IPv6 addresses;
-- endpoint and last-seen information.
+# Device information
 
-Device administration is performed locally on the coordinator. The coordinator
-provides a Unix-domain administrative socket at
-`/run/tcppeer/coordinator-admin.sock`. Deleting a peer immediately removes it
-from the coordinator device list and disconnects it when currently connected.
+TCPeer synchronizes information about known peers.
 
-The administrative protocol accepts:
+The Android interface can expose information such as:
+
+- Peer ID
+- Online/offline state
+- Role
+- Platform
+- Direct transport
+- TCP4/TCP6 state
+- Public IPv4
+- Public IPv6
+- TCPeer IPv4
+- TCPeer IPv6
+- Direct endpoint
+- Traffic counters
+- Last-seen information
+
+---
+
+# Persistent state
+
+The Linux server stores runtime information in SQLite.
+
+The default state database is:
+
+```text
+/var/lib/tcppeer/server/state.db
+```
+
+Persistent information can include:
+
+- Peers
+- Sessions
+- Byte counters
+- DHCP leases
+- Address information
+- Transport information
+
+Live TCP connections naturally do not survive a process restart.
+
+After restart, TCPeer reconnects to the coordinator and performs discovery/direct-connection establishment again.
+
+---
+
+# Coordinator administration
+
+The coordinator provides a local administrative Unix socket.
+
+Typical path:
+
+```text
+/run/tcppeer/coordinator-admin.sock
+```
+
+Administrative operations can include peer removal.
+
+Example command syntax:
 
 ```text
 DELETE NETWORK PEER_ID
 ```
 
-This interface is local to the coordinator and is not exposed through a Linux
-VPN server or Android peer.
+This administrative interface belongs to the control plane.
 
-## Operational CLI
+It is not used to carry tunneled packets.
 
-The `tcppeer` command reads the configured server state database:
+---
 
-```console
-tcppeer --config /etc/tcppeer/server.toml status
-tcppeer --config /etc/tcppeer/server.toml peers
-tcppeer --config /etc/tcppeer/server.toml leases
-tcppeer --config /etc/tcppeer/server.toml sessions
-tcppeer --config /etc/tcppeer/server.toml addresses
-tcppeer --config /etc/tcppeer/server.toml transport
-tcppeer --config /etc/tcppeer/server.toml stats
+# Default ports
+
+Typical defaults are:
+
+| Purpose | Protocol | Port |
+|---|---|---:|
+| Coordinator | TCP | 7443 |
+| Direct peer connection | TCP | 7444 |
+
+Both are configurable.
+
+TCPeer does not require an outer UDP data-plane port.
+
+---
+
+# Installation
+
+Clone or extract the TCPeer source tree and enter the repository:
+
+```bash
+cd TCPeer
 ```
 
-Runtime state defaults to `/var/lib/tcppeer/server/state.db`. It stores peers,
-sessions, byte counters, and DHCP leases. Live TCP streams do not survive a
-service restart, but the coordinator connection and peer discovery are
-re-established automatically.
+Install the Python package:
 
-## Configuration reference
+```bash
+sudo python3 -m pip install . --break-system-packages
+```
 
-### Coordinator
+To force replacement of an existing installation:
 
-| Section | Setting | Purpose |
-|---|---|---|
-| `listen` | `ipv4`, `ipv6`, `port` | Control-plane listen endpoints |
-| `auth.networks` | network-name keys | Shared Secret Key per network |
-| `runtime` | `log_level`, `max_message_size`, `keepalive_seconds` | Coordinator limits and logging |
+```bash
+sudo python3 -m pip install . \
+  --break-system-packages \
+  --force-reinstall
+```
 
-### Server
+---
 
-| Section | Setting | Purpose |
-|---|---|---|
-| `coordinator` | `address`, `port` | Coordinator DNS name or numeric address |
-| `identity` | `network`, `peer_id`, `secret` | Authentication and device identity |
-| `direct` | `ipv4`, `ipv6`, `port`, `target_peer` | Local candidates and coordinated source port |
-| `interface` | `name`, `mtu` | Linux TUN settings |
-| `exit_node` | `enabled`, `nat44`, `nat66`, `software_flow_offload` | Forwarding and nftables behavior |
-| `ipv4` | subnet, server, pool, lease | Stateful DHCPv4 settings |
-| `ipv6` | prefix, server, RA lifetimes, DNS | SLAAC and RDNSS settings |
-| `paths` | `state_db` | Persistent server SQLite database |
-| `runtime` | `log_level` | Server logging verbosity |
+# `tcppeer.egg-info` permission problem
 
-`direct.ipv4` and `direct.ipv6` may be empty. The server selects suitable local
-addresses and asks the coordinator to report public mappings separately. DNS
-names are resolved at connection time and can return either or both families.
+If installation fails with an error similar to:
 
-## Troubleshooting
+```text
+error: Cannot update time stamp of directory 'src/tcppeer.egg-info'
+```
 
-### `status=203/EXEC`
+remove the generated metadata and reinstall:
 
-The systemd unit points to a missing executable. Install the Python package,
-then rerun the configurator so it resolves the actual installed path:
+```bash
+sudo rm -rf src/tcppeer.egg-info
 
-```console
-sudo python3 -m pip install --break-system-packages .
+sudo python3 -m pip install . \
+  --break-system-packages \
+  --force-reinstall
+```
+
+---
+
+# Interactive configuration
+
+TCPeer includes an interactive Linux configurator.
+
+Run:
+
+```bash
 sudo python3 configure.py
 ```
 
-### `no endpoint for the required address family`
+Typical configuration files include:
 
-The coordinator did not receive a usable candidate for the selected family.
-Check DNS results, public IPv6 availability, mapped-port discovery, and the
-`Registering direct endpoints` journal message on both peers.
-
-### Direct connection fails behind two NATs
-
-Confirm both peers use the same direct port for mapping discovery and the
-outbound connection. If that is correct, one of the NATs may use
-endpoint-dependent mapping/filtering or may reject TCP simultaneous-open.
-TCPeer deliberately has no relay fallback for that case.
-
-### Internet works but the physical LAN does not
-
-Reconnect after changing Wi-Fi/LTE so Android recalculates local-prefix
-exclusions. Check for the log message `Keeping directly connected networks
-outside TCPeer`.
-
-### Port scanner still reports `filtered`
-
-Verify that `tcppeer-open-input` is the first rule in every normal IPv4 and
-IPv6 priority-filter `INPUT` chain. Another firewall manager may have reloaded
-its tables after TCPeer started; restart `tcppeer-server` after that reload.
-Remember that UDP scanners often cannot distinguish an open silent UDP service
-from a filtered port.
-
-### NAT or flowtable setup fails
-
-Run nftables checks as root:
-
-```console
-sudo journalctl -u tcppeer-server -n 100 --no-pager
-sudo nft list ruleset
-sudo ip -4 route show default
-sudo ip -6 route show default
+```text
+/etc/tcppeer/coordinator.toml
+/etc/tcppeer/server.toml
 ```
 
-If the kernel rejects the flowtable, TCPeer logs a warning and retries with
-normal forwarding.
+The configurator can also install/configure the corresponding systemd services.
 
-## Development and tests
+---
 
-TCPeer's Python runtime uses only the standard library:
+# Coordinator service
 
-```console
+Restart:
+
+```bash
+sudo systemctl restart tcppeer-coordinator
+```
+
+Status:
+
+```bash
+sudo systemctl status tcppeer-coordinator --no-pager -l
+```
+
+Follow logs:
+
+```bash
+sudo journalctl -f -u tcppeer-coordinator
+```
+
+---
+
+# Server service
+
+Restart:
+
+```bash
+sudo systemctl restart tcppeer-server
+```
+
+Status:
+
+```bash
+sudo systemctl status tcppeer-server --no-pager -l
+```
+
+Follow logs:
+
+```bash
+sudo journalctl -f -u tcppeer-server
+```
+
+Inspect recent logs:
+
+```bash
+sudo journalctl -u tcppeer-server -n 200 --no-pager
+```
+
+---
+
+# Inspecting the Linux tunnel
+
+Show the TCPeer TUN interface:
+
+```bash
+ip address show tcppeer0
+```
+
+IPv4 routes:
+
+```bash
+ip -4 route
+```
+
+IPv6 routes:
+
+```bash
+ip -6 route
+```
+
+nftables:
+
+```bash
+sudo nft list ruleset
+```
+
+Forwarding:
+
+```bash
+sysctl net.ipv4.ip_forward
+sysctl net.ipv6.conf.all.forwarding
+```
+
+---
+
+# Building the Android application
+
+TCPeer's Android application is built with Gradle.
+
+Requirements include:
+
+- JDK 17
+- Android SDK
+- Gradle wrapper from the repository
+
+Build the debug APK:
+
+```bash
+./gradlew assembleDebug
+```
+
+A successful build ends with:
+
+```text
+BUILD SUCCESSFUL
+```
+
+The APK is generated at:
+
+```text
+android-app/build/outputs/apk/debug/android-app-debug.apk
+```
+
+Run Android unit tests and build:
+
+```bash
+./gradlew \
+  :android-app:testDebugUnitTest \
+  :android-app:assembleDebug
+```
+
+---
+
+# Installing the Android APK
+
+Using ADB:
+
+```bash
+adb install -r \
+  android-app/build/outputs/apk/debug/android-app-debug.apk
+```
+
+Or copy the APK to the Android device and install it there.
+
+---
+
+# Android configuration
+
+Typical Android configuration contains:
+
+```text
+Coordinator Address
+Coordinator Port
+Network
+Secret Key
+Peer ID
+Target Peer ID
+Direct Port
+MTU
+```
+
+The network name and Secret Key must match the coordinator configuration.
+
+Each Peer ID should uniquely identify its peer.
+
+The target peer normally identifies the Linux server / exit node used by the Android client.
+
+---
+
+# Linux CLI
+
+The TCPeer CLI can inspect server state.
+
+Examples:
+
+```bash
+tcppeer --config /etc/tcppeer/server.toml status
+```
+
+```bash
+tcppeer --config /etc/tcppeer/server.toml peers
+```
+
+```bash
+tcppeer --config /etc/tcppeer/server.toml leases
+```
+
+```bash
+tcppeer --config /etc/tcppeer/server.toml sessions
+```
+
+```bash
+tcppeer --config /etc/tcppeer/server.toml addresses
+```
+
+```bash
+tcppeer --config /etc/tcppeer/server.toml transport
+```
+
+```bash
+tcppeer --config /etc/tcppeer/server.toml stats
+```
+
+---
+
+# Configuration overview
+
+## Coordinator
+
+Common coordinator configuration areas include:
+
+| Section | Setting | Purpose |
+|---|---|---|
+| `listen` | `ipv4` | IPv4 listen address |
+| `listen` | `ipv6` | IPv6 listen address |
+| `listen` | `port` | Coordinator TCP port |
+| `auth.networks` | network keys | TCPeer network Secret Keys |
+| `runtime` | `log_level` | Logging |
+| `runtime` | `max_message_size` | Control message limit |
+| `runtime` | `keepalive_seconds` | Coordinator keepalive |
+
+Typical coordinator port:
+
+```text
+7443/TCP
+```
+
+---
+
+## Linux server
+
+Common server configuration areas include:
+
+| Section | Purpose |
+|---|---|
+| `coordinator` | Coordinator endpoint |
+| `identity` | Network, Peer ID and Secret Key |
+| `direct` | Direct TCP settings and target peer |
+| `interface` | TUN interface and MTU |
+| `exit_node` | Forwarding, NAT and flow offload |
+| `ipv4` | IPv4 addressing and DHCP |
+| `ipv6` | IPv6 addressing, SLAAC/RA and DNS |
+| `paths` | Persistent state |
+| `runtime` | Runtime/logging behavior |
+
+Typical direct port:
+
+```text
+7444/TCP
+```
+
+---
+
+# RAW IP implementation
+
+The sender and receiver must agree on the RAW IP stream format.
+
+There is intentionally no TCPeer-specific data header.
+
+---
+
+## Sender
+
+For each complete packet obtained from the TUN:
+
+```text
+1. Obtain the complete IP packet.
+2. Verify that it is IPv4 or IPv6 as required.
+3. Write the original packet bytes to the direct TCP stream.
+4. Do not prepend a TCPeer header.
+```
+
+Conceptually:
+
+```text
+write(packet)
+```
+
+Not:
+
+```text
+write(length)
+write(packet)
+```
+
+Not:
+
+```text
+write("TCPD")
+write(metadata)
+write(packet)
+```
+
+Not:
+
+```text
+write(DATA_MAGIC)
+write(DATA_VERSION)
+write(length)
+write(packet)
+```
+
+---
+
+## Receiver
+
+The receiver parses the TCP byte stream using the inner IP packet's own length information.
+
+Conceptually:
+
+```text
+read first bytes
+        |
+        v
+determine IP version
+        |
+        +------ IPv4 ------> Total Length
+        |
+        +------ IPv6 ------> Payload Length + 40
+        |
+        v
+read exactly remaining bytes
+        |
+        v
+complete raw IP packet
+        |
+        v
+write to TUN
+```
+
+---
+
+# Important TCP stream behavior
+
+The following assumption is invalid:
+
+```text
+one TCP write == one TCP read
+```
+
+TCP does not provide message boundaries.
+
+For example:
+
+```text
+Sender:
+
+write(IP packet A)
+write(IP packet B)
+write(IP packet C)
+```
+
+may be received internally as:
+
+```text
+read():
+  end of A + beginning of B
+
+read():
+  rest of B + all of C
+```
+
+or any other byte-stream segmentation.
+
+TCPeer must therefore reconstruct inner packet boundaries independently of TCP segment/read boundaries.
+
+The IPv4 and IPv6 length fields provide enough information to do this without adding a TCPeer per-packet header.
+
+---
+
+# TCP segments are not TCPeer packets
+
+The outer TCP implementation may:
+
+- split one inner IP packet across several TCP segments
+- combine bytes from multiple inner IP packets into one TCP segment
+- retransmit data
+- reorder network segments internally before exposing the ordered byte stream
+- acknowledge data
+- change TCP segmentation according to MSS/offload behavior
+
+None of that changes the TCPeer RAW IP format.
+
+TCPeer sees the resulting ordered TCP byte stream.
+
+It reconstructs inner IP packets from that stream.
+
+---
+
+# No transport-header stripping
+
+TCPeer does not strip the inner transport header.
+
+For example, this inner packet:
+
+```text
+IPv6
+TCP
+HTTP payload
+```
+
+is transported as:
+
+```text
+[IPv6 header][TCP header][HTTP payload]
+```
+
+not:
+
+```text
+TCPD
+Protocol=TCP
+Source Port=...
+Sequence=...
+...
+[HTTP payload]
+```
+
+Likewise:
+
+```text
+IPv6
+ICMPv6
+Router Advertisement
+```
+
+is transported as:
+
+```text
+[IPv6 header][ICMPv6 header][RA data]
+```
+
+The entire inner IP packet remains intact.
+
+---
+
+# Checksums
+
+Because TCPeer transports the original inner packet rather than converting its headers into TCPeer metadata, TCPeer does not normally need to reconstruct inner TCP/UDP headers merely for transport.
+
+The original inner packet includes its original protocol headers and checksum fields.
+
+Normal kernel/TUN/network-stack behavior still applies.
+
+---
+
+# MTU
+
+TCPeer is a Layer 3 VPN and the configured TUN MTU should account for the characteristics of the outer path.
+
+TCPeer itself adds:
+
+```text
+0 bytes
+```
+
+of per-packet data framing.
+
+However, the outer connection still uses:
+
+```text
+Outer IPv4 or IPv6
+TCP
+```
+
+and therefore consumes ordinary network header space.
+
+The configured MTU should be appropriate for the deployment.
+
+---
+
+# Performance
+
+The RAW IP data path avoids TCPeer-specific per-packet framing work.
+
+For each normal tunneled packet, TCPeer does not need to:
+
+```text
+serialize TCPD
+parse TCPD
+convert IP metadata to ASCII
+convert transport metadata to ASCII
+reconstruct inner TCP headers
+reconstruct inner UDP headers
+reconstruct inner SCTP headers
+reconstruct inner DCCP headers
+add a TCPeer packet-length field
+add a TCPeer DATA magic
+```
+
+The intended hot path is essentially:
+
+```text
+TUN
+ |
+ v
+raw packet
+ |
+ v
+TCP stream
+ |
+ v
+raw packet
+ |
+ v
+TUN
+```
+
+The actual throughput still depends on factors including:
+
+- CPU performance
+- Android `VpnService`
+- TUN performance
+- TCP congestion control
+- TCP receive/send buffers
+- outer network RTT
+- packet sizes
+- NAT/firewall behavior
+- Wi-Fi or mobile-network performance
+- kernel networking behavior
+
+---
+
+# Troubleshooting
+
+## `Connection lost. Retrying`
+
+Inspect the Linux side:
+
+```bash
+sudo journalctl -f -u tcppeer-server
+```
+
+Inspect the Android process:
+
+```bash
+logcat --pid=$(pidof com.tcppeer.android)
+```
+
+Both peers must run compatible TCPeer versions.
+
+In particular, a client using an obsolete TCPD/data-frame implementation is not compatible with a server expecting the current RAW IP data plane.
+
+---
+
+# Old TCPD errors
+
+Errors such as:
+
+```text
+invalid TCPD magic
+```
+
+or:
+
+```text
+Unsupported TCPD transport protocol
+```
+
+indicate code from the previous TCPD-based implementation.
+
+The current RAW IP data plane should not require TCPD parsing for direct tunneled packets.
+
+Make sure both the Python server package and Android APK were rebuilt/reinstalled from the current source.
+
+---
+
+# Reinstalling the server after source changes
+
+From the repository root:
+
+```bash
+sudo rm -rf src/tcppeer.egg-info
+```
+
+Then:
+
+```bash
+sudo python3 -m pip install . \
+  --break-system-packages \
+  --force-reinstall
+```
+
+Restart:
+
+```bash
+sudo systemctl restart tcppeer-server
+```
+
+Follow logs:
+
+```bash
+sudo journalctl -f -u tcppeer-server
+```
+
+---
+
+# Rebuilding Android after source changes
+
+```bash
+./gradlew assembleDebug
+```
+
+APK:
+
+```text
+android-app/build/outputs/apk/debug/android-app-debug.apk
+```
+
+After installing the new APK, ensure the running Android application is actually the newly built version before debugging protocol incompatibilities.
+
+---
+
+# Direct connection debugging
+
+Check server logs:
+
+```bash
+sudo journalctl -u tcppeer-server -n 200 --no-pager
+```
+
+Look for information about:
+
+- Coordinator connection
+- Endpoint registration
+- Public IPv4
+- Public IPv6
+- Direct connection attempts
+- TCP4
+- TCP6
+- Target Peer ID
+- Connection establishment
+- Connection closure
+
+Also verify the relevant TCP direct port is reachable according to the network topology.
+
+---
+
+# IPv6 debugging
+
+Inspect addresses:
+
+```bash
+ip -6 address
+```
+
+Inspect routes:
+
+```bash
+ip -6 route
+```
+
+Inspect TCPeer:
+
+```bash
+ip -6 address show tcppeer0
+```
+
+Inspect server logs:
+
+```bash
+sudo journalctl -u tcppeer-server -n 200 --no-pager
+```
+
+---
+
+# IPv4 debugging
+
+Inspect addresses:
+
+```bash
+ip -4 address
+```
+
+Routes:
+
+```bash
+ip -4 route
+```
+
+TCPeer:
+
+```bash
+ip -4 address show tcppeer0
+```
+
+---
+
+# Exit-node debugging
+
+Check forwarding:
+
+```bash
+sysctl net.ipv4.ip_forward
+```
+
+```bash
+sysctl net.ipv6.conf.all.forwarding
+```
+
+Inspect nftables:
+
+```bash
+sudo nft list ruleset
+```
+
+Inspect default routes:
+
+```bash
+ip -4 route show default
+```
+
+```bash
+ip -6 route show default
+```
+
+Inspect TCPeer logs:
+
+```bash
+sudo journalctl -u tcppeer-server -n 200 --no-pager
+```
+
+---
+
+# Android debugging
+
+Clear logcat:
+
+```bash
+logcat -c
+```
+
+Capture only the TCPeer process:
+
+```bash
+logcat --pid=$(pidof com.tcppeer.android) -v threadtime
+```
+
+Filter common TCPeer messages:
+
+```bash
+logcat -v threadtime | grep -iE 'TCPeer|TCPeerVpnService|ProtocolException'
+```
+
+Useful messages include:
+
+```text
+Direct IPV4 active connection established
+Direct IPV6 active connection established
+Connection failed
+Connection lost
+Retrying
+```
+
+---
+
+# Development
+
+Create a Python virtual environment:
+
+```bash
 python3 -m venv .venv
+```
+
+Activate it:
+
+```bash
 . .venv/bin/activate
+```
+
+Install the project for development:
+
+```bash
 python -m pip install -e '.[test]'
+```
+
+Run Python tests:
+
+```bash
 pytest
 ```
 
-Build and test Android with:
+Build Android:
 
-```console
-./gradlew :android-app:testDebugUnitTest :android-app:assembleDebug
+```bash
+./gradlew assembleDebug
 ```
 
-Automated tests cover authentication, ASCII control framing, direct DATA
-framing, coordinator policy, mapped ports, DHCPv4, SLAAC/RA, DNS discovery,
-TPP, SQLite state, TUN behavior, nftables generation, configurator entrypoints,
-and Android protocol/address policy. Unit tests cannot prove that a real NAT or
-carrier permits simultaneous-open; validate that on the intended networks.
+Run Android unit tests:
 
-## Security model
+```bash
+./gradlew :android-app:testDebugUnitTest
+```
 
-- The Secret Key itself is not transmitted. Peers prove knowledge with an
-  HMAC-SHA256 challenge response using a fresh coordinator nonce.
-- The Secret Key is stored locally in configuration/preferences and is not a
-  substitute for end-to-end traffic encryption.
-- Endpoint metadata, device metadata, control messages, DNS traffic, and
-  tunneled IP packets are cleartext on the direct TCP stream.
-- There is no server identity certificate or TLS authentication.
+---
 
-Use application-layer encryption such as HTTPS or SSH inside TCPeer whenever
-confidentiality or server authentication matters.
+# Project layout
 
-## Project layout
+A typical TCPeer source tree contains:
 
 ```text
-android-app/                 native Kotlin/Compose Android client
-docs/technical-specification.md
-examples/                    annotated coordinator and server TOML
-packaging/systemd/           source service units
-src/tcppeer/                 Python package
-tests/                       Python automated tests
-cli.py                       source-tree CLI wrapper
-configure.py                 source-tree configurator wrapper
-coordinator.py               source-tree coordinator wrapper
-server.py                    source-tree Linux server wrapper
+TCPeer/
+├── android-app/
+│   └── src/main/java/com/tcppeer/android/
+│       ├── protocol/
+│       ├── ui/
+│       └── vpn/
+│
+├── src/
+│   └── tcppeer/
+│       ├── auth.py
+│       ├── cli.py
+│       ├── config.py
+│       ├── configurator.py
+│       ├── coordinator.py
+│       ├── dhcp.py
+│       ├── dns.py
+│       ├── exit_node.py
+│       ├── packet.py
+│       ├── pd.py
+│       ├── protocol.py
+│       ├── ra.py
+│       ├── server.py
+│       ├── state.py
+│       ├── tpp.py
+│       ├── transport.py
+│       └── tun.py
+│
+├── build.gradle.kts
+├── settings.gradle.kts
+├── pyproject.toml
+└── README.md
 ```
 
-## License
+---
 
-Apache License 2.0. See [LICENSE](LICENSE).
+# Security model
+
+TCPeer currently provides authentication but not data-plane encryption.
+
+## Provided
+
+```text
+Shared Secret Key
+HMAC-SHA256 authentication
+Fresh authentication challenge/nonce
+Direct peer-to-peer transport
+```
+
+## Not provided
+
+```text
+TLS on the direct tunnel
+Data-plane encryption
+Authenticated encryption of tunneled packets
+Traffic confidentiality from observers of the direct connection
+```
+
+Applications requiring confidentiality should use end-to-end encrypted protocols.
+
+Examples:
+
+```text
+HTTPS
+SSH
+TLS-enabled applications
+end-to-end encrypted application protocols
+```
+
+---
+
+# Protocol summary
+
+## Control
+
+```text
+Peer
+ |
+ | TCP
+ v
+Coordinator
+ |
+ +-- authentication
+ +-- peer discovery
+ +-- endpoint discovery
+ +-- connection coordination
+ +-- device state
+```
+
+## Data
+
+```text
+Android peer
+     |
+     | direct TCP4 or TCP6
+     |
+     v
+Linux peer
+```
+
+Contents of the direct data stream:
+
+```text
+<raw IPv4 packet>
+<raw IPv6 packet>
+<raw IPv4 packet>
+<raw IPv6 packet>
+...
+```
+
+TCPeer-specific per-packet data framing:
+
+```text
+0 bytes
+```
+
+---
+
+# Design principle
+
+The current TCPeer data-plane design can be summarized as:
+
+```text
+The IP packet is already self-describing enough
+to determine its normal packet length.
+
+Do not wrap it in another TCPeer packet format.
+```
+
+IPv4 already provides:
+
+```text
+Total Length
+```
+
+IPv6 already provides:
+
+```text
+Payload Length
+```
+
+Therefore the direct TCP byte stream can transport consecutive raw IP packets without a TCPD or DATA wrapper.
+
+---
+
+# Summary
+
+TCPeer is a direct TCP-based dual-stack Layer 3 VPN.
+
+```text
+                    Coordinator
+                         |
+                   CONTROL ONLY
+                         |
+            +------------+------------+
+            |                         |
+         Android                    Linux
+            |                         |
+            +====== direct TCP =======+
+                         |
+                  RAW IP DATA PLANE
+                         |
+             +-----------+-----------+
+             |                       |
+           IPv4                    IPv6
+             |                       |
+        TCP / UDP /             TCP / UDP /
+        ICMP / ...              ICMPv6 / ...
+```
+
+The coordinator handles discovery and coordination.
+
+The peers carry the VPN traffic directly.
+
+The direct TCP stream carries complete raw IPv4 and IPv6 packets.
+
+There is no TCPD data wrapper.
+
+There is no TCPeer packet-length prefix.
+
+There is no TCPeer per-packet DATA header.
+
+```text
+TCPeer-specific data-plane framing overhead:
+
+0 bytes
+```
+
+---
+
+# License
+
+TCPeer is licensed under the Apache License 2.0.
+
+See:
+
+```text
+LICENSE
+```
+
+for the complete license text.
