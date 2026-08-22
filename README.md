@@ -1978,6 +1978,26 @@ TCPeer-specific data-plane framing overhead:
 
 ---
 
+# Development and AI assistance
+
+The original foundation and initial implementation of TCPeer were created with the assistance of **OpenAI Codex using GPT-5.4**.
+
+Subsequent development, including major protocol changes, Android and Linux improvements, debugging, performance work, documentation, and the current RAW IP data-plane implementation, was developed with the assistance of **ChatGPT using GPT-5.6 Sol**.
+
+In short:
+
+```text
+Initial TCPeer foundation:
+Codex + GPT-5.4
+
+Further development and current implementation:
+ChatGPT + GPT-5.6 Sol
+```
+
+TCPeer itself is an independent project; the AI systems listed above were used as development assistants.
+
+---
+
 # License
 
 TCPeer is licensed under the Apache License 2.0.
