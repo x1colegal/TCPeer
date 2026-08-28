@@ -1,15 +1,11 @@
 package com.tcppeer.android.ui
 
-import android.os.Build
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
-import androidx.compose.material3.dynamicDarkColorScheme
-import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
+import com.tcppeer.android.vpn.AppThemeMode
 
 private val LightColors = lightColorScheme(
     primary = Color(0xFF315DA8),
@@ -30,14 +26,10 @@ private val DarkColors = darkColorScheme(
 )
 
 @Composable
-fun TcpPeerTheme(content: @Composable () -> Unit) {
-    val darkTheme = isSystemInDarkTheme()
-    val context = LocalContext.current
-    val colors = when {
-        Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && darkTheme -> dynamicDarkColorScheme(context)
-        Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> dynamicLightColorScheme(context)
-        darkTheme -> DarkColors
-        else -> LightColors
-    }
+fun TcpPeerTheme(
+    appTheme: AppThemeMode = AppThemeMode.DARK,
+    content: @Composable () -> Unit,
+) {
+    val colors = if (appTheme == AppThemeMode.DARK) DarkColors else LightColors
     MaterialTheme(colorScheme = colors, content = content)
 }

@@ -39,7 +39,6 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.withContext
 import java.io.Closeable
@@ -269,18 +268,19 @@ class TcpPeerVpnService : VpnService() {
         if (registration.command != "ENDPOINT-INFO") throw ProtocolException("Coordinator did not accept registration")
         TcpPeerProtocol.writeControl(controlOutput, ControlMessage("PEER-INFO", mapOf("Action" to "List")))
         readDeviceList(controlInput)
+        val targetPeerId = effectiveTargetPeerId(config, TcpPeerRuntime.state.value.devices)
         var family: DirectFamily
         var address: InetAddress
         var peerPort: Int
         var direct: Socket
 
         while (true) {
-            updateConnecting("Waiting for ${config.targetPeerId} to become ready.")
+            updateConnecting("Waiting for $targetPeerId to become ready.")
             TcpPeerProtocol.writeControl(controlOutput, ControlMessage("PUNCH-READY", mapOf(
-                "Peer-ID" to config.targetPeerId,
+                "Peer-ID" to targetPeerId,
             )))
 
-            val punch = awaitPunchGo(controlInput, controlOutput, config)
+            val punch = awaitPunchGo(controlInput, controlOutput, targetPeerId)
 
             family = when (punch.field("Family")) {
                 "IPv6" -> DirectFamily.IPV6
@@ -446,7 +446,7 @@ class TcpPeerVpnService : VpnService() {
                                             mapOf(
                                                 "Peer-ID" to (
                                                     message.field("Peer-ID")
-                                                        ?: config.targetPeerId
+                                                        ?: targetPeerId
                                                 ),
                                             ),
                                         ),
@@ -486,7 +486,7 @@ class TcpPeerVpnService : VpnService() {
                 exchangePackets(
                     descriptor,
                     BufferedInputStream(directInput, DIRECT_STREAM_BUFFER_BYTES),
-                    BufferedOutputStream(directOutput, DIRECT_STREAM_BUFFER_BYTES),
+                    directOutput,
                     addresses.second.address,
                 )
             } finally {
@@ -495,14 +495,14 @@ class TcpPeerVpnService : VpnService() {
         }
     }
 
-    private fun awaitPunchGo(input: java.io.InputStream, output: java.io.OutputStream, config: VpnConfiguration): ControlMessage {
+    private fun awaitPunchGo(input: java.io.InputStream, output: java.io.OutputStream, targetPeerId: String): ControlMessage {
         while (true) {
             when (val message = TcpPeerProtocol.readControl(input)) {
                 is ControlMessage -> when (message.command) {
                     "PUNCH-GO" -> return message
                     "PEER-INFO" -> if (message.field("Action") == "Punch-Request") {
                         TcpPeerProtocol.writeControl(output, ControlMessage("PUNCH-READY", mapOf(
-                            "Peer-ID" to (message.field("Peer-ID") ?: config.targetPeerId),
+                            "Peer-ID" to (message.field("Peer-ID") ?: targetPeerId),
                         )))
                     }
                     "PING", "KEEPALIVE" -> TcpPeerProtocol.writeControl(output, ControlMessage("PONG"))
@@ -625,8 +625,6 @@ class TcpPeerVpnService : VpnService() {
             socket.bind(InetSocketAddress(wildcard, localPort))
             if (!protect(socket)) throw IllegalStateException("Cannot protect the direct socket from the VPN")
             socket.connect(InetSocketAddress(address, port), 12_000)
-            socket.sendBufferSize = DIRECT_SOCKET_BUFFER_BYTES
-            socket.receiveBufferSize = DIRECT_SOCKET_BUFFER_BYTES
             socket.tcpNoDelay = true
             socket.soTimeout = 15_000
             Log.i(TAG, "Direct ${family.name} active connection established to ${formatEndpoint(address, port)}")
@@ -648,8 +646,6 @@ class TcpPeerVpnService : VpnService() {
                 throw IllegalStateException("Cannot protect the accepted direct socket from the VPN")
             }
             it.tcpNoDelay = true
-            it.sendBufferSize = DIRECT_SOCKET_BUFFER_BYTES
-            it.receiveBufferSize = DIRECT_SOCKET_BUFFER_BYTES
             it.soTimeout = 15_000
             Log.i(TAG, "Direct ${family.name} passive connection accepted from ${it.remoteSocketAddress}")
         }
@@ -694,7 +690,9 @@ class TcpPeerVpnService : VpnService() {
     ): Pair<com.tcppeer.android.protocol.DhcpOffer, com.tcppeer.android.protocol.SlaacConfiguration> {
         val transactionId = AddressNegotiation.transactionId()
         TcpPeerProtocol.writeData(output, AddressNegotiation.dhcpDiscover(config.peerId, transactionId))
+        output.flush()
         TcpPeerProtocol.writeData(output, AddressNegotiation.routerSolicitation())
+        output.flush()
         var offer: com.tcppeer.android.protocol.DhcpOffer? = null
         var acknowledged: com.tcppeer.android.protocol.DhcpOffer? = null
         var slaac: com.tcppeer.android.protocol.SlaacConfiguration? = null
@@ -706,6 +704,7 @@ class TcpPeerVpnService : VpnService() {
                 if (offer != null) {
                     packetKind = "DHCP-OFFER"
                     TcpPeerProtocol.writeData(output, AddressNegotiation.dhcpRequest(config.peerId, offer!!))
+                    output.flush()
                 }
             }
             if (acknowledged == null) {
@@ -735,8 +734,15 @@ class TcpPeerVpnService : VpnService() {
             .setBlocking(true)
             .addAddress(ipv4.address, ipv4.prefixLength)
             .addAddress(ipv6.address, ipv6.prefixLength)
-        preserveLocalNetworkAccess(builder, ipv4.address, ipv6.address)
-        (ipv4.dns + ipv6.dns).distinctBy { it.hostAddress }.forEach(builder::addDnsServer)
+        if (!config.useExitNode) {
+            builder
+                .addRoute(networkAddress(ipv4.address, ipv4.prefixLength), ipv4.prefixLength)
+                .addRoute(ipv6.prefix, ipv6.prefixLength)
+        }
+        preserveLocalNetworkAccess(builder, ipv4.address, ipv6.address, config.useExitNode)
+        if (config.useExitNode) {
+            (ipv4.dns + ipv6.dns).distinctBy { it.hostAddress }.forEach(builder::addDnsServer)
+        }
         return builder.establish()
     }
 
@@ -744,6 +750,7 @@ class TcpPeerVpnService : VpnService() {
         builder: Builder,
         tunnelIpv4: InetAddress,
         tunnelIpv6: InetAddress,
+        useExitNode: Boolean,
     ) {
         val properties = connectivityManager.activeNetwork?.let(connectivityManager::getLinkProperties)
         val excluded = properties?.linkAddresses.orEmpty()
@@ -753,23 +760,34 @@ class TcpPeerVpnService : VpnService() {
             // bypassing the TCPeer overlay. In that ambiguous case VPN wins.
             .filterNot { it.contains(tunnelIpv4) || it.contains(tunnelIpv6) }
             .distinctBy(IpPrefix::toString)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            builder.addRoute("0.0.0.0", 0).addRoute("::", 0)
-            excluded.forEach(builder::excludeRoute)
-        } else {
-            var routes = listOf(
-                RoutePrefix(ByteArray(4), 0),
-                RoutePrefix(ByteArray(16), 0),
-            )
-            excluded.forEach { prefix ->
-                val blocked = RoutePrefix(prefix.address.address, prefix.prefixLength)
-                routes = routes.flatMap { subtractPrefix(it, blocked) }
+        if (useExitNode) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                builder.addRoute("0.0.0.0", 0).addRoute("::", 0)
+                excluded.forEach(builder::excludeRoute)
+            } else {
+                var routes = listOf(
+                    RoutePrefix(ByteArray(4), 0),
+                    RoutePrefix(ByteArray(16), 0),
+                )
+                excluded.forEach { prefix ->
+                    val blocked = RoutePrefix(prefix.address.address, prefix.prefixLength)
+                    routes = routes.flatMap { subtractPrefix(it, blocked) }
+                }
+                routes.forEach { builder.addRoute(InetAddress.getByAddress(it.address), it.prefixLength) }
             }
-            routes.forEach { builder.addRoute(InetAddress.getByAddress(it.address), it.prefixLength) }
         }
         if (excluded.isNotEmpty()) {
             Log.i(TAG, "Keeping directly connected networks outside TCPeer: ${excluded.joinToString()}")
         }
+    }
+
+    private fun effectiveTargetPeerId(
+        config: VpnConfiguration,
+        devices: List<NetworkDevice>,
+    ): String {
+        if (config.useExitNode) return config.targetPeerId
+        return devices.firstOrNull { it.online && it.peerId != config.peerId }?.peerId
+            ?: throw ProtocolException("No online peer is available while Use Exit Node is disabled")
     }
 
     private fun subtractPrefix(route: RoutePrefix, blocked: RoutePrefix): List<RoutePrefix> {
@@ -809,15 +827,6 @@ class TcpPeerVpnService : VpnService() {
         val pendingPings = ConcurrentHashMap<Long, Pair<String, Long>>()
         val pendingTxBytes = AtomicLong(0)
         val pendingRxBytes = AtomicLong(0)
-        val outputPending = AtomicBoolean(false)
-        val outputFlusher = launch(Dispatchers.IO) {
-            while (true) {
-                delay(DIRECT_FLUSH_INTERVAL_MS)
-                if (outputPending.getAndSet(false)) {
-                    synchronized(directOutput) { directOutput.flush() }
-                }
-            }
-        }
         val statistics = launch {
             while (true) {
                 delay(250)
@@ -828,13 +837,34 @@ class TcpPeerVpnService : VpnService() {
                 }
             }
         }
+        /*
+         * Simple RAW-IP TX path.
+         *
+         * Deliberately mirrors the Python implementation:
+         *
+         *   TUN read -> TCP write -> next TUN read
+         *
+         * No Channel, no batching and no per-packet ByteArray copy.
+         * Packet boundaries remain encoded by the IPv4/IPv6 headers.
+         * TCPeer framing overhead remains ZERO bytes.
+         */
         val tunToPeer = launch(Dispatchers.IO) {
             val buffer = ByteArray(65_535)
+
             while (true) {
                 val count = tunInput.read(buffer)
+
                 if (count < 0) break
-                synchronized(directOutput) { TcpPeerProtocol.writeData(directOutput, buffer, 0, count) }
-                outputPending.set(true)
+                if (count == 0) continue
+
+                synchronized(directOutput) {
+                    directOutput.write(
+                        buffer,
+                        0,
+                        count,
+                    )
+                }
+
                 pendingTxBytes.addAndGet(count.toLong())
             }
         }
@@ -852,8 +882,9 @@ class TcpPeerVpnService : VpnService() {
                     val sentAt = System.nanoTime()
                     val packet = TppProtocol.request(overlayIpv6, destination, identifier, sentAt)
                     pendingPings[identifier] = request.peerId to sentAt
-                    synchronized(directOutput) { TcpPeerProtocol.writeData(directOutput, packet) }
-                    outputPending.set(true)
+                    synchronized(directOutput) {
+                        TcpPeerProtocol.writeData(directOutput, packet)
+                    }
                     pendingTxBytes.addAndGet(packet.size.toLong())
                     launch {
                         delay(3_000)
@@ -877,7 +908,6 @@ class TcpPeerVpnService : VpnService() {
                             synchronized(directOutput) {
                                 TcpPeerProtocol.writeData(directOutput, reply)
                             }
-                            outputPending.set(true)
                             pendingTxBytes.addAndGet(reply.size.toLong())
                         } else {
                             tunOutput.write(packet)
@@ -902,8 +932,9 @@ class TcpPeerVpnService : VpnService() {
             peerToTun.cancel()
             pingRequests.cancel()
             statistics.cancel()
-            outputFlusher.cancel()
-            synchronized(directOutput) { runCatching { directOutput.flush() } }
+            synchronized(directOutput) {
+                runCatching { directOutput.flush() }
+            }
             closeQuietly(tunInput)
             closeQuietly(tunOutput)
         }
@@ -1005,9 +1036,8 @@ class TcpPeerVpnService : VpnService() {
         private const val CHANNEL_ID = "tcppeer_vpn"
         private const val NOTIFICATION_ID = 7443
         private const val COORDINATOR_TIMEOUT_MS = 35_000
-        private const val DIRECT_SOCKET_BUFFER_BYTES = 4 * 1024 * 1024
-        private const val DIRECT_STREAM_BUFFER_BYTES = 512 * 1024
-        private const val DIRECT_FLUSH_INTERVAL_MS = 2L
+        private const val DIRECT_SOCKET_BUFFER_BYTES = 8 * 1024 * 1024
+        private const val DIRECT_STREAM_BUFFER_BYTES = 1024 * 1024
         private const val DEVICE_REFRESH_INTERVAL_MS = 5_000L
         private const val TAG = "TCPeerVpnService"
     }
