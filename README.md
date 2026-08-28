@@ -623,6 +623,13 @@ TCPeer can install IPv4 and IPv6 routes through the Android VPN.
 
 This allows the Linux peer to operate as an exit node.
 
+Even when the Android option `Use Exit Node` is disabled, the Linux peer is
+still required for address negotiation and routed TCPeer connectivity.
+
+Disabling `Use Exit Node` only prevents normal internet traffic and exit-node
+DNS from replacing the phone's own upstream connection. It does not remove the
+need for a TCPeer server / exit node peer to assign IPv4 and IPv6 addresses.
+
 Conceptually:
 
 ```text
@@ -1153,7 +1160,11 @@ The network name and Secret Key must match the coordinator configuration.
 
 Each Peer ID should uniquely identify its peer.
 
-The target peer normally identifies the Linux server / exit node used by the Android client.
+The target peer identifies the Linux server / exit node used by the Android client.
+
+This remains necessary even when `Use Exit Node` is disabled, because the
+Android client still needs that peer to negotiate and receive its VPN IPv4 and
+IPv6 addresses.
 
 ---
 

@@ -7,6 +7,7 @@ import kotlinx.coroutines.flow.asStateFlow
 enum class ConnectionStatus(val label: String) {
     DISCONNECTED("Disconnected"),
     CONNECTING("Connecting"),
+    COORDINATOR_ONLY("Coordinator Only"),
     TCP6_DIRECT("TCP6 Direct"),
     TCP4_DIRECT("TCP4 Direct"),
     NO_DIRECT_CONNECTION("No Direct Connection"),

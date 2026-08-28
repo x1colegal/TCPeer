@@ -9,6 +9,7 @@ import android.content.Intent
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
+import android.view.Window
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -22,9 +23,11 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -58,6 +61,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.PrimaryTabRow
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
@@ -65,6 +69,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -84,8 +89,10 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.tcppeer.android.ui.TcpPeerTheme
+import com.tcppeer.android.vpn.AppMaterialColor
 import com.tcppeer.android.vpn.AppThemeMode
 import com.tcppeer.android.vpn.ConfigurationStore
 import com.tcppeer.android.vpn.ConnectionStatus
@@ -116,7 +123,11 @@ class MainActivity : ComponentActivity() {
         setContent {
             val store = remember { ConfigurationStore(this) }
             var configuration by remember { mutableStateOf(store.load()) }
-            TcpPeerTheme(appTheme = configuration.appTheme) {
+            TcpPeerTheme(
+                appTheme = configuration.appTheme,
+                materialColor = configuration.materialColor,
+            ) {
+                ApplySystemBars(window = window, appTheme = configuration.appTheme)
                 val runtime by TcpPeerRuntime.state.collectAsStateWithLifecycle()
                 TcpPeerScreen(
                     configuration = configuration,
@@ -169,8 +180,17 @@ private fun TcpPeerScreen(
 ) {
     var showNetworkSettings by remember { mutableStateOf(false) }
     var showAppSettings by remember { mutableStateOf(false) }
-    val active = runtime.status in setOf(ConnectionStatus.CONNECTING, ConnectionStatus.TCP4_DIRECT, ConnectionStatus.TCP6_DIRECT)
-    val connected = runtime.status in setOf(ConnectionStatus.TCP4_DIRECT, ConnectionStatus.TCP6_DIRECT)
+    val active = runtime.status in setOf(
+        ConnectionStatus.CONNECTING,
+        ConnectionStatus.COORDINATOR_ONLY,
+        ConnectionStatus.TCP4_DIRECT,
+        ConnectionStatus.TCP6_DIRECT,
+    )
+    val connected = runtime.status in setOf(
+        ConnectionStatus.COORDINATOR_ONLY,
+        ConnectionStatus.TCP4_DIRECT,
+        ConnectionStatus.TCP6_DIRECT,
+    )
 
     runtime.activePingPeerId?.let { peerId ->
         TppPingDialog(peerId, runtime.pingSamples, TcpPeerRuntime::stopContinuousPing)
@@ -345,6 +365,7 @@ private fun ConnectionHero(
             when {
                 connected -> "Connected"
                 runtime.status == ConnectionStatus.CONNECTING -> "Connecting..."
+                runtime.status == ConnectionStatus.COORDINATOR_ONLY -> "Connected"
                 runtime.status == ConnectionStatus.NO_DIRECT_CONNECTION -> "Connection failed"
                 else -> "Not connected"
             },
@@ -352,7 +373,12 @@ private fun ConnectionHero(
             fontWeight = FontWeight.Bold,
         )
         Text(
-            if (connected) runtime.status.label else runtime.detail,
+            when {
+                runtime.status == ConnectionStatus.COORDINATOR_ONLY ->
+                    "Coordinator connected. Exit node is disabled, so only the TCPeer directory is active."
+                connected -> runtime.status.label
+                else -> runtime.detail
+            },
             modifier = Modifier.fillMaxWidth(),
             textAlign = TextAlign.Center,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -410,7 +436,7 @@ private fun NetworkSettingsDialog(
                             Text("Use Exit Node", fontWeight = FontWeight.Bold)
                             Text(
                                 if (configuration.useExitNode) "Route internet through a selected peer"
-                                else "Keep the tunnel without forcing an exit node",
+                                else "Keep TCPeer connected, but leave normal internet on the phone network",
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
@@ -431,8 +457,8 @@ private fun NetworkSettingsDialog(
                     SettingsField(
                         value = configuration.targetPeerId,
                         onValueChange = { onConfigurationChange(configuration.copy(targetPeerId = it)) },
-                        label = "Exit node peer ID",
-                        active = active || !configuration.useExitNode,
+                        label = if (configuration.useExitNode) "Exit node peer ID" else "Server peer ID",
+                        active = active,
                     )
                 }
                 item {
@@ -476,12 +502,12 @@ private fun AppSettingsDialog(
                     }
                 }
                 item {
-                    Text("App theme", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    ThemeSectionTitle("Appearance mode")
                 }
                 item {
                     ThemeModeOption(
                         title = "Dark",
-                        description = "Dark TCPeer theme.",
+                        description = "Dark surfaces with bright status text.",
                         selected = configuration.appTheme == AppThemeMode.DARK,
                         enabled = !active,
                         icon = { Icon(Icons.Default.Check, contentDescription = null) },
@@ -492,7 +518,7 @@ private fun AppSettingsDialog(
                 item {
                     ThemeModeOption(
                         title = "Light",
-                        description = "Light TCPeer theme.",
+                        description = "Light surfaces with dark status text.",
                         selected = configuration.appTheme == AppThemeMode.LIGHT,
                         enabled = !active,
                         icon = { Icon(Icons.Default.Info, contentDescription = null) },
@@ -500,9 +526,28 @@ private fun AppSettingsDialog(
                         onConfigurationChange(configuration.copy(appTheme = AppThemeMode.LIGHT))
                     }
                 }
+                item {
+                    ThemeSectionTitle("Material color")
+                }
+                item {
+                    MaterialColorPicker(
+                        selected = configuration.materialColor,
+                        enabled = !active,
+                    ) { color ->
+                        onConfigurationChange(configuration.copy(materialColor = color))
+                    }
+                }
                 item { Button(onClick = onDismiss, modifier = Modifier.fillMaxWidth()) { Text("Done") } }
             }
         }
+    }
+}
+
+@Composable
+private fun ThemeSectionTitle(title: String) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
     }
 }
 
@@ -531,10 +576,66 @@ private fun ThemeModeOption(
                 Text(title, fontWeight = FontWeight.Bold)
                 Text(description, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
             }
-            OutlinedButton(onClick = onClick, enabled = enabled) {
-                Text(if (selected) "Selected" else "Use")
+            RadioButton(selected = selected, onClick = onClick, enabled = enabled)
+        }
+    }
+}
+
+@Composable
+private fun MaterialColorPicker(
+    selected: AppMaterialColor,
+    enabled: Boolean,
+    onSelect: (AppMaterialColor) -> Unit,
+) {
+    FlowRow(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        AppMaterialColor.entries.forEach { color ->
+            val selectedColor = when (color) {
+                AppMaterialColor.BLUE -> Color(0xFF315DA8)
+                AppMaterialColor.GREEN -> Color(0xFF2D6A4F)
+                AppMaterialColor.ORANGE -> Color(0xFF9A4600)
+                AppMaterialColor.ROSE -> Color(0xFF9C405D)
+            }
+            Surface(
+                modifier = Modifier
+                    .clickable(enabled = enabled) { onSelect(color) }
+                    .border(
+                        width = if (selected == color) 2.dp else 1.dp,
+                        color = if (selected == color) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant,
+                        shape = RoundedCornerShape(22.dp),
+                    ),
+                color = MaterialTheme.colorScheme.surfaceContainerLow,
+                shape = RoundedCornerShape(22.dp),
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Surface(
+                        modifier = Modifier.size(18.dp),
+                        shape = CircleShape,
+                        color = selectedColor,
+                    ) {}
+                    Text(color.label, fontWeight = if (selected == color) FontWeight.Bold else FontWeight.Medium)
+                }
             }
         }
+    }
+}
+
+@Composable
+private fun ApplySystemBars(
+    window: Window,
+    appTheme: AppThemeMode,
+) {
+    SideEffect {
+        val controller = WindowCompat.getInsetsController(window, window.decorView)
+        controller.isAppearanceLightStatusBars = appTheme == AppThemeMode.LIGHT
+        controller.isAppearanceLightNavigationBars = appTheme == AppThemeMode.LIGHT
     }
 }
 
@@ -744,6 +845,7 @@ private fun formatLatency(value: Double): String = String.format(Locale.US, "%.1
 private fun StatusCard(runtime: VpnRuntimeState) {
     val statusColor = when (runtime.status) {
         ConnectionStatus.TCP4_DIRECT, ConnectionStatus.TCP6_DIRECT -> Color(0xFF2E7D32)
+        ConnectionStatus.COORDINATOR_ONLY -> MaterialTheme.colorScheme.primary
         ConnectionStatus.CONNECTING -> MaterialTheme.colorScheme.tertiary
         ConnectionStatus.NO_DIRECT_CONNECTION -> MaterialTheme.colorScheme.error
         ConnectionStatus.DISCONNECTED -> MaterialTheme.colorScheme.outline

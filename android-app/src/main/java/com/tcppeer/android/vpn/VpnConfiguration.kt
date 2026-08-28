@@ -12,6 +12,21 @@ enum class AppThemeMode(val storageValue: String, val label: String) {
     }
 }
 
+enum class AppMaterialColor(
+    val storageValue: String,
+    val label: String,
+) {
+    BLUE("blue", "Blue"),
+    GREEN("green", "Green"),
+    ORANGE("orange", "Orange"),
+    ROSE("rose", "Rose");
+
+    companion object {
+        fun fromStorage(value: String?): AppMaterialColor =
+            entries.firstOrNull { it.storageValue == value } ?: BLUE
+    }
+}
+
 data class VpnConfiguration(
     val coordinatorAddress: String = "",
     val coordinatorPort: Int = 7443,
@@ -23,6 +38,7 @@ data class VpnConfiguration(
     val directPort: Int = 7444,
     val mtu: Int = 1400,
     val appTheme: AppThemeMode = AppThemeMode.DARK,
+    val materialColor: AppMaterialColor = AppMaterialColor.BLUE,
 ) {
     fun validate() {
         require(coordinatorAddress.isNotBlank()) { "Coordinator DNS name or IP address is required" }
@@ -31,8 +47,8 @@ data class VpnConfiguration(
         require(network.isNotBlank() && network.all { it.code in 1..127 }) { "Network must be ASCII" }
         require(peerId.isNotBlank() && peerId.all { it.code in 1..127 }) { "Peer ID must be ASCII" }
         require(secret.all { it.code in 0..127 }) { "Secret must be ASCII" }
-        require(!useExitNode || (targetPeerId.isNotBlank() && targetPeerId.all { it.code in 1..127 })) {
-            "Exit node peer ID must be ASCII"
+        require(targetPeerId.isNotBlank() && targetPeerId.all { it.code in 1..127 }) {
+            "Server or exit node peer ID must be ASCII"
         }
         require(directPort in 1..65535) { "Direct port must be between 1 and 65535" }
         require(mtu in 1280..65535) { "Dual-stack MTU must be between 1280 and 65535" }
@@ -53,6 +69,9 @@ class ConfigurationStore(context: Context) {
         directPort = preferences.getInt("direct_port", 7444),
         mtu = preferences.getInt("mtu", 1400),
         appTheme = AppThemeMode.fromStorage(preferences.getString("app_theme", AppThemeMode.DARK.storageValue)),
+        materialColor = AppMaterialColor.fromStorage(
+            preferences.getString("material_color", AppMaterialColor.BLUE.storageValue),
+        ),
     )
 
     fun save(value: VpnConfiguration) {
@@ -69,6 +88,7 @@ class ConfigurationStore(context: Context) {
             putInt("mtu", value.mtu)
             putBoolean("route_all_traffic", value.useExitNode)
             putString("app_theme", value.appTheme.storageValue)
+            putString("material_color", value.materialColor.storageValue)
         }
     }
 

@@ -268,7 +268,7 @@ class TcpPeerVpnService : VpnService() {
         if (registration.command != "ENDPOINT-INFO") throw ProtocolException("Coordinator did not accept registration")
         TcpPeerProtocol.writeControl(controlOutput, ControlMessage("PEER-INFO", mapOf("Action" to "List")))
         readDeviceList(controlInput)
-        val targetPeerId = effectiveTargetPeerId(config, TcpPeerRuntime.state.value.devices)
+        val targetPeerId = config.targetPeerId
         var family: DirectFamily
         var address: InetAddress
         var peerPort: Int
@@ -781,14 +781,6 @@ class TcpPeerVpnService : VpnService() {
         }
     }
 
-    private fun effectiveTargetPeerId(
-        config: VpnConfiguration,
-        devices: List<NetworkDevice>,
-    ): String {
-        if (config.useExitNode) return config.targetPeerId
-        return devices.firstOrNull { it.online && it.peerId != config.peerId }?.peerId
-            ?: throw ProtocolException("No online peer is available while Use Exit Node is disabled")
-    }
 
     private fun subtractPrefix(route: RoutePrefix, blocked: RoutePrefix): List<RoutePrefix> {
         if (route.address.size != blocked.address.size || !contains(route, blocked.address)) return listOf(route)
