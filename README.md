@@ -1978,6 +1978,14 @@ TCPeer-specific data-plane framing overhead:
 
 ---
 
+# Development and AI assistance
+
+TCPeer was developed with the assistance of **OpenAI Codex**.
+
+TCPeer itself is an independent project; Codex was used as a development assistant.
+
+---
+
 # License
 
 TCPeer is licensed under the Apache License 2.0.
