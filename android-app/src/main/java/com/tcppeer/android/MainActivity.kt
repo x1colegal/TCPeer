@@ -1,10 +1,9 @@
 package com.tcppeer.android
 
+import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
-
-import android.Manifest
 import android.content.Intent
 import android.net.VpnService
 import android.os.Build
@@ -15,15 +14,13 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
-import androidx.compose.animation.animateContentSize
-import androidx.compose.foundation.background
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.Image
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -39,12 +36,14 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
-import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
@@ -53,14 +52,12 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.PrimaryTabRow
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
@@ -170,6 +167,15 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+private enum class RootTab {
+    HOME, PEERS, SETTINGS
+}
+
+private enum class SettingsSection {
+    NETWORK, APP
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun TcpPeerScreen(
     configuration: VpnConfiguration,
@@ -178,164 +184,245 @@ private fun TcpPeerScreen(
     onConnect: (VpnConfiguration) -> Unit,
     onDisconnect: () -> Unit,
 ) {
-    var showNetworkSettings by remember { mutableStateOf(false) }
-    var showAppSettings by remember { mutableStateOf(false) }
-    val active = runtime.status in setOf(
-        ConnectionStatus.CONNECTING,
-        ConnectionStatus.COORDINATOR_ONLY,
-        ConnectionStatus.TCP4_DIRECT,
-        ConnectionStatus.TCP6_DIRECT,
-    )
-    val connected = runtime.status in setOf(
-        ConnectionStatus.COORDINATOR_ONLY,
-        ConnectionStatus.TCP4_DIRECT,
-        ConnectionStatus.TCP6_DIRECT,
-    )
+    var selectedTab by remember { mutableStateOf(RootTab.HOME) }
+    var selectedSettingsSection by remember { mutableStateOf(SettingsSection.NETWORK) }
+    val active = runtime.status != ConnectionStatus.DISCONNECTED && runtime.status != ConnectionStatus.NO_DIRECT_CONNECTION
+    val connected = runtime.status == ConnectionStatus.COORDINATOR_ONLY ||
+        runtime.status == ConnectionStatus.TCP4_DIRECT ||
+        runtime.status == ConnectionStatus.TCP6_DIRECT
 
     runtime.activePingPeerId?.let { peerId ->
         TppPingDialog(peerId, runtime.pingSamples, TcpPeerRuntime::stopContinuousPing)
     }
-    if (showNetworkSettings) {
-        NetworkSettingsDialog(
-            configuration = configuration,
-            active = active,
-            onConfigurationChange = onConfigurationChange,
-            onDismiss = { showNetworkSettings = false },
-        )
-    }
-    if (showAppSettings) {
-        AppSettingsDialog(
-            configuration = configuration,
-            active = active,
-            onConfigurationChange = onConfigurationChange,
-            onDismiss = { showAppSettings = false },
-        )
-    }
 
-    Surface(
-        modifier = Modifier.fillMaxSize(),
-        color = MaterialTheme.colorScheme.background,
-        contentColor = MaterialTheme.colorScheme.onBackground,
-    ) {
-      LazyColumn(
-          modifier = Modifier.fillMaxSize(),
-          contentPadding = PaddingValues(start = 22.dp, end = 22.dp, top = 48.dp, bottom = 40.dp),
-          verticalArrangement = Arrangement.spacedBy(22.dp),
-      ) {
-        item {
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Switch(
-                    checked = active,
-                    onCheckedChange = { enabled -> if (enabled) onConnect(configuration) else onDisconnect() },
-                )
-                Spacer(Modifier.width(18.dp))
-                Column(Modifier.weight(1f)) {
-                    Text(configuration.network, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
-                    AnimatedContent(runtime.status, label = "connection-status") { status ->
-                        Text(status.label, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.titleMedium)
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = {
+                    Column {
+                        Text("TCPeer", fontWeight = FontWeight.Bold)
+                        Text(
+                            "PeerNet overlay for your devices",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
                     }
-                }
-                Surface(shape = CircleShape, color = MaterialTheme.colorScheme.surfaceContainerHighest) {
-                    Image(
-                        painterResource(R.drawable.ic_launcher_foreground),
-                        contentDescription = "TCPeer logo",
-                        modifier = Modifier.size(54.dp).padding(5.dp),
-                    )
-                }
+                },
+                actions = {
+                    Row(modifier = Modifier.padding(end = 8.dp)) {
+                        Switch(
+                            checked = active,
+                            onCheckedChange = { enabled -> if (enabled) onConnect(configuration) else onDisconnect() },
+                        )
+                    }
+                },
+            )
+        },
+        bottomBar = {
+            NavigationBar {
+                NavigationBarItem(
+                    selected = selectedTab == RootTab.HOME,
+                    onClick = { selectedTab = RootTab.HOME },
+                    icon = { Icon(Icons.Default.Home, null) },
+                    label = { Text("Home") },
+                )
+                NavigationBarItem(
+                    selected = selectedTab == RootTab.PEERS,
+                    onClick = { selectedTab = RootTab.PEERS },
+                    icon = { Icon(Icons.Default.Info, null) },
+                    label = { Text("Peers") },
+                )
+                NavigationBarItem(
+                    selected = selectedTab == RootTab.SETTINGS,
+                    onClick = { selectedTab = RootTab.SETTINGS },
+                    icon = { Icon(Icons.Default.Settings, null) },
+                    label = { Text("Settings") },
+                )
             }
-        }
-
-        item {
-            ConnectionHero(
+        },
+    ) { innerPadding ->
+        when (selectedTab) {
+            RootTab.HOME -> HomeTab(
+                modifier = Modifier.padding(innerPadding),
+                configuration = configuration,
                 runtime = runtime,
                 active = active,
                 connected = connected,
                 onConnect = { onConnect(configuration) },
             )
+            RootTab.PEERS -> PeersTab(
+                modifier = Modifier.padding(innerPadding),
+                configuration = configuration,
+                runtime = runtime,
+            )
+            RootTab.SETTINGS -> SettingsTab(
+                modifier = Modifier.padding(innerPadding),
+                configuration = configuration,
+                active = active,
+                selectedSection = selectedSettingsSection,
+                onSelectSection = { selectedSettingsSection = it },
+                onConfigurationChange = onConfigurationChange,
+            )
         }
+    }
+}
 
-        if (connected) {
-            item {
-                Column {
-                    Text("Machines", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+@Composable
+private fun HomeTab(
+    modifier: Modifier = Modifier,
+    configuration: VpnConfiguration,
+    runtime: VpnRuntimeState,
+    active: Boolean,
+    connected: Boolean,
+    onConnect: () -> Unit,
+) {
+    LazyColumn(
+        modifier = modifier.fillMaxSize(),
+        contentPadding = PaddingValues(start = 22.dp, end = 22.dp, top = 18.dp, bottom = 28.dp),
+        verticalArrangement = Arrangement.spacedBy(18.dp),
+    ) {
+        item {
+            ConnectionHero(
+                runtime = runtime,
+                active = active,
+                connected = connected,
+                onConnect = onConnect,
+            )
+        }
+        item {
+            InfoCard(
+                title = configuration.network,
+                body = "This device joins your PeerNet as ${configuration.peerId}. " +
+                    "This screen shows the current connection state, short transport logs, and the active overlay addresses.",
+            )
+        }
+        item {
+            Surface(color = MaterialTheme.colorScheme.surfaceContainerLow, shape = RoundedCornerShape(24.dp)) {
+                Column(
+                    modifier = Modifier.fillMaxWidth().padding(18.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Text("Connection details", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                     Text(
-                        "${runtime.devices.count { it.online }} online in ${configuration.network}",
+                        "These values are updated from the live session when TCPeer is connected.",
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodyMedium,
                     )
-                }
-            }
-            if (runtime.devices.isEmpty()) {
-                item { EmptyMachines() }
-            } else {
-                items(runtime.devices.size) { index ->
-                    val device = runtime.devices[index]
-                    DeviceCard(
-                        device = device,
-                        isSelf = device.peerId == configuration.peerId,
-                    ) {
-                        TcpPeerRuntime.startContinuousPing(device.peerId, device.overlayIpv6)
-                    }
-                }
-            }
-            item {
-                Surface(color = MaterialTheme.colorScheme.surfaceContainerLow, shape = RoundedCornerShape(20.dp)) {
-                    Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
-                        Text("Connection details", fontWeight = FontWeight.Bold)
-                        DetailRow("Endpoint", runtime.endpoint)
-                        DetailRow("TCPeer IPv4", runtime.overlayIpv4)
-                        DetailRow("TCPeer IPv6", runtime.overlayIpv6)
-                        DetailRow("Traffic", "${formatBytes(runtime.rxBytes)} down / ${formatBytes(runtime.txBytes)} up")
-                    }
+                    DetailRow("Endpoint", runtime.endpoint)
+                    DetailRow("PeerNet IPv4", runtime.overlayIpv4)
+                    DetailRow("PeerNet IPv6", runtime.overlayIpv6)
+                    DetailRow("Traffic", "${formatBytes(runtime.rxBytes)} down / ${formatBytes(runtime.txBytes)} up")
                 }
             }
         }
+        item {
+            InfoCard(
+                title = "Security note",
+                body = "Only the Secret Key proof is protected today. The direct transport and VPN payload are still not confidential yet.",
+            )
+        }
+    }
+}
 
+@Composable
+private fun PeersTab(
+    modifier: Modifier = Modifier,
+    configuration: VpnConfiguration,
+    runtime: VpnRuntimeState,
+) {
+    LazyColumn(
+        modifier = modifier.fillMaxSize(),
+        contentPadding = PaddingValues(start = 22.dp, end = 22.dp, top = 18.dp, bottom = 28.dp),
+        verticalArrangement = Arrangement.spacedBy(18.dp),
+    ) {
         item {
-            Surface(
-                modifier = Modifier.fillMaxWidth().clickable { showNetworkSettings = true },
-                color = MaterialTheme.colorScheme.surfaceContainerLow,
-                shape = RoundedCornerShape(20.dp),
-            ) {
-                Row(Modifier.padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Default.Settings, contentDescription = null)
-                    Spacer(Modifier.width(14.dp))
-                    Column(Modifier.weight(1f)) {
-                        Text("Network settings", fontWeight = FontWeight.Bold)
-                        Text("Coordinator, identity, exit node and transport", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("Peers", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+        }
+        item {
+            Text(
+                "These are the machines linked to your PeerNet. Each peer card shows whether that device is online, what role it has, which transport it uses, and which public and overlay addresses it currently reports.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodyLarge,
+            )
+        }
+        item {
+            Surface(color = MaterialTheme.colorScheme.surfaceContainerLow, shape = RoundedCornerShape(24.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(18.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column {
+                        Text("${runtime.devices.count { it.online }} online", fontWeight = FontWeight.Bold)
+                        Text(
+                            "Inside ${configuration.network}",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
                     }
-                    Text(">", style = MaterialTheme.typography.titleLarge)
+                    Text("${runtime.devices.size} total", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold)
+                }
+            }
+        }
+        if (runtime.devices.isEmpty()) {
+            item { EmptyPeers() }
+        } else {
+            items(runtime.devices) { device ->
+                DeviceCard(
+                    device = device,
+                    isSelf = device.peerId == configuration.peerId,
+                ) {
+                    TcpPeerRuntime.startContinuousPing(device.peerId, device.overlayIpv6)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingsTab(
+    modifier: Modifier = Modifier,
+    configuration: VpnConfiguration,
+    active: Boolean,
+    selectedSection: SettingsSection,
+    onSelectSection: (SettingsSection) -> Unit,
+    onConfigurationChange: (VpnConfiguration) -> Unit,
+) {
+    LazyColumn(
+        modifier = modifier.fillMaxSize(),
+        contentPadding = PaddingValues(start = 22.dp, end = 22.dp, top = 18.dp, bottom = 28.dp),
+        verticalArrangement = Arrangement.spacedBy(18.dp),
+    ) {
+        item {
+            Text("Settings", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+        }
+        item {
+            Text(
+                "This area groups all app configuration. Network Settings controls how this device joins your PeerNet, and App Settings controls only the UI style.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodyLarge,
+            )
+        }
+        item {
+            FlowRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                SectionChip("Network Settings", selectedSection == SettingsSection.NETWORK) {
+                    onSelectSection(SettingsSection.NETWORK)
+                }
+                SectionChip("App Settings", selectedSection == SettingsSection.APP) {
+                    onSelectSection(SettingsSection.APP)
                 }
             }
         }
         item {
-            Surface(
-                modifier = Modifier.fillMaxWidth().clickable { showAppSettings = true },
-                color = MaterialTheme.colorScheme.surfaceContainerLow,
-                shape = RoundedCornerShape(20.dp),
-            ) {
-                Row(Modifier.padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Default.Info, contentDescription = null)
-                    Spacer(Modifier.width(14.dp))
-                    Column(Modifier.weight(1f)) {
-                        Text("App settings", fontWeight = FontWeight.Bold)
-                        Text("Theme and interface presentation", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                    Text(">", style = MaterialTheme.typography.titleLarge)
-                }
+            when (selectedSection) {
+                SettingsSection.NETWORK -> NetworkSettingsPanel(configuration, active, onConfigurationChange)
+                SettingsSection.APP -> AppSettingsPanel(configuration, active, onConfigurationChange)
             }
         }
-        item {
-            Row(verticalAlignment = Alignment.Top) {
-                Icon(Icons.Default.Info, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                Spacer(Modifier.width(12.dp))
-                Text(
-                    "Only the Secret Key proof is protected. Endpoints and VPN traffic remain cleartext.",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    style = MaterialTheme.typography.bodySmall,
-                )
-            }
-        }
-      }
     }
 }
 
@@ -348,24 +435,27 @@ private fun ConnectionHero(
 ) {
     val scale by animateFloatAsState(if (active) 1.0f else 0.92f, tween(500), label = "hero-scale")
     Column(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 28.dp),
+        modifier = Modifier.fillMaxWidth().padding(vertical = 24.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         Surface(
-            modifier = Modifier.size(86.dp).graphicsLayer { scaleX = scale; scaleY = scale },
+            modifier = Modifier.size(92.dp).graphicsLayer { scaleX = scale; scaleY = scale },
             shape = CircleShape,
             color = if (connected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerHighest,
         ) {
             Box(contentAlignment = Alignment.Center) {
-                Image(painterResource(R.drawable.ic_launcher_foreground), null, Modifier.size(78.dp))
+                androidx.compose.foundation.Image(
+                    painterResource(R.drawable.ic_launcher_foreground),
+                    null,
+                    Modifier.size(82.dp),
+                )
             }
         }
         Text(
             when {
                 connected -> "Connected"
                 runtime.status == ConnectionStatus.CONNECTING -> "Connecting..."
-                runtime.status == ConnectionStatus.COORDINATOR_ONLY -> "Connected"
                 runtime.status == ConnectionStatus.NO_DIRECT_CONNECTION -> "Connection failed"
                 else -> "Not connected"
             },
@@ -373,12 +463,7 @@ private fun ConnectionHero(
             fontWeight = FontWeight.Bold,
         )
         Text(
-            when {
-                runtime.status == ConnectionStatus.COORDINATOR_ONLY ->
-                    "Coordinator connected. Exit node is disabled, so only the TCPeer directory is active."
-                connected -> runtime.status.label
-                else -> runtime.detail
-            },
+            runtime.detail.toFriendlyRuntimeDetail(),
             modifier = Modifier.fillMaxWidth(),
             textAlign = TextAlign.Center,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -397,147 +482,174 @@ private fun ConnectionHero(
 }
 
 @Composable
-private fun EmptyMachines() {
-    Surface(color = MaterialTheme.colorScheme.surfaceContainerLow, shape = RoundedCornerShape(20.dp)) {
-        Column(Modifier.fillMaxWidth().padding(28.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-            Text("No machines yet", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-            Text("The coordinator directory will appear here.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+private fun InfoCard(title: String, body: String) {
+    Surface(color = MaterialTheme.colorScheme.surfaceContainerLow, shape = RoundedCornerShape(24.dp)) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(18.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(title, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
+            Text(body, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
         }
     }
 }
 
 @Composable
-private fun NetworkSettingsDialog(
+private fun EmptyPeers() {
+    Surface(color = MaterialTheme.colorScheme.surfaceContainerLow, shape = RoundedCornerShape(24.dp)) {
+        Column(Modifier.fillMaxWidth().padding(28.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Text("No peers yet", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            Text(
+                "When the coordinator reports the devices linked to your PeerNet, they will show up here.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+            )
+        }
+    }
+}
+
+@Composable
+private fun SectionChip(
+    title: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+) {
+    Surface(
+        modifier = Modifier.clickable(onClick = onClick),
+        color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerLow,
+        shape = RoundedCornerShape(22.dp),
+    ) {
+        Text(
+            title,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+            fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+        )
+    }
+}
+
+@Composable
+private fun NetworkSettingsPanel(
     configuration: VpnConfiguration,
     active: Boolean,
     onConfigurationChange: (VpnConfiguration) -> Unit,
-    onDismiss: () -> Unit,
 ) {
     var showSecret by remember { mutableStateOf(false) }
-    Dialog(onDismissRequest = onDismiss) {
-        Surface(shape = RoundedCornerShape(28.dp), color = MaterialTheme.colorScheme.surface) {
-            LazyColumn(
-                modifier = Modifier.fillMaxWidth().padding(22.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                item {
-                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        Text("Network settings", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                        IconButton(onClick = onDismiss) { Icon(Icons.Default.Close, "Close settings") }
-                    }
-                }
-                item { SettingsField(configuration.coordinatorAddress, { onConfigurationChange(configuration.copy(coordinatorAddress = it)) }, "Coordinator DNS name or IP", active) }
-                item { SettingsField(configuration.coordinatorPort.toString(), { it.toIntOrNull()?.let { value -> onConfigurationChange(configuration.copy(coordinatorPort = value)) } }, "Coordinator TCP port", active, true) }
-                item { SettingsField(configuration.network, { onConfigurationChange(configuration.copy(network = it)) }, "Network", active) }
-                item { SettingsField(configuration.peerId, { onConfigurationChange(configuration.copy(peerId = it)) }, "Peer ID", active) }
-                item {
-                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        Column(Modifier.weight(1f)) {
-                            Text("Use Exit Node", fontWeight = FontWeight.Bold)
-                            Text(
-                                if (configuration.useExitNode) "Route internet through a selected peer"
-                                else "Keep TCPeer connected, but leave normal internet on the phone network",
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                        Switch(
-                            checked = configuration.useExitNode,
-                            onCheckedChange = {
-                            onConfigurationChange(
-                                configuration.copy(
-                                    useExitNode = it,
-                                ),
-                            )
+    Surface(shape = RoundedCornerShape(28.dp), color = MaterialTheme.colorScheme.surfaceContainerLow) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Icon(Icons.Default.Settings, null)
+                Text("Network Settings", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+            }
+            Text(
+                "Choose the coordinator address, the identity of this device, the preferred peer, and the basic transport parameters for the PeerNet session.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            SettingsField(configuration.coordinatorAddress, { onConfigurationChange(configuration.copy(coordinatorAddress = it)) }, "Coordinator DNS name or IP", active)
+            SettingsField(configuration.coordinatorPort.toString(), { it.toIntOrNull()?.let { value -> onConfigurationChange(configuration.copy(coordinatorPort = value)) } }, "Coordinator TCP port", active, true)
+            SettingsField(configuration.network, { onConfigurationChange(configuration.copy(network = it)) }, "PeerNet name", active)
+            SettingsField(configuration.peerId, { onConfigurationChange(configuration.copy(peerId = it)) }, "This peer ID", active)
+            Surface(color = MaterialTheme.colorScheme.surfaceContainerHighest, shape = RoundedCornerShape(20.dp)) {
+                Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Use Exit Node", fontWeight = FontWeight.Bold)
+                        Text(
+                            if (configuration.useExitNode) {
+                                "Internet traffic is routed through the selected peer."
+                            } else {
+                                "Only PeerNet access stays in TCPeer. Regular internet stays on the phone network."
                             },
-                            enabled = !active,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodySmall,
                         )
                     }
-                }
-                item {
-                    SettingsField(
-                        value = configuration.targetPeerId,
-                        onValueChange = { onConfigurationChange(configuration.copy(targetPeerId = it)) },
-                        label = if (configuration.useExitNode) "Exit node peer ID" else "Server peer ID",
-                        active = active,
-                    )
-                }
-                item {
-                    OutlinedTextField(
-                        value = configuration.secret,
-                        onValueChange = { onConfigurationChange(configuration.copy(secret = it)) },
-                        label = { Text("Protected Secret Key") },
-                        supportingText = { Text("Sent only as an HMAC-SHA256 proof") },
-                        visualTransformation = if (showSecret) VisualTransformation.None else PasswordVisualTransformation(),
-                        trailingIcon = { TextButton(onClick = { showSecret = !showSecret }) { Text(if (showSecret) "Hide" else "Show") } },
-                        singleLine = true,
+                    Switch(
+                        checked = configuration.useExitNode,
+                        onCheckedChange = { onConfigurationChange(configuration.copy(useExitNode = it)) },
                         enabled = !active,
-                        modifier = Modifier.fillMaxWidth(),
                     )
                 }
-                item { SettingsField(configuration.directPort.toString(), { it.toIntOrNull()?.let { value -> onConfigurationChange(configuration.copy(directPort = value)) } }, "Direct TCP port", active, true) }
-                item { SettingsField(configuration.mtu.toString(), { it.toIntOrNull()?.let { value -> onConfigurationChange(configuration.copy(mtu = value)) } }, "MTU", active, true) }
-                item { Button(onClick = onDismiss, modifier = Modifier.fillMaxWidth()) { Text("Done") } }
             }
+            SettingsField(
+                value = configuration.targetPeerId,
+                onValueChange = { onConfigurationChange(configuration.copy(targetPeerId = it)) },
+                label = if (configuration.useExitNode) "Exit node peer ID" else "Preferred peer ID",
+                active = active,
+            )
+            OutlinedTextField(
+                value = configuration.secret,
+                onValueChange = { onConfigurationChange(configuration.copy(secret = it)) },
+                label = { Text("Protected Secret Key") },
+                supportingText = { Text("Used only for authentication proof during connection.") },
+                visualTransformation = if (showSecret) VisualTransformation.None else PasswordVisualTransformation(),
+                trailingIcon = { TextButton(onClick = { showSecret = !showSecret }) { Text(if (showSecret) "Hide" else "Show") } },
+                singleLine = true,
+                enabled = !active,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            SettingsField(configuration.directPort.toString(), { it.toIntOrNull()?.let { value -> onConfigurationChange(configuration.copy(directPort = value)) } }, "Direct transport port", active, true)
+            SettingsField(configuration.mtu.toString(), { it.toIntOrNull()?.let { value -> onConfigurationChange(configuration.copy(mtu = value)) } }, "Tunnel MTU", active, true)
         }
     }
 }
 
 @Composable
-private fun AppSettingsDialog(
+private fun AppSettingsPanel(
     configuration: VpnConfiguration,
     active: Boolean,
     onConfigurationChange: (VpnConfiguration) -> Unit,
-    onDismiss: () -> Unit,
 ) {
-    Dialog(onDismissRequest = onDismiss) {
-        Surface(shape = RoundedCornerShape(28.dp), color = MaterialTheme.colorScheme.surface) {
-            LazyColumn(
-                modifier = Modifier.fillMaxWidth().padding(22.dp),
-                verticalArrangement = Arrangement.spacedBy(14.dp),
+    Surface(shape = RoundedCornerShape(28.dp), color = MaterialTheme.colorScheme.surfaceContainerLow) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Icon(Icons.Default.PlayArrow, null)
+                Text("App Settings", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+            }
+            Text(
+                "These options only change the presentation of the app. They do not affect how the PeerNet tunnel works.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            ThemeSectionTitle("Appearance mode")
+            ThemeModeOption(
+                title = "Dark",
+                description = "Dark surfaces with brighter accents.",
+                selected = configuration.appTheme == AppThemeMode.DARK,
+                enabled = !active,
+                icon = { Icon(Icons.Default.Check, null) },
             ) {
-                item {
-                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        Text("App settings", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                        IconButton(onClick = onDismiss) { Icon(Icons.Default.Close, "Close app settings") }
-                    }
-                }
-                item {
-                    ThemeSectionTitle("Appearance mode")
-                }
-                item {
-                    ThemeModeOption(
-                        title = "Dark",
-                        description = "Dark surfaces with bright status text.",
-                        selected = configuration.appTheme == AppThemeMode.DARK,
-                        enabled = !active,
-                        icon = { Icon(Icons.Default.Check, contentDescription = null) },
-                    ) {
-                        onConfigurationChange(configuration.copy(appTheme = AppThemeMode.DARK))
-                    }
-                }
-                item {
-                    ThemeModeOption(
-                        title = "Light",
-                        description = "Light surfaces with dark status text.",
-                        selected = configuration.appTheme == AppThemeMode.LIGHT,
-                        enabled = !active,
-                        icon = { Icon(Icons.Default.Info, contentDescription = null) },
-                    ) {
-                        onConfigurationChange(configuration.copy(appTheme = AppThemeMode.LIGHT))
-                    }
-                }
-                item {
-                    ThemeSectionTitle("Material color")
-                }
-                item {
-                    MaterialColorPicker(
-                        selected = configuration.materialColor,
-                        enabled = !active,
-                    ) { color ->
-                        onConfigurationChange(configuration.copy(materialColor = color))
-                    }
-                }
-                item { Button(onClick = onDismiss, modifier = Modifier.fillMaxWidth()) { Text("Done") } }
+                onConfigurationChange(configuration.copy(appTheme = AppThemeMode.DARK))
+            }
+            ThemeModeOption(
+                title = "Pure Black",
+                description = "True black surfaces for OLED-style dark mode.",
+                selected = configuration.appTheme == AppThemeMode.PURE_BLACK,
+                enabled = !active,
+                icon = { Icon(Icons.Default.Check, null) },
+            ) {
+                onConfigurationChange(configuration.copy(appTheme = AppThemeMode.PURE_BLACK))
+            }
+            ThemeModeOption(
+                title = "Light",
+                description = "Light surfaces with darker content and status text.",
+                selected = configuration.appTheme == AppThemeMode.LIGHT,
+                enabled = !active,
+                icon = { Icon(Icons.Default.Info, null) },
+            ) {
+                onConfigurationChange(configuration.copy(appTheme = AppThemeMode.LIGHT))
+            }
+            ThemeSectionTitle("Material color")
+            MaterialColorPicker(
+                selected = configuration.materialColor,
+                enabled = !active,
+            ) { color ->
+                onConfigurationChange(configuration.copy(materialColor = color))
             }
         }
     }
@@ -560,11 +672,10 @@ private fun ThemeModeOption(
     icon: @Composable () -> Unit,
     onClick: () -> Unit,
 ) {
-    val shape = RoundedCornerShape(24.dp)
     Surface(
         modifier = Modifier.fillMaxWidth().clickable(enabled = enabled, onClick = onClick),
-        color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerLow,
-        shape = shape,
+        color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerHighest,
+        shape = RoundedCornerShape(24.dp),
     ) {
         Row(
             Modifier.fillMaxWidth().padding(18.dp),
@@ -595,8 +706,20 @@ private fun MaterialColorPicker(
         AppMaterialColor.entries.forEach { color ->
             val selectedColor = when (color) {
                 AppMaterialColor.BLUE -> Color(0xFF315DA8)
+                AppMaterialColor.INDIGO -> Color(0xFF4659A8)
+                AppMaterialColor.VIOLET -> Color(0xFF6C4AA0)
+                AppMaterialColor.PURPLE -> Color(0xFF7A4FA3)
+                AppMaterialColor.PINK -> Color(0xFFB12E78)
                 AppMaterialColor.GREEN -> Color(0xFF2D6A4F)
+                AppMaterialColor.TEAL -> Color(0xFF006A67)
+                AppMaterialColor.CYAN -> Color(0xFF006782)
+                AppMaterialColor.RED -> Color(0xFFB3261E)
                 AppMaterialColor.ORANGE -> Color(0xFF9A4600)
+                AppMaterialColor.AMBER -> Color(0xFF7A5700)
+                AppMaterialColor.YELLOW -> Color(0xFF6F5D00)
+                AppMaterialColor.LIME -> Color(0xFF586500)
+                AppMaterialColor.BROWN -> Color(0xFF7A5347)
+                AppMaterialColor.GRAY -> Color(0xFF5F5E66)
                 AppMaterialColor.ROSE -> Color(0xFF9C405D)
             }
             Surface(
@@ -607,7 +730,7 @@ private fun MaterialColorPicker(
                         color = if (selected == color) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant,
                         shape = RoundedCornerShape(22.dp),
                     ),
-                color = MaterialTheme.colorScheme.surfaceContainerLow,
+                color = MaterialTheme.colorScheme.surfaceContainerHighest,
                 shape = RoundedCornerShape(22.dp),
             ) {
                 Row(
@@ -652,7 +775,6 @@ private fun SettingsField(value: String, onValueChange: (String) -> Unit, label:
     )
 }
 
-
 @Composable
 private fun DeviceCard(device: NetworkDevice, isSelf: Boolean, onPing: () -> Unit) {
     var expanded by remember { mutableStateOf(false) }
@@ -660,20 +782,20 @@ private fun DeviceCard(device: NetworkDevice, isSelf: Boolean, onPing: () -> Uni
 
     fun copyAddress(label: String, value: String) {
         if (value == "-") return
-        val clipboard =
-            context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         clipboard.setPrimaryClip(ClipData.newPlainText(label, value))
     }
+
     Surface(
         modifier = Modifier.fillMaxWidth().animateContentSize().clickable { expanded = !expanded },
         color = MaterialTheme.colorScheme.surfaceContainerLow,
-        shape = RoundedCornerShape(20.dp),
+        shape = RoundedCornerShape(24.dp),
     ) {
-        Column(Modifier.fillMaxWidth().padding(17.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Surface(shape = CircleShape, color = MaterialTheme.colorScheme.surfaceContainerHighest) {
-                        Box(Modifier.size(44.dp), contentAlignment = Alignment.Center) {
+                        Box(Modifier.size(46.dp), contentAlignment = Alignment.Center) {
                             Text(device.platform.take(1).uppercase(), fontWeight = FontWeight.Bold)
                             Box(
                                 Modifier.align(Alignment.BottomEnd).size(11.dp).background(
@@ -687,48 +809,54 @@ private fun DeviceCard(device: NetworkDevice, isSelf: Boolean, onPing: () -> Uni
                     Column {
                         Text(device.peerId, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                         Text(
-                            device.role,
+                            "${device.role} • ${if (device.online) "Online" else "Offline"}",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
                 }
-                Spacer(Modifier.width(16.dp))
                 Text(
-                    if (expanded) "^" else ">",
-                    style = MaterialTheme.typography.titleLarge,
-                    modifier = Modifier.padding(start = 8.dp),
+                    if (expanded) "Hide" else "Details",
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.SemiBold,
                 )
             }
+            Text(
+                "Transport: ${device.transport}. PeerNet IPv6: ${device.overlayIpv6}",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodySmall,
+            )
             AnimatedVisibility(expanded) {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     HorizontalDivider(Modifier.padding(vertical = 4.dp))
+                    Text(
+                        "This peer card shows the identity, reachability, and addresses currently linked to this machine inside your PeerNet.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
                     DetailRow("Status", if (device.online) "Online" else "Offline")
                     DetailRow("Role", device.role)
                     DetailRow("Platform", device.platform)
                     DetailRow("Transport", device.transport)
                     DetailRow("Public IPv4", device.ipv4)
                     DetailRow("Public IPv6", device.ipv6)
-                    DetailRow("TCPeer IPv4", device.overlayIpv4)
-                    DetailRow("TCPeer IPv6", device.overlayIpv6)
-
+                    DetailRow("PeerNet IPv4", device.overlayIpv4)
+                    DetailRow("PeerNet IPv6", device.overlayIpv6)
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         Button(
-                            onClick = { copyAddress("TCPeer IPv4", device.overlayIpv4) },
+                            onClick = { copyAddress("PeerNet IPv4", device.overlayIpv4) },
                             enabled = device.overlayIpv4 != "-",
                             modifier = Modifier.weight(1f),
                         ) { Text("Copy IPv4") }
-
                         Button(
-                            onClick = { copyAddress("TCPeer IPv6", device.overlayIpv6) },
+                            onClick = { copyAddress("PeerNet IPv6", device.overlayIpv6) },
                             enabled = device.overlayIpv6 != "-",
                             modifier = Modifier.weight(1f),
                         ) { Text("Copy IPv6") }
                     }
-
                     if (!isSelf) {
                         Button(
                             onClick = onPing,
@@ -764,7 +892,7 @@ private fun TppPingDialog(peerId: String, samples: List<TppPingSample>, onClose:
                 Column {
                     Text("TPP continuous ping", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
                     Text(
-                        "$peerId - IPv6 Next Header 99 - every 1 second",
+                        "$peerId • IPv6 Next Header 99 • 1 sample per second",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -775,6 +903,11 @@ private fun TppPingDialog(peerId: String, samples: List<TppPingSample>, onClose:
                     style = MaterialTheme.typography.headlineMedium,
                     color = if (latest == null && samples.isNotEmpty()) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
                 )
+                Text(
+                    "This live graph measures latency to the selected PeerNet IPv6 peer.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall,
+                )
                 TppPingChart(samples)
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                     PingStatistic("Min", minimum?.let(::formatLatency) ?: "-")
@@ -783,7 +916,7 @@ private fun TppPingDialog(peerId: String, samples: List<TppPingSample>, onClose:
                     PingStatistic("Loss", String.format(Locale.US, "%.0f%%", lossPercent))
                 }
                 Text(
-                    "Last ${samples.size} samples (60-second window)",
+                    "Last ${samples.size} samples from the rolling 60-second window.",
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -842,51 +975,6 @@ private fun PingStatistic(label: String, value: String) {
 private fun formatLatency(value: Double): String = String.format(Locale.US, "%.1f ms", value)
 
 @Composable
-private fun StatusCard(runtime: VpnRuntimeState) {
-    val statusColor = when (runtime.status) {
-        ConnectionStatus.TCP4_DIRECT, ConnectionStatus.TCP6_DIRECT -> Color(0xFF2E7D32)
-        ConnectionStatus.COORDINATOR_ONLY -> MaterialTheme.colorScheme.primary
-        ConnectionStatus.CONNECTING -> MaterialTheme.colorScheme.tertiary
-        ConnectionStatus.NO_DIRECT_CONNECTION -> MaterialTheme.colorScheme.error
-        ConnectionStatus.DISCONNECTED -> MaterialTheme.colorScheme.outline
-    }
-    Card(
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
-        modifier = Modifier.fillMaxWidth(),
-    ) {
-        Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Box(Modifier.size(12.dp).background(statusColor, CircleShape))
-                Spacer(Modifier.size(10.dp))
-                Text(runtime.status.label, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
-            }
-            Text(runtime.detail, style = MaterialTheme.typography.bodyMedium)
-            if (runtime.status == ConnectionStatus.TCP4_DIRECT || runtime.status == ConnectionStatus.TCP6_DIRECT) {
-                HorizontalDivider(color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.15f))
-                DetailRow("Endpoint", runtime.endpoint)
-                DetailRow("Overlay IPv4", runtime.overlayIpv4)
-                DetailRow("Overlay IPv6", runtime.overlayIpv6)
-                DetailRow("Traffic", "${formatBytes(runtime.rxBytes)} received / ${formatBytes(runtime.txBytes)} sent")
-                val uptime = runtime.connectedAtMillis?.let { (System.currentTimeMillis() - it) / 1000 } ?: 0
-                DetailRow("Uptime", formatDuration(uptime))
-            }
-        }
-    }
-}
-
-@Composable
-private fun WarningCard() {
-    FilledTonalButton(onClick = {}, modifier = Modifier.fillMaxWidth(), contentPadding = PaddingValues(16.dp)) {
-        Icon(Icons.Default.Info, contentDescription = null)
-        Spacer(Modifier.size(10.dp))
-        Column(horizontalAlignment = Alignment.Start) {
-            Text("No confidentiality", fontWeight = FontWeight.SemiBold)
-            Text("Only the Secret Key proof is protected. VPN traffic remains cleartext.", style = MaterialTheme.typography.bodySmall)
-        }
-    }
-}
-
-@Composable
 private fun DetailRow(label: String, value: String) {
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
         Text(label, style = MaterialTheme.typography.labelLarge, modifier = Modifier.weight(0.34f))
@@ -917,4 +1005,19 @@ private fun formatDuration(seconds: Long): String {
     val minutes = (seconds % 3600) / 60
     val remaining = seconds % 60
     return if (hours > 0) "%dh %02dm".format(hours, minutes) else "%dm %02ds".format(minutes, remaining)
+}
+
+private fun String.toFriendlyRuntimeDetail(): String = when {
+    isBlank() -> "TCPeer is waiting for the next connection update."
+    contains("connectivity, not confidentiality", ignoreCase = true) ->
+        "TCPeer is ready to connect. It gives you PeerNet connectivity, but not traffic confidentiality yet."
+    contains("coordinator", ignoreCase = true) && contains("auth", ignoreCase = true) ->
+        "TCPeer is talking to the coordinator and authenticating this peer before the direct session comes up."
+    contains("waiting", ignoreCase = true) ->
+        "TCPeer is waiting for the selected peer to become ready for the direct connection."
+    contains("retry", ignoreCase = true) && contains("direct", ignoreCase = true) ->
+        "The direct path did not open yet, so TCPeer is retrying the peer-to-peer connection."
+    contains("lost", ignoreCase = true) && contains("reconnect", ignoreCase = true) ->
+        "The active connection was lost, so TCPeer is reconnecting on the current network."
+    else -> this
 }

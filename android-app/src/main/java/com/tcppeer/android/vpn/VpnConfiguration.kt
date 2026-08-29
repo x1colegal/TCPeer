@@ -5,7 +5,8 @@ import androidx.core.content.edit
 
 enum class AppThemeMode(val storageValue: String, val label: String) {
     LIGHT("light", "Light"),
-    DARK("dark", "Dark");
+    DARK("dark", "Dark"),
+    PURE_BLACK("pure_black", "Pure Black");
 
     companion object {
         fun fromStorage(value: String?): AppThemeMode = entries.firstOrNull { it.storageValue == value } ?: DARK
@@ -17,8 +18,20 @@ enum class AppMaterialColor(
     val label: String,
 ) {
     BLUE("blue", "Blue"),
+    INDIGO("indigo", "Indigo"),
+    VIOLET("violet", "Violet"),
+    PURPLE("purple", "Purple"),
+    PINK("pink", "Pink"),
     GREEN("green", "Green"),
+    TEAL("teal", "Teal"),
+    CYAN("cyan", "Cyan"),
+    RED("red", "Red"),
     ORANGE("orange", "Orange"),
+    AMBER("amber", "Amber"),
+    YELLOW("yellow", "Yellow"),
+    LIME("lime", "Lime"),
+    BROWN("brown", "Brown"),
+    GRAY("gray", "Gray"),
     ROSE("rose", "Rose");
 
     companion object {
