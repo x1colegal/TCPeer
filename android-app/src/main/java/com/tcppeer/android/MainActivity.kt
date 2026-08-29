@@ -448,63 +448,91 @@ private fun HelpTab(
         listOf(
             HelpTopic(
                 title = "What is a PeerNet?",
-                body = "A PeerNet is your private overlay network of linked devices. TCPeer uses it to give your machines stable peer identities and overlay IP addresses, even when the underlying internet paths change.",
+                body = "A PeerNet is an overlay network formed by the peers that belong to the same TCPeer network name. In practical terms, it is a logical network built on top of the normal internet. Each peer keeps its own identity, exchanges control information through the coordinator, and receives overlay addresses that are used inside the private mesh. This means the devices can talk to each other as members of the same virtual network even if they are physically on different LANs, mobile networks, or public internet providers. The important consequence is that a PeerNet is not the same thing as the underlying Wi-Fi, LTE, or Ethernet network. It is a higher-level topology created by TCPeer itself.",
             ),
             HelpTopic(
                 title = "What is the difference between a Coordinator and a Server?",
-                body = "The Coordinator is the control plane. It helps peers authenticate, register, discover each other, and prepare direct connections. A Server is a regular peer with an always-on role, usually used as a main node or exit node for the PeerNet data path.",
+                body = "The Coordinator is the control-plane component. Its job is signaling, peer registration, authentication, endpoint exchange, and connection orchestration. It is not supposed to be the main data-plane tunnel for user traffic. A Server, on the other hand, is just a peer that usually stays online and acts as a stable node for services, routing, subnet forwarding, or exit-node duties. In networking terms, the coordinator manages metadata and session setup, while a server peer carries real overlay traffic like any other participant. The consequence is that the coordinator is logically central for discovery, but the data path is intended to become peer-to-peer whenever possible.",
             ),
             HelpTopic(
                 title = "What is TCP?",
-                body = "TCP is a reliable and ordered internet transport protocol. It retries lost data and makes sure bytes are delivered in order, which is why many apps and websites use it.",
+                body = "TCP stands for Transmission Control Protocol. It is a connection-oriented transport protocol that provides reliable, ordered, duplicate-free byte-stream delivery. It uses sequence numbers, acknowledgements, retransmissions, congestion control, and flow control to make sure the receiver gets the data in the correct order. This is why protocols such as HTTP, SSH, and many VPNs often rely on TCP. The tradeoff is that if a segment is lost, later bytes are held back until the missing data is recovered. That behavior is called head-of-line blocking, and it matters a lot when you tunnel one protocol through another.",
             ),
             HelpTopic(
                 title = "What is hole punching?",
-                body = "Hole punching is a NAT traversal technique. Two peers try to open matching paths through their routers at nearly the same time so they can talk directly instead of using a relay.",
+                body = "Hole punching is a NAT traversal method used when two peers are both behind routers performing network address translation. The basic idea is that each peer first learns its externally visible endpoint, then both peers send outbound traffic at nearly the same time so the NAT devices create matching state entries. If the timing and router behavior line up, inbound packets from the other peer are accepted and a direct path appears. The important consequence is that hole punching depends on NAT behavior, firewall policy, endpoint mapping style, and timing. It is not guaranteed to work on every network.",
             ),
             HelpTopic(
                 title = "What is UDP hole punching?",
-                body = "UDP hole punching usually works better because UDP is connectionless. Routers often create temporary NAT mappings more easily for UDP traffic, so two peers can often establish a direct path faster.",
+                body = "UDP hole punching is the version of NAT traversal based on UDP datagrams. It usually has a better success rate because UDP is connectionless and many NAT devices are more permissive when tracking UDP state. A peer can send probe packets to create a temporary mapping, and the other side can often reply through that same mapping. This is one reason many peer-to-peer systems, game protocols, media systems, and ICE-style traversal mechanisms prefer UDP. The consequence is better direct-path flexibility, but the application must implement its own reliability, ordering, congestion behavior, or encryption if it needs those properties.",
             ),
             HelpTopic(
                 title = "What is TCP hole punching?",
-                body = "TCP hole punching is harder than UDP hole punching because both peers must coordinate simultaneous connection attempts very closely. Some routers and firewalls simply do not handle it well, so success rates can be lower.",
+                body = "TCP hole punching is a more fragile NAT traversal technique based on near-simultaneous TCP connection attempts, sometimes called simultaneous open. Unlike UDP, TCP has stateful connection establishment with SYN, SYN-ACK, and ACK semantics, and many NAT/firewall implementations are less friendly to this pattern. Both peers must use carefully coordinated timing and compatible NAT behavior for the direct session to succeed. The consequence is that TCP hole punching can work, but in the real world it often has a lower success rate than UDP hole punching, especially with symmetric NATs or aggressive firewall policies.",
             ),
             HelpTopic(
                 title = "What is TCP-over-TCP?",
-                body = "TCP-over-TCP means one TCP stream is carried inside another TCP stream. This can happen with tunnels or VPNs that use TCP outside while carrying TCP traffic inside.",
+                body = "TCP-over-TCP means an inner TCP session is encapsulated inside an outer TCP transport. This happens when you run TCP application traffic through a tunnel, VPN, proxy, or overlay that also uses TCP as its external carrier. From a protocol-design perspective, the inner connection is unaware of the retransmission and congestion behavior of the outer one, and the outer one is unaware of the application semantics of the inner one. The result is stacked reliability mechanisms interacting with each other.",
             ),
             HelpTopic(
                 title = "What is TCP-over-TCP meltdown?",
-                body = "TCP-over-TCP meltdown is the performance problem that can happen when both inner and outer TCP layers react to loss and delay at the same time. Consequences can include sudden slowdowns, bursty traffic, and unstable throughput.",
+                body = "TCP-over-TCP meltdown is the classic performance pathology that appears when a reliable ordered TCP stream is tunneled through another reliable ordered TCP stream. When loss or latency spikes occur, the outer TCP layer retransmits and delays bytes, while the inner TCP layer also interprets the same disruption as congestion or packet loss. Both layers back off, both layers retransmit, and both layers may amplify queueing delay. The consequence can be severe throughput collapse, bursty recovery behavior, latency inflation, and very uneven performance. This is especially painful for interactive traffic, bulk transfers over unstable links, and VPN-style tunneling.",
             ),
             HelpTopic(
                 title = "Why does TCPeer use TCP on the external transport layer and not UDP?",
-                body = "Right now TCPeer prefers a simpler external TCP transport because it is easier to deploy and reason about across mixed networks. The tradeoff is that it may leave performance on the table compared with a well-tuned UDP-based transport.",
+                body = "TCPeer currently uses TCP as the main external transport because it is simpler to deploy, easier to debug, and more predictable across many hostile or restricted networks. TCP often survives environments where UDP is rate-limited, filtered, or handled inconsistently. It also reduces the amount of custom transport logic needed at the current stage of the project. The downside is that TCP is not ideal for every tunnel design, especially when the payload already contains latency-sensitive or TCP-based traffic. A future AEAD-over-UDP or USTP-style path can improve efficiency and control, but it also increases protocol complexity, interop burden, NAT traversal difficulty, and implementation risk.",
             ),
             HelpTopic(
                 title = "What is an Exit Node?",
-                body = "An exit node is a peer that forwards your internet traffic through the PeerNet. If you enable it, your phone can use that remote peer as its internet path instead of using the local network directly.",
+                body = "An exit node is a peer that forwards general internet traffic on behalf of another peer. When you enable Use Exit Node, your device installs routes so traffic that would normally leave through the local Wi-Fi or mobile network instead leaves through the TCPeer tunnel and is then NATed or routed onward by the chosen peer. In practical terms, that peer becomes your egress point. The consequences are important: latency can increase, throughput depends on the exit node quality, and the exit node must be configured correctly for forwarding, DNS, firewall policy, and NAT or prefix routing.",
             ),
             HelpTopic(
                 title = "What happens if I disable Use Exit Node?",
-                body = "When Use Exit Node is off, TCPeer should keep PeerNet access for linked devices while your normal internet stays on the phone network. The consequence is that only PeerNet resources go through the tunnel.",
+                body = "When Use Exit Node is disabled, TCPeer should keep routes only for PeerNet resources and leave default internet connectivity on the phone's ordinary upstream network. In routing terms, the overlay prefixes remain inside the tunnel, while the default route stays outside. The intended consequence is split tunneling: PeerNet traffic goes through TCPeer, but public internet traffic does not. This mode is useful when you want access to linked peers without forcing all browsing or app traffic through a remote node.",
             ),
             HelpTopic(
                 title = "What are PeerNet IPv4 and PeerNet IPv6?",
-                body = "These are the overlay addresses assigned inside the PeerNet, not necessarily the public internet addresses of the device. They are the addresses peers use to reach each other across the TCPeer overlay.",
+                body = "PeerNet IPv4 and PeerNet IPv6 are overlay addresses assigned by the TCPeer environment, not necessarily the native addresses of the device on the physical network. These are the addresses that peers use inside the virtual topology once the tunnel is established. They can remain stable even when the real public endpoint changes. The important distinction is that public IP addresses describe how a device is reached on the internet, while PeerNet addresses describe how the device is addressed inside the overlay itself.",
             ),
             HelpTopic(
                 title = "What does the Endpoint field mean?",
-                body = "Endpoint is the current public or reachable address and port used by the direct transport path. It describes how the peer is reached on the outside network, not its internal PeerNet address.",
+                body = "The Endpoint field shows the externally reachable transport endpoint currently used by the direct session. That normally means an IP address plus a port, such as a public IPv6 socket or a NAT-mapped IPv4/port pair. This is part of the outer transport layer, not the inner PeerNet address space. The consequence is that the endpoint can change when the network changes, while the overlay identity and PeerNet address may stay conceptually tied to the same peer.",
             ),
             HelpTopic(
                 title = "What is the Protected Secret Key?",
-                body = "The Protected Secret Key is used for authentication proof when connecting to the coordinator. In the current TCPeer design, it helps prove identity, but it does not automatically encrypt all VPN traffic.",
+                body = "The Protected Secret Key is currently used as an authentication secret for proving that a peer is allowed to join a given TCPeer network. It participates in proof generation during coordinator authentication, typically through an HMAC-based challenge-response flow. That means it protects identity verification, not necessarily full session confidentiality. The important consequence is that a protected secret is not the same thing as end-to-end encrypted transport. Authentication and encryption are related concepts, but they solve different problems.",
             ),
             HelpTopic(
                 title = "What is continuous TPP ping?",
-                body = "Continuous TPP ping is a live latency measurement inside the PeerNet. It sends regular probe packets and shows the round-trip time and packet loss so you can judge link quality between peers.",
+                body = "Continuous TPP ping is a live measurement tool inside the PeerNet dataplane. It periodically sends probe packets to another peer and records round-trip latency, timeouts, and recent sample history. From an operational perspective, it helps you evaluate whether the overlay path is healthy, unstable, lossy, or showing latency spikes. The consequence is that it becomes easier to distinguish 'the peer is online' from 'the path quality is actually good enough for real use.'",
+            ),
+            HelpTopic(
+                title = "Why does TCPeer just fail when it cannot establish a TCP direct connection instead of falling back to a relay?",
+                body = "TCPeer currently treats direct connectivity as the primary success condition because the project is focused on peer-to-peer transport rather than relay-backed indirection. If a direct TCP session cannot be established, the software fails instead of silently switching to a relay path. Technically, this keeps the behavior explicit, avoids hiding transport failures, and avoids introducing a second data-plane architecture with different latency, bandwidth, privacy, accounting, and operational characteristics. The tradeoff is obvious: user experience is harsher when NAT traversal fails. A relay fallback can improve reachability, but it also means extra infrastructure, extra trust assumptions, more server bandwidth costs, and different performance semantics.",
+            ),
+            HelpTopic(
+                title = "Why does TCPeer fail when it cannot establish an IPv6 connection instead of falling back to IPv4?",
+                body = "TCPeer follows an IPv6-first policy because globally routable IPv6 often gives a cleaner and more direct end-to-end path than NATed IPv4. If both peers have usable IPv6, TCPeer prefers that family and may treat falling back to IPv4 as a policy violation instead of an automatic rescue path. The reasoning is that silently switching families can hide address-quality bugs, NAT issues, or incorrect endpoint advertisement. The consequence is stricter behavior: connections fail earlier, but debugging is clearer and the application does not accidentally abandon a better native IPv6 path without telling you.",
+            ),
+            HelpTopic(
+                title = "Why does TCPeer only try IPv4 direct when the peer does not have an IPv6 address?",
+                body = "In the current design, IPv4 direct transport is mostly a compatibility fallback rather than the preferred path. When a peer does not have a usable IPv6 address, TCPeer is more willing to attempt an IPv4 direct session because there is no better end-to-end family available. This policy reduces ambiguity in family selection and keeps the behavior consistent with the IPv6-first model. In practice, that means IPv4 is treated as the fallback path used when native public or usable IPv6 is missing, not as an equal first-choice candidate.",
+            ),
+            HelpTopic(
+                title = "What is NAT, and why does it matter so much here?",
+                body = "NAT stands for Network Address Translation. It allows many private devices to share one public address, usually by rewriting source addresses and ports. For ordinary client-server traffic this often works transparently, but for peer-to-peer systems it becomes a major obstacle because each peer must discover how it appears from the outside and whether inbound packets from the other peer will be accepted. The consequence is that NAT behavior strongly influences whether direct connections succeed, whether hole punching works, and whether a relay becomes necessary.",
+            ),
+            HelpTopic(
+                title = "What is the difference between an overlay address and a public address?",
+                body = "A public address belongs to the underlying internet-facing network stack of the device or its upstream router. An overlay address belongs to the logical TCPeer network built above that stack. Public addresses are about reachability on the outside network; overlay addresses are about identity and routing inside the PeerNet. The important operational consequence is that you might change Wi-Fi, LTE, or ISP and get a different public endpoint while still conceptually remaining the same overlay peer.",
+            ),
+            HelpTopic(
+                title = "Why can a peer be online but still not usable?",
+                body = "A peer being marked online usually means it successfully registered with the coordinator and is considered alive from the control-plane perspective. That does not always guarantee that the direct data-plane path is healthy. A peer can be online while still having broken endpoint advertisement, NAT issues, unusable transport family selection, blocked ports, bad routing, or an unstable tunnel. The consequence is that control-plane liveness and data-plane usability are related but not identical states.",
+            ),
+            HelpTopic(
+                title = "Why are technical tradeoffs shown inside the app?",
+                body = "TCPeer exposes technical concepts because transport choice, routing policy, exit-node behavior, and direct-path setup all have real consequences for performance and reliability. Hiding everything behind vague labels would make the app easier to read but much harder to reason about when something fails. The goal of the Help! page is to bridge that gap: keep the app usable while still teaching the actual networking concepts that influence behavior.",
             ),
         )
     }
