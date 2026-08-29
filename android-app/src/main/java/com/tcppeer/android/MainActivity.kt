@@ -590,13 +590,6 @@ private fun HelpTopicCard(topic: HelpTopic) {
                     fontWeight = FontWeight.SemiBold,
                 )
             }
-            if (!expanded) {
-                Text(
-                    "Short explanation and practical meaning.",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    style = MaterialTheme.typography.bodySmall,
-                )
-            }
             AnimatedVisibility(expanded) {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     HorizontalDivider()
