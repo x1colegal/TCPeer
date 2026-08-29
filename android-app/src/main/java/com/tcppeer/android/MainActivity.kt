@@ -168,7 +168,7 @@ class MainActivity : ComponentActivity() {
 }
 
 private enum class RootTab {
-    HOME, PEERS, SETTINGS
+    HOME, PEERS, SETTINGS, HELP
 }
 
 private enum class SettingsSection {
@@ -238,6 +238,12 @@ private fun TcpPeerScreen(
                     icon = { Icon(Icons.Default.Settings, null) },
                     label = { Text("Settings") },
                 )
+                NavigationBarItem(
+                    selected = selectedTab == RootTab.HELP,
+                    onClick = { selectedTab = RootTab.HELP },
+                    icon = { Icon(Icons.Default.Info, null) },
+                    label = { Text("Help!") },
+                )
             }
         },
     ) { innerPadding ->
@@ -263,9 +269,17 @@ private fun TcpPeerScreen(
                 onSelectSection = { selectedSettingsSection = it },
                 onConfigurationChange = onConfigurationChange,
             )
+            RootTab.HELP -> HelpTab(
+                modifier = Modifier.padding(innerPadding),
+            )
         }
     }
 }
+
+private data class HelpTopic(
+    val title: String,
+    val body: String,
+)
 
 @Composable
 private fun HomeTab(
@@ -421,6 +435,149 @@ private fun SettingsTab(
             when (selectedSection) {
                 SettingsSection.NETWORK -> NetworkSettingsPanel(configuration, active, onConfigurationChange)
                 SettingsSection.APP -> AppSettingsPanel(configuration, active, onConfigurationChange)
+            }
+        }
+    }
+}
+
+@Composable
+private fun HelpTab(
+    modifier: Modifier = Modifier,
+) {
+    val topics = remember {
+        listOf(
+            HelpTopic(
+                title = "What is a PeerNet?",
+                body = "A PeerNet is your private overlay network of linked devices. TCPeer uses it to give your machines stable peer identities and overlay IP addresses, even when the underlying internet paths change.",
+            ),
+            HelpTopic(
+                title = "What is the difference between a Coordinator and a Server?",
+                body = "The Coordinator is the control plane. It helps peers authenticate, register, discover each other, and prepare direct connections. A Server is a regular peer with an always-on role, usually used as a main node or exit node for the PeerNet data path.",
+            ),
+            HelpTopic(
+                title = "What is TCP?",
+                body = "TCP is a reliable and ordered internet transport protocol. It retries lost data and makes sure bytes are delivered in order, which is why many apps and websites use it.",
+            ),
+            HelpTopic(
+                title = "What is hole punching?",
+                body = "Hole punching is a NAT traversal technique. Two peers try to open matching paths through their routers at nearly the same time so they can talk directly instead of using a relay.",
+            ),
+            HelpTopic(
+                title = "What is UDP hole punching?",
+                body = "UDP hole punching usually works better because UDP is connectionless. Routers often create temporary NAT mappings more easily for UDP traffic, so two peers can often establish a direct path faster.",
+            ),
+            HelpTopic(
+                title = "What is TCP hole punching?",
+                body = "TCP hole punching is harder than UDP hole punching because both peers must coordinate simultaneous connection attempts very closely. Some routers and firewalls simply do not handle it well, so success rates can be lower.",
+            ),
+            HelpTopic(
+                title = "What is TCP-over-TCP?",
+                body = "TCP-over-TCP means one TCP stream is carried inside another TCP stream. This can happen with tunnels or VPNs that use TCP outside while carrying TCP traffic inside.",
+            ),
+            HelpTopic(
+                title = "What is TCP-over-TCP meltdown?",
+                body = "TCP-over-TCP meltdown is the performance problem that can happen when both inner and outer TCP layers react to loss and delay at the same time. Consequences can include sudden slowdowns, bursty traffic, and unstable throughput.",
+            ),
+            HelpTopic(
+                title = "Why does TCPeer use TCP on the external transport layer and not UDP?",
+                body = "Right now TCPeer prefers a simpler external TCP transport because it is easier to deploy and reason about across mixed networks. The tradeoff is that it may leave performance on the table compared with a well-tuned UDP-based transport.",
+            ),
+            HelpTopic(
+                title = "What is an Exit Node?",
+                body = "An exit node is a peer that forwards your internet traffic through the PeerNet. If you enable it, your phone can use that remote peer as its internet path instead of using the local network directly.",
+            ),
+            HelpTopic(
+                title = "What happens if I disable Use Exit Node?",
+                body = "When Use Exit Node is off, TCPeer should keep PeerNet access for linked devices while your normal internet stays on the phone network. The consequence is that only PeerNet resources go through the tunnel.",
+            ),
+            HelpTopic(
+                title = "What are PeerNet IPv4 and PeerNet IPv6?",
+                body = "These are the overlay addresses assigned inside the PeerNet, not necessarily the public internet addresses of the device. They are the addresses peers use to reach each other across the TCPeer overlay.",
+            ),
+            HelpTopic(
+                title = "What does the Endpoint field mean?",
+                body = "Endpoint is the current public or reachable address and port used by the direct transport path. It describes how the peer is reached on the outside network, not its internal PeerNet address.",
+            ),
+            HelpTopic(
+                title = "What is the Protected Secret Key?",
+                body = "The Protected Secret Key is used for authentication proof when connecting to the coordinator. In the current TCPeer design, it helps prove identity, but it does not automatically encrypt all VPN traffic.",
+            ),
+            HelpTopic(
+                title = "What is continuous TPP ping?",
+                body = "Continuous TPP ping is a live latency measurement inside the PeerNet. It sends regular probe packets and shows the round-trip time and packet loss so you can judge link quality between peers.",
+            ),
+        )
+    }
+    LazyColumn(
+        modifier = modifier.fillMaxSize(),
+        contentPadding = PaddingValues(start = 22.dp, end = 22.dp, top = 18.dp, bottom = 28.dp),
+        verticalArrangement = Arrangement.spacedBy(18.dp),
+    ) {
+        item {
+            Text("Help!", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+        }
+        item {
+            Text(
+                "Tap any card to expand it. This page explains TCPeer concepts, what certain features mean, and the main consequences or tradeoffs behind them.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodyLarge,
+            )
+        }
+        items(topics) { topic ->
+            HelpTopicCard(topic)
+        }
+    }
+}
+
+@Composable
+private fun HelpTopicCard(topic: HelpTopic) {
+    var expanded by remember { mutableStateOf(false) }
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .animateContentSize()
+            .clickable { expanded = !expanded },
+        color = MaterialTheme.colorScheme.surfaceContainerLow,
+        shape = RoundedCornerShape(24.dp),
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(18.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    topic.title,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.weight(1f),
+                )
+                Spacer(Modifier.width(12.dp))
+                Text(
+                    if (expanded) "Hide" else "Read",
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+            if (!expanded) {
+                Text(
+                    "Short explanation and practical meaning.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            AnimatedVisibility(expanded) {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    HorizontalDivider()
+                    Text(
+                        topic.body,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
             }
         }
     }
