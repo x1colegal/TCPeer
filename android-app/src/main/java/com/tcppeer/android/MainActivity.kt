@@ -456,7 +456,7 @@ private fun HelpTab(
             ),
             HelpTopic(
                 title = "What is TCP?",
-                body = "TCP stands for Transmission Control Protocol. It is a connection-oriented transport protocol that provides reliable, ordered, duplicate-free byte-stream delivery. It uses sequence numbers, acknowledgements, retransmissions, congestion control, and flow control to make sure the receiver gets the data in the correct order. This is why protocols such as HTTP, SSH, and many VPNs often rely on TCP. The tradeoff is that if a segment is lost, later bytes are held back until the missing data is recovered. That behavior is called head-of-line blocking, and it matters a lot when you tunnel one protocol through another.",
+                body = "TCP stands for Transmission Control Protocol. It is a connection-oriented transport protocol that provides reliable, ordered, duplicate-free byte-stream delivery. It uses sequence numbers, acknowledgements, retransmissions, congestion control, and flow control to make sure the receiver gets the data in the correct order. This is why protocols such as HTTP, SSH, and many traditional application protocols rely on TCP. The tradeoff is that if a segment is lost, later bytes are held back until the missing data is recovered. That behavior is called head-of-line blocking, and it matters a lot when you tunnel one protocol through another.",
             ),
             HelpTopic(
                 title = "What is hole punching?",
