@@ -100,6 +100,11 @@ class Server:
         self._registered_port_ipv4: int | None = config.direct_port if self._registered_ipv4 else None
         self._registered_port_ipv6: int | None = config.direct_port if self._registered_ipv6 else None
         self._direct_candidates: dict[socket.AddressFamily, socket.socket] = {}
+        self._direct_connect_tasks: dict[str, asyncio.Task] = {}
+        self._direct_adoption_lock = asyncio.Lock()
+        self._direct_owner_token: str | None = None
+        self._direct_owner_key: tuple[str, str] | None = None
+        self._direct_attempt_counter = 0
         self._byte_counters: dict[tuple[str, str], int] = {}
         self._coordinator_writer = None
         self._pending_tpp_pings: dict[int, asyncio.Future] = {}
@@ -184,10 +189,19 @@ class Server:
             self._listeners.append(listener)
 
     async def _accept_direct(self, reader, writer) -> None:
+        attempt = self._next_direct_attempt()
         try:
             direct_socket = writer.get_extra_info("socket")
             direct_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
             direct_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+            LOG.info(
+                "direct-accept start ts=%.6f attempt=%s initiated=no fd=%s local=%s remote=%s",
+                time.time(),
+                attempt,
+                direct_socket.fileno(),
+                self._sockname_text(writer),
+                self._peername_text(writer),
+            )
             info = await read_control(reader)
             if info.command != "PEER-INFO" or info.get("Network") != self.config.network:
                 raise ProtocolError("invalid direct peer handshake")
@@ -204,7 +218,15 @@ class Server:
             }).encode())
             await writer.drain()
             endpoint = writer.get_extra_info("peername") or ("unknown", 0)
-            await self._adopt_direct(reader, writer, peer_id, actual_family, f"{endpoint[0]}:{endpoint[1]}")
+            await self._adopt_direct(
+                reader,
+                writer,
+                peer_id,
+                actual_family,
+                f"{endpoint[0]}:{endpoint[1]}",
+                initiated=False,
+                attempt=attempt,
+            )
         except (ProtocolError, ConnectionError, asyncio.IncompleteReadError) as exc:
             LOG.warning("Rejected direct connection: %s", exc)
             writer.close()
@@ -309,9 +331,16 @@ class Server:
                 writer.write(ControlMessage("PONG", {}).encode())
                 await writer.drain()
             elif message.command == "PUNCH-GO":
-                task = asyncio.create_task(self._connect_direct(message), name="direct-connect")
+                peer_id = message.get("Peer-ID") or "unknown"
+                previous = self._direct_connect_tasks.get(peer_id)
+                if previous is not None and not previous.done():
+                    LOG.info("direct-connect cancel-stale ts=%.6f peer_id=%s reason=new-punch-go", time.time(), peer_id)
+                    previous.cancel()
+                task = asyncio.create_task(self._connect_direct(message), name=f"direct-connect:{peer_id}")
+                self._direct_connect_tasks[peer_id] = task
                 self._tasks.add(task)
                 task.add_done_callback(self._tasks.discard)
+                task.add_done_callback(lambda done, pid=peer_id: self._clear_direct_connect_task(pid, done))
             elif message.command == "PEER-INFO" and message.get("Action") == "Punch-Request":
                 requested_peer = message.get("Peer-ID")
                 if requested_peer:
@@ -423,11 +452,33 @@ class Server:
         if delay > 0:
             await asyncio.sleep(delay)
         peer_id = message.get("Peer-ID") or "unknown"
+        attempt = self._next_direct_attempt()
         try:
             candidate = self._direct_candidates.pop(family, None)
-            reader, writer = await DirectConnector().connect(
-                local, remote, family, prebound_socket=candidate,
+            LOG.info(
+                "direct-connect attempt ts=%.6f peer_id=%s family=%s attempt=%s initiated=yes local=%s:%s remote=%s:%s candidate_fd=%s",
+                time.time(),
+                peer_id,
+                "tcp6" if family == socket.AF_INET6 else "tcp4",
+                attempt,
+                local.address,
+                local.port,
+                remote.address,
+                remote.port,
+                candidate.fileno() if candidate is not None else None,
             )
+            reader, writer = await DirectConnector().connect(
+                local, remote, family, prebound_socket=candidate, peer_id=peer_id, attempt=attempt,
+            )
+        except asyncio.CancelledError:
+            LOG.info(
+                "direct-connect cancelled ts=%.6f peer_id=%s family=%s attempt=%s initiated=yes",
+                time.time(),
+                peer_id,
+                "tcp6" if family == socket.AF_INET6 else "tcp4",
+                attempt,
+            )
+            raise
         except DirectConnectionError:
             self.store.update_peer(peer_id, transport="No Direct Connection")
             raise
@@ -446,13 +497,70 @@ class Server:
         if required_family != family:
             writer.close()
             raise ProtocolError("coordinator selected a family that violates IPv6-first policy")
-        await self._adopt_direct(reader, writer, peer_id, family, f"{remote.address}:{remote.port}")
+        await self._adopt_direct(
+            reader,
+            writer,
+            peer_id,
+            family,
+            f"{remote.address}:{remote.port}",
+            initiated=True,
+            attempt=attempt,
+        )
 
-    async def _adopt_direct(self, reader, writer, peer_id: str, family: socket.AddressFamily, endpoint: str) -> None:
-        if self.direct_writer is not None:
-            self.direct_writer.close()
-        self.direct_writer = writer
-        self.direct_peer_id = peer_id
+    async def _adopt_direct(
+        self,
+        reader,
+        writer,
+        peer_id: str,
+        family: socket.AddressFamily,
+        endpoint: str,
+        *,
+        initiated: bool,
+        attempt: int,
+    ) -> None:
+        token = str(uuid.uuid4())
+        connection_key = self._connection_key(writer)
+        replaced_writer = None
+        replaced_peer_id = None
+        packet_count = 0
+
+        async with self._direct_adoption_lock:
+            if self.direct_writer is not None and self.direct_peer_id == peer_id and self._direct_owner_key is not None:
+                if connection_key >= self._direct_owner_key:
+                    LOG.info(
+                        "direct-adopt loser-close ts=%.6f peer_id=%s family=%s attempt=%s initiated=%s fd=%s local=%s remote=%s winner_key=%s loser_key=%s",
+                        time.time(),
+                        peer_id,
+                        "tcp6" if family == socket.AF_INET6 else "tcp4",
+                        attempt,
+                        "yes" if initiated else "no",
+                        self._socket_fd(writer),
+                        self._sockname_text(writer),
+                        self._peername_text(writer),
+                        self._direct_owner_key,
+                        connection_key,
+                    )
+                    writer.close()
+                    await asyncio.gather(writer.wait_closed(), return_exceptions=True)
+                    return
+            replaced_writer = self.direct_writer
+            replaced_peer_id = self.direct_peer_id
+            self.direct_writer = writer
+            self.direct_peer_id = peer_id
+            self._direct_owner_token = token
+            self._direct_owner_key = connection_key
+
+        if replaced_writer is not None and replaced_writer is not writer:
+            LOG.info(
+                "direct-adopt replace-close ts=%.6f old_peer_id=%s new_peer_id=%s attempt=%s reason=replaced-by-new-direct fd=%s",
+                time.time(),
+                replaced_peer_id,
+                peer_id,
+                attempt,
+                self._socket_fd(replaced_writer),
+            )
+            replaced_writer.close()
+
         label = "TCP6 Direct" if family == socket.AF_INET6 else "TCP4 Direct"
         self.store.update_peer(peer_id, transport=label, endpoint=endpoint, connected_at=int(time.time()))
         session_id = str(uuid.uuid4())
@@ -465,18 +573,49 @@ class Server:
         try:
             while True:
                 packet = await read_data(reader)
+                packet_count += 1
                 self._add_bytes(peer_id, "rx_bytes", len(packet))
                 await self._handle_peer_packet(packet, writer, peer_id)
+        except ProtocolError as exc:
+            if packet_count == 0 and "connection closed while reading IP version" in str(exc):
+                LOG.info(
+                    "direct-adopt early-eof ts=%.6f peer_id=%s family=%s attempt=%s initiated=%s fd=%s local=%s remote=%s reason=%s",
+                    time.time(),
+                    peer_id,
+                    "tcp6" if family == socket.AF_INET6 else "tcp4",
+                    attempt,
+                    "yes" if initiated else "no",
+                    self._socket_fd(writer),
+                    self._sockname_text(writer),
+                    self._peername_text(writer),
+                    exc,
+                )
+                return
+            raise
         finally:
-            if self.direct_writer is writer:
+            if self.direct_writer is writer and self._direct_owner_token == token:
                 self.direct_writer = None
                 self.direct_peer_id = None
+                self._direct_owner_token = None
+                self._direct_owner_key = None
                 self.store.update_peer(peer_id, transport="Disconnected")
             with self.store.connection:
                 self.store.connection.execute(
                     "UPDATE sessions SET state='disconnected', ended_at=? WHERE session_id=?",
                     (int(time.time()), session_id),
                 )
+            LOG.info(
+                "direct-adopt close ts=%.6f peer_id=%s family=%s attempt=%s initiated=%s fd=%s local=%s remote=%s packets=%s reason=stream-ended",
+                time.time(),
+                peer_id,
+                "tcp6" if family == socket.AF_INET6 else "tcp4",
+                attempt,
+                "yes" if initiated else "no",
+                self._socket_fd(writer),
+                self._sockname_text(writer),
+                self._peername_text(writer),
+                packet_count,
+            )
             writer.close()
 
     def _add_bytes(self, peer_id: str, column: str, amount: int) -> None:
@@ -500,6 +639,43 @@ class Server:
         while True:
             await asyncio.sleep(1)
             self._flush_byte_counters()
+
+    def _next_direct_attempt(self) -> int:
+        self._direct_attempt_counter += 1
+        return self._direct_attempt_counter
+
+    def _clear_direct_connect_task(self, peer_id: str, task: asyncio.Task) -> None:
+        if self._direct_connect_tasks.get(peer_id) is task:
+            self._direct_connect_tasks.pop(peer_id, None)
+
+    @staticmethod
+    def _socket_fd(writer) -> int | None:
+        sock = writer.get_extra_info("socket")
+        if sock is None:
+            return None
+        try:
+            return sock.fileno()
+        except OSError:
+            return None
+
+    @staticmethod
+    def _sockname_text(writer) -> str:
+        try:
+            return str(writer.get_extra_info("sockname"))
+        except OSError:
+            return "unknown"
+
+    @staticmethod
+    def _peername_text(writer) -> str:
+        try:
+            return str(writer.get_extra_info("peername"))
+        except OSError:
+            return "unknown"
+
+    def _connection_key(self, writer) -> tuple[str, str]:
+        local = self._sockname_text(writer)
+        remote = self._peername_text(writer)
+        return tuple(sorted((local, remote)))
 
     @staticmethod
     async def _write_data(writer, packet: bytes) -> None:

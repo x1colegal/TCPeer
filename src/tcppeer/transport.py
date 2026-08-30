@@ -5,12 +5,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 import asyncio
 import ipaddress
+import logging
 import socket
 from typing import Iterable
 
 
 class DirectConnectionError(ConnectionError):
     """Raised when the mandatory direct connection cannot be established."""
+
+
+LOG = logging.getLogger("tcppeer.transport")
 
 
 def is_usable_ipv6(address: str | None) -> bool:
@@ -74,6 +78,9 @@ class DirectConnector:
         remote: Endpoint,
         required_family: socket.AddressFamily,
         prebound_socket: socket.socket | None = None,
+        *,
+        peer_id: str = "unknown",
+        attempt: int = 0,
     ):
         if local.family != required_family or remote.family != required_family:
             raise DirectConnectionError("endpoint family violates transport policy")
@@ -91,8 +98,63 @@ class DirectConnector:
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
 
             try:
+                bind_candidates = [local.address]
+                wildcard = "::" if required_family == socket.AF_INET6 else "0.0.0.0"
+                if prebound_socket is None and local.address != wildcard:
+                    bind_candidates.append(wildcard)
+
                 if prebound_socket is None:
-                    sock.bind((local.address, local.port))
+                    bound = False
+                    bind_error = None
+                    for bind_address in bind_candidates:
+                        try:
+                            sock.bind((bind_address, local.port))
+                            bound = True
+                            LOG.info(
+                                "direct-connect bind-ok ts=%.6f peer_id=%s family=%s attempt=%s initiated=yes fd=%s local=%s:%s remote=%s:%s",
+                                loop.time(),
+                                peer_id,
+                                "tcp6" if required_family == socket.AF_INET6 else "tcp4",
+                                attempt,
+                                sock.fileno(),
+                                bind_address,
+                                local.port,
+                                remote.address,
+                                remote.port,
+                            )
+                            break
+                        except OSError as exc:
+                            bind_error = exc
+                            LOG.warning(
+                                "direct-connect bind-failed ts=%.6f peer_id=%s family=%s attempt=%s initiated=yes fd=%s local=%s:%s remote=%s:%s errno=%s reason=%s",
+                                loop.time(),
+                                peer_id,
+                                "tcp6" if required_family == socket.AF_INET6 else "tcp4",
+                                attempt,
+                                sock.fileno(),
+                                bind_address,
+                                local.port,
+                                remote.address,
+                                remote.port,
+                                getattr(exc, "errno", None),
+                                exc,
+                            )
+                            if exc.errno not in {99, 49, 19}:
+                                raise
+                    if not bound:
+                        raise bind_error or OSError("bind failed")
+
+                LOG.info(
+                    "direct-connect connect-start ts=%.6f peer_id=%s family=%s attempt=%s initiated=yes fd=%s local=%s remote=%s:%s",
+                    loop.time(),
+                    peer_id,
+                    "tcp6" if required_family == socket.AF_INET6 else "tcp4",
+                    attempt,
+                    sock.fileno(),
+                    sock.getsockname(),
+                    remote.address,
+                    remote.port,
+                )
 
                 remaining = deadline - loop.time()
                 attempt_timeout = min(self.timeout, remaining)
@@ -101,11 +163,45 @@ class DirectConnector:
                     attempt_timeout,
                 )
 
+                LOG.info(
+                    "direct-connect connect-ok ts=%.6f peer_id=%s family=%s attempt=%s initiated=yes fd=%s local=%s remote=%s",
+                    loop.time(),
+                    peer_id,
+                    "tcp6" if required_family == socket.AF_INET6 else "tcp4",
+                    attempt,
+                    sock.fileno(),
+                    sock.getsockname(),
+                    sock.getpeername(),
+                )
+
                 reader, writer = await asyncio.open_connection(sock=sock)
                 return reader, writer
 
+            except asyncio.CancelledError:
+                LOG.info(
+                    "direct-connect cancelled ts=%.6f peer_id=%s family=%s attempt=%s initiated=yes fd=%s",
+                    loop.time(),
+                    peer_id,
+                    "tcp6" if required_family == socket.AF_INET6 else "tcp4",
+                    attempt,
+                    sock.fileno(),
+                )
+                sock.close()
+                raise
             except Exception as exc:
                 last_exc = exc
+                LOG.warning(
+                    "direct-connect failed ts=%.6f peer_id=%s family=%s attempt=%s initiated=yes fd=%s local=%s remote=%s:%s reason=%s",
+                    loop.time(),
+                    peer_id,
+                    "tcp6" if required_family == socket.AF_INET6 else "tcp4",
+                    attempt,
+                    sock.fileno(),
+                    sock.getsockname() if sock.fileno() >= 0 else "closed",
+                    remote.address,
+                    remote.port,
+                    exc,
+                )
                 sock.close()
 
                 if prebound_socket is not None:
