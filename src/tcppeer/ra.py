@@ -9,6 +9,7 @@ from typing import Iterable
 ICMPV6_ROUTER_ADVERTISEMENT = 134
 IPPROTO_ICMPV6 = 58
 ALL_NODES = ipaddress.ip_address("ff02::1")
+LINK_LOCAL_ROUTER = ipaddress.ip_address("fe80::1")
 
 
 def internet_checksum(data: bytes) -> int:
@@ -73,3 +74,9 @@ def is_router_solicitation(packet: bytes) -> bool:
         and packet[6] == IPPROTO_ICMPV6
         and packet[40] == 133
     )
+
+
+def ipv6_source(packet: bytes) -> ipaddress.IPv6Address | None:
+    if len(packet) < 40 or packet[0] >> 4 != 6:
+        return None
+    return ipaddress.IPv6Address(packet[8:24])

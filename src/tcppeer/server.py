@@ -25,7 +25,7 @@ from tcppeer.dns import discover_upstream_dns
 from tcppeer.exit_node import ExitNodeFirewall
 from tcppeer.packet import build_dhcp_packet, extract_dhcp_payload
 from tcppeer.protocol import ControlMessage, ProtocolError, encode_data, read_control, read_data
-from tcppeer.ra import ALL_NODES, build_router_advertisement, is_router_solicitation
+from tcppeer.ra import ALL_NODES, LINK_LOCAL_ROUTER, build_router_advertisement, ipv6_source, is_router_solicitation
 from tcppeer.pd import PrefixDelegationClient, discover_ipv6_upstream, router_address, slaac_subnet
 from tcppeer.state import StateStore
 from tcppeer.tpp import ECHO_REQUEST, ECHO_REPLY, build_tpp, build_reply as build_tpp_reply, parse_tpp
@@ -665,7 +665,7 @@ class Server:
                 self._add_bytes(peer_id, "tx_bytes", len(response))
             return
         if is_router_solicitation(packet):
-            response = self._ra_packet()
+            response = self._ra_packet(ipv6_source(packet) or ALL_NODES)
             await self._write_data(writer, response)
             self._add_bytes(peer_id, "tx_bytes", len(response))
             return
@@ -774,14 +774,15 @@ class Server:
         if self.direct_writer is not None:
             await self._write_data(self.direct_writer, self._ra_packet())
 
-    def _ra_packet(self) -> bytes:
+    def _ra_packet(self, destination: ipaddress.IPv6Address = ALL_NODES) -> bytes:
         return build_router_advertisement(
-            self._active_server_ipv6, self._active_ipv6_prefix,
+            LINK_LOCAL_ROUTER,
+            self._active_ipv6_prefix,
             self.config.router_lifetime_seconds,
             self.config.preferred_lifetime_seconds,
             self.config.valid_lifetime_seconds,
             self.dns,
-            ALL_NODES,
+            destination,
         )
 
     async def _ra_loop(self) -> None:
