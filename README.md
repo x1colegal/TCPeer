@@ -1256,6 +1256,21 @@ tcppeer --config /etc/tcppeer/server.toml transport
 tcppeer --config /etc/tcppeer/server.toml stats
 ```
 
+On a Linux Client, `tcppeer` automatically uses `/etc/tcppeer/client.toml`
+when no server configuration exists:
+
+```bash
+tcppeer status
+tcppeer peers
+tcppeer ping PEER_ID
+```
+
+An explicit Client configuration is also accepted:
+
+```bash
+tcppeer --config /etc/tcppeer/client.toml status
+```
+
 ---
 
 # Configuration overview

@@ -1,4 +1,4 @@
-"""Read-only operational CLI for TCPeer server state."""
+"""Read-only operational CLI for TCPeer Linux server and client state."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import time
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tcppeer.config import ConfigurationError, ServerConfig
+from tcppeer.config import ClientConfig, ConfigurationError, ServerConfig
 from tcppeer.tpp import ECHO_REPLY, build_tpp, parse_tpp
 
 
@@ -35,14 +35,41 @@ def _print_table(rows: list[sqlite3.Row], columns: list[str]) -> None:
         print("  ".join(value.ljust(widths[index]) for index, value in enumerate(row)))
 
 
-def run_command(config: ServerConfig, command: str, peer_id: str | None = None) -> None:
+LinuxConfig = ServerConfig | ClientConfig
+
+
+def _default_config_path() -> Path:
+    server = Path("/etc/tcppeer/server.toml")
+    client = Path("/etc/tcppeer/client.toml")
+    if server.is_file():
+        return server
+    if client.is_file():
+        return client
+    return server
+
+
+def _load_config(path: str | Path) -> LinuxConfig:
+    config_path = Path(path)
+    try:
+        import tomllib
+        with config_path.open("rb") as source:
+            tables = tomllib.load(source)
+    except OSError:
+        raise
+    if "routing" in tables or config_path.name == "client.toml":
+        return ClientConfig.from_file(config_path)
+    return ServerConfig.from_file(config_path)
+
+
+def run_command(config: LinuxConfig, command: str, peer_id: str | None = None) -> None:
     connection = sqlite3.connect(f"file:{config.state_db}?mode=ro", uri=True)
     try:
         if command in {"status", "peers", "addresses", "transport", "stats"}:
             peers = _rows(connection, "SELECT * FROM peers ORDER BY peer_id")
             if command == "status":
                 connected = sum(row["transport"] not in {"Disconnected", "No Direct Connection"} for row in peers)
-                print(f"Server peer ID: {config.peer_id}")
+                role = "Client" if isinstance(config, ClientConfig) else "Server"
+                print(f"{role} peer ID: {config.peer_id}")
                 print(f"TUN interface: {config.tun_name}")
                 print(f"Connected peers: {connected}")
             elif command == "peers":
@@ -61,7 +88,7 @@ def run_command(config: ServerConfig, command: str, peer_id: str | None = None) 
         connection.close()
 
 
-def _run_ping(config: ServerConfig, peer_id: str) -> None:
+def _run_ping(config: LinuxConfig, peer_id: str) -> None:
     import re
     import socket
     import statistics
@@ -147,8 +174,8 @@ def _run_ping(config: ServerConfig, peer_id: str) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Inspect TCPeer server state")
-    parser.add_argument("--config", default="/etc/tcppeer/server.toml")
+    parser = argparse.ArgumentParser(description="Inspect TCPeer Linux server or client state")
+    parser.add_argument("--config", help="configuration file (auto-detects server.toml or client.toml by default)")
     parser.add_argument("command", choices=("status", "peers", "leases", "sessions", "addresses", "transport", "stats", "ping"))
     parser.add_argument("peer_id", nargs="?")
     return parser
@@ -157,7 +184,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     try:
-        config = ServerConfig.from_file(args.config)
+        config_path = Path(args.config) if args.config else _default_config_path()
+        config = _load_config(config_path)
         if args.command == "ping":
             if not args.peer_id:
                 raise SystemExit("Usage: tcppeer ping <peer-id>")
