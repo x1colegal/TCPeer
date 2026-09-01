@@ -23,6 +23,7 @@ data class NetworkDevice(
     val ipv6: String,
     val overlayIpv4: String,
     val overlayIpv6: String,
+    val connectedUsing: String = "-",
 )
 
 data class TppPingRequest(val peerId: String, val ipv6: String)

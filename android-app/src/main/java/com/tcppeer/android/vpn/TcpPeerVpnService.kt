@@ -69,6 +69,7 @@ class TcpPeerVpnService : VpnService() {
     private var directSocket: Socket? = null
     private val meshSockets = ConcurrentHashMap<String, Socket>()
     private val meshSocketKeys = ConcurrentHashMap<String, String>()
+    private val meshEndpoints = ConcurrentHashMap<String, String>()
     private val meshAdoptionLock = Any()
     private val meshConnecting = ConcurrentHashMap.newKeySet<String>()
     private val meshPunchActive = ConcurrentHashMap.newKeySet<String>()
@@ -405,6 +406,7 @@ class TcpPeerVpnService : VpnService() {
             peerOutputs[targetPeerId] = directOutput
             meshSockets[targetPeerId] = direct
             meshSocketKeys[targetPeerId] = connectionKey(direct)
+            meshEndpoints[targetPeerId] = formatSocketEndpoint(direct)
             val tunOutput = FileOutputStream(descriptor.fileDescriptor)
             prepareDirectListener(config.directPort, DirectFamily.IPV6)
             val passiveAcceptJob = launch(Dispatchers.IO) {
@@ -443,6 +445,7 @@ class TcpPeerVpnService : VpnService() {
                                     ipv6 = message.field("IPv6").orEmpty().ifBlank { "-" },
                                     overlayIpv4 = message.field("Overlay-IPv4").orEmpty().ifBlank { "-" },
                                     overlayIpv6 = message.field("Overlay-IPv6").orEmpty().ifBlank { "-" },
+                                    connectedUsing = message.field("Peer-ID")?.let(meshEndpoints::get) ?: "-",
                                 ).also { device ->
                                     if (
                                         device.online &&
@@ -609,8 +612,11 @@ class TcpPeerVpnService : VpnService() {
                 }
             } finally {
                 peerOutputs.remove(peerId, output)
-                meshSockets.remove(peerId, socket)
-                meshSocketKeys.remove(peerId, connectionKey(socket))
+                if (meshSockets.remove(peerId, socket)) {
+                    meshSocketKeys.remove(peerId, connectionKey(socket))
+                    meshEndpoints.remove(peerId)
+                    updateConnectedUsing(peerId, "-")
+                }
             }
         } catch (error: Exception) {
             Log.w(TAG, "Direct mesh connection to $peerId closed", error)
@@ -695,8 +701,11 @@ class TcpPeerVpnService : VpnService() {
             )
         } finally {
             output?.let { peerOutputs.remove(peerId, it) }
-            meshSockets.remove(peerId, socket)
-            meshSocketKeys.remove(peerId, connectionKey(socket))
+            if (meshSockets.remove(peerId, socket)) {
+                meshSocketKeys.remove(peerId, connectionKey(socket))
+                meshEndpoints.remove(peerId)
+                updateConnectedUsing(peerId, "-")
+            }
             closeQuietly(socket)
         }
     }
@@ -727,6 +736,7 @@ class TcpPeerVpnService : VpnService() {
             replaced = current
             meshSockets[peerId] = socket
             meshSocketKeys[peerId] = key
+            meshEndpoints[peerId] = formatSocketEndpoint(socket)
             peerOutputs[peerId] = output
         }
         replaced?.takeUnless { it === socket }?.let {
@@ -743,7 +753,16 @@ class TcpPeerVpnService : VpnService() {
                 "socket=${socketToken(socket)} initiated=$initiated local=${socket.localSocketAddress} " +
                 "remote=${socket.remoteSocketAddress} key=$key",
         )
+        updateConnectedUsing(peerId, formatSocketEndpoint(socket))
         return true
+    }
+
+    private fun updateConnectedUsing(peerId: String, endpoint: String) {
+        TcpPeerRuntime.update { state -> state.copy(
+            devices = state.devices.map { device ->
+                if (device.peerId == peerId) device.copy(connectedUsing = endpoint) else device
+            },
+        ) }
     }
 
     private fun processInboundPacket(
@@ -831,6 +850,7 @@ class TcpPeerVpnService : VpnService() {
                     ipv6 = message.field("IPv6").orEmpty().ifBlank { "-" },
                     overlayIpv4 = message.field("Overlay-IPv4").orEmpty().ifBlank { "-" },
                     overlayIpv6 = message.field("Overlay-IPv6").orEmpty().ifBlank { "-" },
+                    connectedUsing = message.field("Peer-ID")?.let(meshEndpoints::get) ?: "-",
                 )
             }
         }
@@ -1284,6 +1304,11 @@ class TcpPeerVpnService : VpnService() {
         socket.remoteSocketAddress?.toString().orEmpty(),
     ).sorted().joinToString("|")
 
+    private fun formatSocketEndpoint(socket: Socket): String {
+        val address = socket.inetAddress ?: return "-"
+        return formatEndpoint(address, socket.port)
+    }
+
     private fun socketToken(socket: Any): String =
         "${socket.javaClass.simpleName}@${Integer.toHexString(System.identityHashCode(socket))}"
 
@@ -1322,6 +1347,7 @@ class TcpPeerVpnService : VpnService() {
         meshSockets.values.forEach(::closeQuietly)
         meshSockets.clear()
         meshSocketKeys.clear()
+        meshEndpoints.clear()
         meshConnecting.clear()
         meshPunchActive.clear()
         closeDirectListeners()
