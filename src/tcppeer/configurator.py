@@ -245,6 +245,8 @@ def install(component: str, content: str, state_db: Path | None, user: str, grou
         raise FileNotFoundError("TCPeer command-line installation completed but required commands are unavailable")
     config_dir = Path("/etc/tcppeer")
     config_dir.mkdir(mode=0o750, parents=True, exist_ok=True)
+    config_dir.chmod(0o750)
+    shutil.chown(config_dir, group=group)
     config_path = config_dir / f"{component}.toml"
     config_path.write_text(content, encoding="ascii")
     config_path.chmod(0o640)
