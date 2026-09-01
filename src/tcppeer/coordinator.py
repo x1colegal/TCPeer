@@ -378,12 +378,7 @@ class Coordinator:
 
     async def _punch_go(self, left: RegisteredPeer, right: RegisteredPeer) -> None:
         same_public_origin = left.observed_address == right.observed_address
-        # Globally scoped IPv6 addresses are commonly assigned directly to LAN
-        # interfaces. Two peers in the same /64 are therefore on-link even
-        # though their coordinator-observed IPv6 addresses are necessarily
-        # different. Requiring the same observed address only makes sense for
-        # IPv4 peers sharing a NAT.
-        local_ipv6_path = self._same_local_network(left.local_ipv6, right.local_ipv6, 6)
+        local_ipv6_path = same_public_origin and self._same_local_network(left.local_ipv6, right.local_ipv6, 6)
         both_ipv6 = (
             is_usable_ipv6(left.declared_ipv6) and is_usable_ipv6(right.declared_ipv6)
         ) or local_ipv6_path
@@ -410,11 +405,7 @@ class Coordinator:
             right_port = right.mapped_ipv4_port or (right.observed_port if right_observed_version == 4 else right.listen_port)
         local_left = left.local_ipv6 if both_ipv6 else left.local_ipv4
         local_right = right.local_ipv6 if both_ipv6 else right.local_ipv4
-        same_local_network = self._same_local_network(
-            local_left, local_right, 6 if both_ipv6 else 4,
-        )
-        use_local_candidate = same_local_network and (both_ipv6 or same_public_origin)
-        if use_local_candidate:
+        if same_public_origin and self._same_local_network(local_left, local_right, 6 if both_ipv6 else 4):
             left_address = local_left
             right_address = local_right
             left_port = left.listen_port
