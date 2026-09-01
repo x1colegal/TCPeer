@@ -378,13 +378,7 @@ class Server:
                 peer_id = message.get("Peer-ID") or ""
                 if peer_id:
                     device_list_peers.add(peer_id)
-                    self.store.update_peer(
-                        peer_id,
-                        overlay_ipv4=message.get("Overlay-IPv4") or None,
-                        overlay_ipv6=message.get("Overlay-IPv6") or None,
-                        transport=message.get("Transport") or "Disconnected",
-                        endpoint=message.get("Endpoint") or None,
-                    )
+                    self._update_peer_from_directory(peer_id, message)
                     if (
                         peer_id != self.config.peer_id
                         and message.get("Online") == "yes"
@@ -403,6 +397,20 @@ class Server:
                 LOG.warning("Coordinator error: %s", message.get("Reason", "unspecified error"))
             elif message.command in {"DISCONNECT", "AUTH-ERROR"}:
                 raise ConnectionError(message.get("Reason", "coordinator disconnected"))
+
+    def _update_peer_from_directory(self, peer_id: str, message: ControlMessage) -> None:
+        values: dict[str, object] = {
+            "overlay_ipv4": message.get("Overlay-IPv4") or None,
+            "overlay_ipv6": message.get("Overlay-IPv6") or None,
+        }
+        # The coordinator directory reports the peer's observed control-plane
+        # endpoint. Once a direct socket exists, _adopt_direct() has a more
+        # accurate data-plane endpoint and transport. Do not replace those
+        # fields on every five-second directory refresh.
+        if peer_id not in self.direct_writers:
+            values["transport"] = message.get("Transport") or "Disconnected"
+            values["endpoint"] = message.get("Endpoint") or None
+        self.store.update_peer(peer_id, **values)
 
     async def _query_observed_endpoint(self, family: socket.AddressFamily) -> tuple[str, int] | None:
         local_address = self._direct_bind_ipv6 if family == socket.AF_INET6 else self._direct_bind_ipv4
