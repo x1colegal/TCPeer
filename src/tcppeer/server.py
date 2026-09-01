@@ -89,8 +89,7 @@ class Server:
             config.pool_start, config.pool_end, config.lease_seconds, self.dns,
         )
         self.tun = TunDevice(config.tun_name, config.mtu)
-        self.direct_writer = None
-        self.direct_peer_id: str | None = None
+        self.direct_writers: dict[str, object] = {}
         self._tasks: set[asyncio.Task] = set()
         self._listeners: list[asyncio.AbstractServer] = []
         self._direct_bind_ipv4 = config.direct_ipv4 or discover_direct_ipv4({config.tun_name})
@@ -102,11 +101,12 @@ class Server:
         self._direct_candidates: dict[socket.AddressFamily, socket.socket] = {}
         self._direct_connect_tasks: dict[str, asyncio.Task] = {}
         self._direct_adoption_lock = asyncio.Lock()
-        self._direct_owner_token: str | None = None
-        self._direct_owner_key: tuple[str, str] | None = None
+        self._direct_owner_tokens: dict[str, str] = {}
+        self._direct_owner_keys: dict[str, tuple[str, str]] = {}
         self._direct_attempt_counter = 0
         self._byte_counters: dict[tuple[str, str], int] = {}
         self._coordinator_writer = None
+        self._registration_complete = asyncio.Event()
         self._pending_tpp_pings: dict[int, asyncio.Future] = {}
         self.exit_node = ExitNodeFirewall(config, config.tun_name)
         self._active_ipv6_prefix = config.ipv6_prefix
@@ -127,10 +127,25 @@ class Server:
         self.exit_node.apply()
         try:
             self._prepare_direct_candidates()
+            control_task = asyncio.create_task(self._control_loop(), name="control")
+            registration_wait = asyncio.create_task(
+                self._registration_complete.wait(),
+                name="registration-wait",
+            )
+            done, _pending = await asyncio.wait(
+                {control_task, registration_wait},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if control_task in done:
+                registration_wait.cancel()
+                await asyncio.gather(registration_wait, return_exceptions=True)
+                control_task.result()
+                raise ConnectionError("coordinator control loop ended before endpoint registration")
+            registration_wait.result()
             await self._start_direct_listeners()
             await self._start_admin_listener()
             self._tasks = {
-                asyncio.create_task(self._control_loop(), name="control"),
+                control_task,
                 asyncio.create_task(self._tun_loop(), name="tun"),
                 asyncio.create_task(self._ra_loop(), name="router-advertisement"),
                 asyncio.create_task(self._statistics_loop(), name="statistics"),
@@ -149,6 +164,11 @@ class Server:
             for candidate in self._direct_candidates.values():
                 candidate.close()
             self._direct_candidates.clear()
+            for writer in list(self.direct_writers.values()):
+                writer.close()
+            self.direct_writers.clear()
+            self._direct_owner_tokens.clear()
+            self._direct_owner_keys.clear()
             await asyncio.gather(*(listener.wait_closed() for listener in self._listeners), return_exceptions=True)
             self.tun.close()
             self.exit_node.close()
@@ -296,6 +316,7 @@ class Server:
         if self.config.target_peer:
             writer.write(ControlMessage("PUNCH-READY", {"Peer-ID": self.config.target_peer}).encode())
         await writer.drain()
+        self._registration_complete.set()
 
         device_list_peers: set[str] = set()
         device_list_in_progress = False
@@ -357,6 +378,14 @@ class Server:
                         transport=message.get("Transport") or "Disconnected",
                         endpoint=message.get("Endpoint") or None,
                     )
+                    if (
+                        peer_id != self.config.peer_id
+                        and message.get("Online") == "yes"
+                        and peer_id not in self.direct_writers
+                        and self._direct_connect_tasks.get(peer_id) is None
+                    ):
+                        writer.write(ControlMessage("PUNCH-READY", {"Peer-ID": peer_id}).encode())
+                        await writer.drain()
             elif message.command == "PEER-INFO" and message.get("Action") == "List-End":
                 for row in self.store.list_table("peers"):
                     peer_id = row["peer_id"]
@@ -370,34 +399,55 @@ class Server:
 
     async def _query_observed_endpoint(self, family: socket.AddressFamily) -> tuple[str, int] | None:
         local_address = self._direct_bind_ipv6 if family == socket.AF_INET6 else self._direct_bind_ipv4
-        if not local_address:
-            return None
+        local_address = local_address or ("::" if family == socket.AF_INET6 else "0.0.0.0")
         results = await resolve_tcp_endpoints(self.config.coordinator_address, self.config.coordinator_port)
         loop = asyncio.get_running_loop()
-        for candidate_family, socktype, protocol, _name, address in results:
-            if candidate_family != family:
-                continue
-            sock = socket.socket(candidate_family, socktype, protocol)
-            sock.setblocking(False)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            if hasattr(socket, "SO_REUSEPORT"):
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-            try:
-                sock.bind((local_address, self.config.direct_port))
-                await asyncio.wait_for(loop.sock_connect(sock, address), timeout=5)
-                reader, writer = await asyncio.open_connection(sock=sock)
-                writer.write(ControlMessage("ENDPOINT-QUERY", {}).encode())
-                await writer.drain()
-                response = await asyncio.wait_for(read_control(reader), timeout=5)
-                writer.close()
-                await asyncio.gather(writer.wait_closed(), return_exceptions=True)
-                if response.command == "ENDPOINT-INFO":
-                    address_value = response.get("Address") or ""
-                    port_value = int(response.get("Port") or 0)
-                    if address_value and port_value:
-                        return address_value, port_value
-            except (OSError, TimeoutError, ProtocolError, asyncio.IncompleteReadError):
-                sock.close()
+        family_name = "IPv6" if family == socket.AF_INET6 else "IPv4"
+        family_results = [item for item in results if item[0] == family]
+        for attempt in range(1, 4):
+            for candidate_family, socktype, protocol, _name, address in family_results:
+                sock = socket.socket(candidate_family, socktype, protocol)
+                sock.setblocking(False)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if hasattr(socket, "SO_REUSEPORT"):
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                writer = None
+                try:
+                    sock.bind((local_address, self.config.direct_port))
+                    await asyncio.wait_for(loop.sock_connect(sock, address), timeout=5)
+                    selected_address = str(sock.getsockname()[0]).split("%", 1)[0]
+                    if family == socket.AF_INET6 and is_usable_ipv6(selected_address):
+                        self._direct_bind_ipv6 = selected_address
+                    elif family == socket.AF_INET and selected_address != "0.0.0.0":
+                        self._direct_bind_ipv4 = selected_address
+                    reader, writer = await asyncio.open_connection(sock=sock)
+                    writer.write(ControlMessage("ENDPOINT-QUERY", {}).encode())
+                    await writer.drain()
+                    response = await asyncio.wait_for(read_control(reader), timeout=5)
+                    if response.command == "ENDPOINT-INFO":
+                        address_value = response.get("Address") or ""
+                        port_value = int(response.get("Port") or 0)
+                        if public_address(address_value) and port_value:
+                            LOG.info(
+                                "Discovered %s direct endpoint %s:%s on attempt %s",
+                                family_name, address_value, port_value, attempt,
+                            )
+                            return address_value, port_value
+                except (OSError, TimeoutError, ProtocolError, asyncio.IncompleteReadError) as exc:
+                    LOG.warning(
+                        "%s endpoint discovery attempt %s failed: %s",
+                        family_name, attempt, exc,
+                    )
+                finally:
+                    if writer is not None:
+                        writer.close()
+                        await asyncio.gather(writer.wait_closed(), return_exceptions=True)
+                    else:
+                        sock.close()
+            if attempt < 3:
+                await asyncio.sleep(0.25)
+        if not family_results:
+            LOG.warning("Coordinator DNS has no %s address; that family cannot be advertised", family_name)
         return None
 
     async def _open_coordinator_connection(self):
@@ -525,8 +575,10 @@ class Server:
         packet_count = 0
 
         async with self._direct_adoption_lock:
-            if self.direct_writer is not None and self.direct_peer_id == peer_id and self._direct_owner_key is not None:
-                if connection_key >= self._direct_owner_key:
+            current_writer = self.direct_writers.get(peer_id)
+            current_key = self._direct_owner_keys.get(peer_id)
+            if current_writer is not None and current_key is not None:
+                if connection_key >= current_key:
                     LOG.info(
                         "direct-adopt loser-close ts=%.6f peer_id=%s family=%s attempt=%s initiated=%s fd=%s local=%s remote=%s winner_key=%s loser_key=%s",
                         time.time(),
@@ -537,18 +589,17 @@ class Server:
                         self._socket_fd(writer),
                         self._sockname_text(writer),
                         self._peername_text(writer),
-                        self._direct_owner_key,
+                        current_key,
                         connection_key,
                     )
                     writer.close()
                     await asyncio.gather(writer.wait_closed(), return_exceptions=True)
                     return
-            replaced_writer = self.direct_writer
-            replaced_peer_id = self.direct_peer_id
-            self.direct_writer = writer
-            self.direct_peer_id = peer_id
-            self._direct_owner_token = token
-            self._direct_owner_key = connection_key
+            replaced_writer = current_writer
+            replaced_peer_id = peer_id if current_writer is not None else None
+            self.direct_writers[peer_id] = writer
+            self._direct_owner_tokens[peer_id] = token
+            self._direct_owner_keys[peer_id] = connection_key
 
         if replaced_writer is not None and replaced_writer is not writer:
             LOG.info(
@@ -593,11 +644,13 @@ class Server:
                 return
             raise
         finally:
-            if self.direct_writer is writer and self._direct_owner_token == token:
-                self.direct_writer = None
-                self.direct_peer_id = None
-                self._direct_owner_token = None
-                self._direct_owner_key = None
+            if (
+                self.direct_writers.get(peer_id) is writer
+                and self._direct_owner_tokens.get(peer_id) == token
+            ):
+                self.direct_writers.pop(peer_id, None)
+                self._direct_owner_tokens.pop(peer_id, None)
+                self._direct_owner_keys.pop(peer_id, None)
                 self.store.update_peer(peer_id, transport="Disconnected")
             with self.store.connection:
                 self.store.connection.execute(
@@ -716,7 +769,8 @@ class Server:
                 await writer.drain()
                 return
 
-            if self.direct_writer is None or self.direct_peer_id != peer_id:
+            direct_writer = self.direct_writers.get(peer_id)
+            if direct_writer is None:
                 writer.write(
                     f"ERROR peer {peer_id} is not directly connected\n".encode("ascii")
                 )
@@ -758,7 +812,7 @@ class Server:
                     sent_ns,
                 )
 
-                await self._write_data(self.direct_writer, packet)
+                await self._write_data(direct_writer, packet)
                 self._add_bytes(peer_id, "tx_bytes", len(packet))
 
                 try:
@@ -789,9 +843,11 @@ class Server:
     async def _tun_loop(self) -> None:
         while True:
             packet = await self._read_tun()
-            if self.direct_writer is not None and self.direct_peer_id is not None:
-                await self._write_data(self.direct_writer, packet)
-                self._add_bytes(self.direct_peer_id, "tx_bytes", len(packet))
+            peer_id = self._peer_for_packet(packet)
+            writer = self.direct_writers.get(peer_id) if peer_id else None
+            if writer is not None and peer_id is not None:
+                await self._write_data(writer, packet)
+                self._add_bytes(peer_id, "tx_bytes", len(packet))
 
     async def _read_tun(self) -> bytes:
         if self.tun.fd is None:
@@ -845,7 +901,42 @@ class Server:
             await self._write_data(writer, response)
             self._add_bytes(peer_id, "tx_bytes", len(response))
             return
+        destination_peer = self._peer_for_packet(packet)
+        destination_writer = self.direct_writers.get(destination_peer) if destination_peer else None
+        if destination_writer is not None and destination_peer != peer_id:
+            LOG.debug(
+                "Dropping peer-to-peer packet received through %s for %s; direct-only policy forbids Exit Node relay",
+                peer_id,
+                destination_peer,
+            )
+            return
         self.tun.write(packet)
+
+    def _peer_for_packet(self, packet: bytes) -> str | None:
+        """Return the directly connected peer owning the packet destination."""
+        if not packet:
+            return None
+        version = packet[0] >> 4
+        try:
+            if version == 4 and len(packet) >= 20:
+                destination = str(ipaddress.IPv4Address(packet[16:20]))
+                column = "overlay_ipv4"
+            elif version == 6 and len(packet) >= 40:
+                destination = str(ipaddress.IPv6Address(packet[24:40]))
+                column = "overlay_ipv6"
+            else:
+                return None
+        except ipaddress.AddressValueError:
+            return None
+        row = self.store.connection.execute(
+            f"SELECT peer_id FROM peers WHERE {column} = ?",
+            (destination,),
+        ).fetchone()
+        if row is not None and row[0] in self.direct_writers:
+            return str(row[0])
+        if self.config.target_peer in self.direct_writers:
+            return self.config.target_peer
+        return None
 
     async def _configure_initial_ipv6(self) -> None:
         interface = discover_ipv6_upstream({self.config.tun_name})
@@ -932,8 +1023,7 @@ class Server:
             self.exit_node.nat66_enabled = False
             self.exit_node.apply()
 
-            if self.direct_writer is not None:
-                await self._write_data(self.direct_writer, self._ra_packet())
+            await self._broadcast_direct(self._ra_packet())
 
     async def _switch_to_ipv6_fallback(self) -> None:
         self._use_ipv6_fallback()
@@ -947,8 +1037,7 @@ class Server:
 
         self.exit_node.apply()
 
-        if self.direct_writer is not None:
-            await self._write_data(self.direct_writer, self._ra_packet())
+        await self._broadcast_direct(self._ra_packet())
 
     def _ra_packet(self, destination: ipaddress.IPv6Address = ALL_NODES) -> bytes:
         return build_router_advertisement(
@@ -963,11 +1052,16 @@ class Server:
 
     async def _ra_loop(self) -> None:
         while True:
-            if self.direct_writer is not None and self.direct_peer_id is not None:
-                packet = self._ra_packet()
-                await self._write_data(self.direct_writer, packet)
-                self._add_bytes(self.direct_peer_id, "tx_bytes", len(packet))
+            await self._broadcast_direct(self._ra_packet())
             await asyncio.sleep(self.config.ra_interval_seconds)
+
+    async def _broadcast_direct(self, packet: bytes) -> None:
+        for peer_id, writer in list(self.direct_writers.items()):
+            try:
+                await self._write_data(writer, packet)
+                self._add_bytes(peer_id, "tx_bytes", len(packet))
+            except (ConnectionError, OSError):
+                LOG.debug("Direct broadcast failed for peer %s", peer_id, exc_info=True)
 
 
 def build_parser() -> argparse.ArgumentParser:

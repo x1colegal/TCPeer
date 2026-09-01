@@ -65,6 +65,9 @@ class TcpPeerVpnService : VpnService() {
     private var connectionJob: Job? = null
     private var coordinatorSocket: Socket? = null
     private var directSocket: Socket? = null
+    private val meshSockets = ConcurrentHashMap<String, Socket>()
+    private val meshConnecting = ConcurrentHashMap.newKeySet<String>()
+    private val meshPunchActive = ConcurrentHashMap.newKeySet<String>()
     private val directCandidates = mutableMapOf<DirectFamily, Socket>()
     private val directListeners = mutableMapOf<DirectFamily, ServerSocket>()
     private var tunnel: ParcelFileDescriptor? = null
@@ -393,6 +396,10 @@ class TcpPeerVpnService : VpnService() {
         updateNotification(status)
 
         coroutineScope {
+            val peerOutputs = ConcurrentHashMap<String, java.io.OutputStream>()
+            peerOutputs[targetPeerId] = directOutput
+            meshSockets[targetPeerId] = direct
+            val tunOutput = FileOutputStream(descriptor.fileDescriptor)
             val coordinatorControlJob = launch(Dispatchers.IO) {
                 val devices = mutableListOf<NetworkDevice>()
                 var listInProgress = false
@@ -423,7 +430,22 @@ class TcpPeerVpnService : VpnService() {
                                     ipv6 = message.field("IPv6").orEmpty().ifBlank { "-" },
                                     overlayIpv4 = message.field("Overlay-IPv4").orEmpty().ifBlank { "-" },
                                     overlayIpv6 = message.field("Overlay-IPv6").orEmpty().ifBlank { "-" },
-                                )
+                                ).also { device ->
+                                    if (
+                                        device.online &&
+                                        device.peerId != config.peerId &&
+                                        device.peerId != targetPeerId &&
+                                        !meshSockets.containsKey(device.peerId) &&
+                                        meshConnecting.add(device.peerId)
+                                    ) {
+                                        synchronized(controlOutput) {
+                                            TcpPeerProtocol.writeControl(
+                                                controlOutput,
+                                                ControlMessage("PUNCH-READY", mapOf("Peer-ID" to device.peerId)),
+                                            )
+                                        }
+                                    }
+                                }
 
                                 "List-End" -> {
                                     TcpPeerRuntime.update { state ->
@@ -439,18 +461,32 @@ class TcpPeerVpnService : VpnService() {
                                 }
 
                                 "Punch-Request" -> {
-                                    TcpPeerProtocol.writeControl(
-                                        controlOutput,
-                                        ControlMessage(
-                                            "PUNCH-READY",
-                                            mapOf(
-                                                "Peer-ID" to (
-                                                    message.field("Peer-ID")
-                                                        ?: targetPeerId
-                                                ),
+                                    synchronized(controlOutput) {
+                                        TcpPeerProtocol.writeControl(
+                                            controlOutput,
+                                            ControlMessage(
+                                                "PUNCH-READY",
+                                                mapOf("Peer-ID" to (message.field("Peer-ID") ?: targetPeerId)),
                                             ),
-                                        ),
-                                    )
+                                        )
+                                    }
+                                }
+
+                            }
+
+                            "PUNCH-GO" -> {
+                                val punchPeer = message.field("Peer-ID")
+                                if (punchPeer != null && meshPunchActive.add(punchPeer)) {
+                                    launch {
+                                        try {
+                                            connectMeshPeer(
+                                                message, config, advertisedIpv4, advertisedIpv6,
+                                                peerOutputs, tunOutput,
+                                            )
+                                        } finally {
+                                            meshPunchActive.remove(punchPeer)
+                                        }
+                                    }
                                 }
                             }
 
@@ -488,10 +524,78 @@ class TcpPeerVpnService : VpnService() {
                     BufferedInputStream(directInput, DIRECT_STREAM_BUFFER_BYTES),
                     directOutput,
                     addresses.second.address,
+                    peerOutputs,
+                    tunOutput,
                 )
             } finally {
                 coordinatorControlJob.cancel()
+                closeQuietly(tunOutput)
             }
+        }
+    }
+
+    private suspend fun connectMeshPeer(
+        punch: ControlMessage,
+        config: VpnConfiguration,
+        advertisedIpv4: String,
+        advertisedIpv6: String,
+        peerOutputs: ConcurrentHashMap<String, java.io.OutputStream>,
+        tunOutput: FileOutputStream,
+    ) {
+        val peerId = punch.field("Peer-ID") ?: return
+        if (peerId == config.peerId || meshSockets.containsKey(peerId)) return
+        meshConnecting.add(peerId)
+        val family = when (punch.field("Family")) {
+            "IPv6" -> DirectFamily.IPV6
+            "IPv4" -> DirectFamily.IPV4
+            else -> return
+        }
+        val address = InetAddress.getByName(punch.field("Address") ?: return)
+        val port = punch.field("Port")?.toIntOrNull() ?: return
+        val waitMillis = (punch.field("Start-Ms")?.toLongOrNull() ?: 0L) - System.currentTimeMillis()
+        if (waitMillis > 0) delay(waitMillis)
+        val socket = try {
+            openActiveDirect(address, port, config.directPort, family)
+        } catch (error: Exception) {
+            Log.w(TAG, "Direct mesh connection to $peerId failed", error)
+            meshConnecting.remove(peerId)
+            return
+        }
+        try {
+            val input = BufferedInputStream(socket.getInputStream(), DIRECT_STREAM_BUFFER_BYTES)
+            val output = socket.getOutputStream()
+            TcpPeerProtocol.writeControl(output, ControlMessage("PEER-INFO", linkedMapOf(
+                "Network" to config.network,
+                "Peer-ID" to config.peerId,
+                "IPv4" to advertisedIpv4,
+                "IPv6" to advertisedIpv6,
+            )))
+            val peerInfo = TcpPeerProtocol.readControl(input)
+            if (peerInfo.command != "PEER-INFO" || peerInfo.field("Network") != config.network) {
+                throw ProtocolException("Direct mesh peer handshake failed")
+            }
+            val previous = meshSockets.putIfAbsent(peerId, socket)
+            if (previous != null) {
+                socket.close()
+                return
+            }
+            peerOutputs[peerId] = output
+            Log.i(TAG, "Direct mesh connection established with $peerId; no Exit Node relay")
+            try {
+                while (true) {
+                    val packet = TcpPeerProtocol.readData(input)
+                    if (AddressNegotiation.isRouterAdvertisement(packet)) continue
+                    synchronized(tunOutput) { tunOutput.write(packet) }
+                }
+            } finally {
+                peerOutputs.remove(peerId, output)
+                meshSockets.remove(peerId, socket)
+            }
+        } catch (error: Exception) {
+            Log.w(TAG, "Direct mesh connection to $peerId closed", error)
+        } finally {
+            meshConnecting.remove(peerId)
+            closeQuietly(socket)
         }
     }
 
@@ -812,9 +916,10 @@ class TcpPeerVpnService : VpnService() {
         directInput: java.io.InputStream,
         directOutput: java.io.OutputStream,
         overlayIpv6: Inet6Address,
+        peerOutputs: ConcurrentHashMap<String, java.io.OutputStream>,
+        tunOutput: FileOutputStream,
     ) = coroutineScope {
         val tunInput = FileInputStream(descriptor.fileDescriptor)
-        val tunOutput = FileOutputStream(descriptor.fileDescriptor)
         val nextPingId = AtomicLong(System.nanoTime())
         val pendingPings = ConcurrentHashMap<Long, Pair<String, Long>>()
         val pendingTxBytes = AtomicLong(0)
@@ -849,8 +954,18 @@ class TcpPeerVpnService : VpnService() {
                 if (count < 0) break
                 if (count == 0) continue
 
-                synchronized(directOutput) {
-                    directOutput.write(
+                val destination = packetDestination(buffer, count)
+                val directPeer = TcpPeerRuntime.state.value.devices.firstOrNull { device ->
+                    device.overlayIpv4 == destination || device.overlayIpv6.substringBefore('%') == destination
+                }?.peerId
+                val selectedOutput = directPeer?.let(peerOutputs::get)
+                if (directPeer != null && selectedOutput == null) {
+                    Log.d(TAG, "Dropping packet for $directPeer until its direct connection is ready")
+                    continue
+                }
+                val output = selectedOutput ?: directOutput
+                synchronized(output) {
+                    output.write(
                         buffer,
                         0,
                         count,
@@ -892,6 +1007,15 @@ class TcpPeerVpnService : VpnService() {
             while (true) {
                 val packet = TcpPeerProtocol.readData(directInput)
                 pendingRxBytes.addAndGet(packet.size.toLong())
+                if (AddressNegotiation.isRouterAdvertisement(packet)) {
+                    // The RA was already consumed during address negotiation and
+                    // its deterministic SLAAC address was installed explicitly by
+                    // VpnService.Builder. Injecting later RAs into Android's IP
+                    // stack enables RFC 8981 temporary addresses, causing the
+                    // kernel to use an address different from the one registered
+                    // with the coordinator.
+                    continue
+                }
                 val tpp = TppProtocol.parse(packet)
                 when (tpp?.type) {
                     TppProtocol.ECHO_REQUEST -> {
@@ -928,8 +1052,18 @@ class TcpPeerVpnService : VpnService() {
                 runCatching { directOutput.flush() }
             }
             closeQuietly(tunInput)
-            closeQuietly(tunOutput)
         }
+    }
+
+    private fun packetDestination(packet: ByteArray, length: Int): String? {
+        if (length < 1) return null
+        return runCatching {
+            when (packet[0].toInt().ushr(4)) {
+                4 -> if (length >= 20) InetAddress.getByAddress(packet.copyOfRange(16, 20)).hostAddress else null
+                6 -> if (length >= 40) InetAddress.getByAddress(packet.copyOfRange(24, 40)).hostAddress else null
+                else -> null
+            }
+        }.getOrNull()
     }
 
     private fun networkAddress(address: Inet4Address, prefixLength: Int): InetAddress {
@@ -958,6 +1092,10 @@ class TcpPeerVpnService : VpnService() {
         tunnel = null
         closeQuietly(directSocket)
         directSocket = null
+        meshSockets.values.forEach(::closeQuietly)
+        meshSockets.clear()
+        meshConnecting.clear()
+        meshPunchActive.clear()
         synchronized(directCandidates) {
             directCandidates.values.forEach(::closeQuietly)
             directCandidates.clear()

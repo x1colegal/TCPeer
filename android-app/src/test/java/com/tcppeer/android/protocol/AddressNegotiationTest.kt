@@ -4,7 +4,9 @@ import java.net.InetAddress
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class AddressNegotiationTest {
@@ -41,5 +43,7 @@ class AddressNegotiationTest {
         configuration!!
         assertEquals("fdfe:cafe:cafe:0:102:304:506:708", configuration.address.hostAddress)
         assertEquals(64, configuration.prefixLength)
+        assertTrue(AddressNegotiation.isRouterAdvertisement(packet))
+        assertFalse(AddressNegotiation.isRouterAdvertisement(AddressNegotiation.routerSolicitation()))
     }
 }

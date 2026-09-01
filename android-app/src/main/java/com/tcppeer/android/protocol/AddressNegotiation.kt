@@ -164,6 +164,12 @@ object AddressNegotiation {
         return SlaacConfiguration(inet6(address), inet6(prefixBytes), prefixLength, dns)
     }
 
+    fun isRouterAdvertisement(packet: ByteArray): Boolean =
+        packet.size >= 41 &&
+            packet.version() == 6 &&
+            (packet[6].toInt() and 0xFF) == 58 &&
+            (packet[40].toInt() and 0xFF) == 134
+
     private fun option(buffer: ByteBuffer, code: Int, value: ByteArray) {
         buffer.put(code.toByte()).put(value.size.toByte()).put(value)
     }
