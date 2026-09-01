@@ -40,6 +40,7 @@ class CoordinatorConfig:
     log_level: str = "INFO"
     max_message_size: int = 16384
     keepalive_seconds: int = 30
+    state_db: Path = Path("/var/lib/tcppeer/coordinator/state.db")
     @classmethod
     def from_file(cls, path: str | Path) -> "CoordinatorConfig":
         with Path(path).open("rb") as source:
@@ -47,6 +48,7 @@ class CoordinatorConfig:
         listen = _table(data, "listen")
         auth = _table(data, "auth")
         runtime = _table(data, "runtime")
+        paths = _table(data, "paths")
         networks = auth.get("networks", {})
         if not isinstance(networks, dict) or not networks:
             raise ConfigurationError("auth.networks must contain at least one network secret")
@@ -58,6 +60,7 @@ class CoordinatorConfig:
             log_level=str(runtime.get("log_level", "INFO")).upper(),
             max_message_size=int(runtime.get("max_message_size", 16384)),
             keepalive_seconds=int(runtime.get("keepalive_seconds", 30)),
+            state_db=Path(paths.get("state_db", "/var/lib/tcppeer/coordinator/state.db")),
         )
 
 
@@ -166,3 +169,58 @@ class ServerConfig:
             if isinstance(exc, ConfigurationError):
                 raise
             raise ConfigurationError(str(exc)) from exc
+
+
+@dataclass(frozen=True)
+class ClientConfig:
+    coordinator_address: str
+    coordinator_port: int
+    network: str
+    peer_id: str
+    secret: str
+    target_peer: str
+    use_exit_node: bool = False
+    direct_ipv4: str | None = None
+    direct_ipv6: str | None = None
+    direct_port: int = 7444
+    tun_name: str = "tcppeer0"
+    mtu: int = 1400
+    state_db: Path = Path("/var/lib/tcppeer/client/state.db")
+    log_level: str = "INFO"
+
+    def __post_init__(self) -> None:
+        if not self.coordinator_address.strip() or "://" in self.coordinator_address:
+            raise ConfigurationError("coordinator address must be a DNS name or IP address")
+        if not self.peer_id or any(ord(c) > 127 for c in self.peer_id):
+            raise ConfigurationError("peer ID must be non-empty ASCII")
+        if not self.target_peer:
+            raise ConfigurationError("a peer/Exit Node ID is required to receive PeerNet addresses")
+        if not 576 <= self.mtu <= 65535:
+            raise ConfigurationError("MTU must be between 576 and 65535")
+
+    @classmethod
+    def from_file(cls, path: str | Path) -> "ClientConfig":
+        with Path(path).open("rb") as source:
+            data = tomllib.load(source)
+        coordinator = _table(data, "coordinator")
+        identity = _table(data, "identity")
+        direct = _table(data, "direct")
+        interface = _table(data, "interface")
+        routing = _table(data, "routing")
+        paths = _table(data, "paths")
+        runtime = _table(data, "runtime")
+        try:
+            return cls(
+                coordinator_address=str(coordinator["address"]),
+                coordinator_port=_port(coordinator.get("port", 7443), "coordinator.port"),
+                network=str(identity["network"]), peer_id=str(identity["peer_id"]),
+                secret=str(identity["secret"]), target_peer=str(direct["target_peer"]),
+                use_exit_node=bool(routing.get("use_exit_node", False)),
+                direct_ipv4=direct.get("ipv4") or None, direct_ipv6=direct.get("ipv6") or None,
+                direct_port=_port(direct.get("port", 7444), "direct.port"),
+                tun_name=str(interface.get("name", "tcppeer0")), mtu=int(interface.get("mtu", 1400)),
+                state_db=Path(paths.get("state_db", "/var/lib/tcppeer/client/state.db")),
+                log_level=str(runtime.get("log_level", "INFO")).upper(),
+            )
+        except KeyError as exc:
+            raise ConfigurationError(f"missing required setting: {exc.args[0]}") from exc

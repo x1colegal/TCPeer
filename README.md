@@ -44,7 +44,7 @@ TCPeer currently provides:
 - nftables integration
 - Optional nftables software flow offload
 - Linux exit-node operation
-- Persistent SQLite state
+- Persistent SQLite server state and coordinator device inventory
 - Device/peer synchronization
 - Automatic Android reconnection
 - TPP / TCPPeerPing
@@ -60,7 +60,7 @@ A normal TCPeer deployment consists of:
 
 1. A coordinator
 2. A Linux server / exit node
-3. An Android client
+3. One or more Android or Linux clients
 
 ```text
                          CONTROL PLANE
@@ -591,6 +591,24 @@ Typical requirements:
 
 ---
 
+# Linux client
+
+Linux can also join a PeerNet as a non-routing client. It reuses the same TCP
+endpoint discovery, TCP4/TCP6 simultaneous-open, deterministic direct-socket
+arbitration, raw-IP stream, mesh, and TPP implementation as the Exit Node.
+
+The selected `target_peer` must provide TCPeer DHCPv4 and SLAAC so the client
+can receive its overlay addresses. With `routing.use_exit_node = false`, only
+the learned PeerNet IPv4 and IPv6 prefixes use `tcppeer0`; normal Internet and
+DNS stay on the Linux host's upstream network. With it enabled, IPv4/IPv6
+default routes and the received DNS servers use the selected Exit Node.
+
+The Linux client remains direct-only: the coordinator authenticates and
+coordinates TCP hole punching but never relays data, and an Exit Node does not
+relay packets between two mesh peers that should have their own direct socket.
+
+---
+
 # Android client
 
 The Android application is a native TCPeer client built around Android `VpnService`.
@@ -899,6 +917,17 @@ Live TCP connections naturally do not survive a process restart.
 
 After restart, TCPeer reconnects to the coordinator and performs discovery/direct-connection establishment again.
 
+The coordinator separately persists its known-device directory in:
+
+```text
+/var/lib/tcppeer/coordinator/state.db
+```
+
+Peer ID, role, platform, transport, last public IPv4/IPv6 candidates, overlay
+addresses, endpoint, and last-seen time survive a coordinator restart. Loaded
+entries start offline and become online only after authentication and
+registration complete again.
+
 ---
 
 # Coordinator administration
@@ -911,9 +940,20 @@ Typical path:
 /run/tcppeer/coordinator-admin.sock
 ```
 
-Administrative operations can include peer removal.
+Use the installed `tcppeer-devices` command instead of writing to SQLite:
 
-Example command syntax:
+```bash
+sudo tcppeer-devices list
+sudo tcppeer-devices remove PHONE_PEER_ID
+sudo tcppeer-devices remove PHONE_PEER_ID --network home --yes
+```
+
+Removal asks for confirmation unless `--yes` is provided. If the Peer-ID is
+present in more than one PeerNet, `--network` resolves the ambiguity. Removing
+an online device first detaches its active coordinator session, then deletes
+its persistent record. It does not delete or relay VPN packets.
+
+The underlying local protocol also accepts:
 
 ```text
 DELETE NETWORK PEER_ID
@@ -999,6 +1039,7 @@ Typical configuration files include:
 ```text
 /etc/tcppeer/coordinator.toml
 /etc/tcppeer/server.toml
+/etc/tcppeer/client.toml
 ```
 
 The configurator can also install/configure the corresponding systemd services.
@@ -1052,6 +1093,19 @@ Inspect recent logs:
 ```bash
 sudo journalctl -u tcppeer-server -n 200 --no-pager
 ```
+
+---
+
+# Linux client service
+
+```bash
+sudo systemctl status tcppeer-client --no-pager -l
+sudo journalctl -f -u tcppeer-client
+```
+
+`configure.py` offers **Coordinator**, **Exit Node / Server**, and **Client**.
+It installs the matching configuration and unit. Installing the Python project
+also installs `tcppeer-devices` and `tcppeer-client`.
 
 ---
 
@@ -1219,6 +1273,7 @@ Common coordinator configuration areas include:
 | `runtime` | `log_level` | Logging |
 | `runtime` | `max_message_size` | Control message limit |
 | `runtime` | `keepalive_seconds` | Coordinator keepalive |
+| `paths` | `state_db` | Persistent known-device database |
 
 Typical coordinator port:
 
@@ -1249,6 +1304,18 @@ Typical direct port:
 ```text
 7444/TCP
 ```
+
+## Linux client
+
+| Section | Purpose |
+|---|---|
+| `coordinator` | Coordinator DNS/IP and TCP port |
+| `identity` | PeerNet, Peer-ID, and Secret Key |
+| `direct` | TCP candidates, port, and address-assignment peer |
+| `interface` | TUN name and MTU |
+| `routing` | `use_exit_node` Internet/DNS policy |
+| `paths` | Local SQLite runtime state |
+| `runtime` | Logging |
 
 ---
 
@@ -1813,7 +1880,11 @@ TCPeer/
 │       ├── cli.py
 │       ├── config.py
 │       ├── configurator.py
+│       ├── client.py
 │       ├── coordinator.py
+│       ├── coordinator_state.py
+│       ├── devices_cli.py
+│       ├── address_negotiation.py
 │       ├── dhcp.py
 │       ├── dns.py
 │       ├── exit_node.py

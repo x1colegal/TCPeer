@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 import logging
 import ipaddress
 from pathlib import Path
@@ -18,6 +18,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tcppeer.config import CoordinatorConfig, ConfigurationError
+from tcppeer.coordinator_state import CoordinatorStore
 from tcppeer.auth import proof_matches
 from tcppeer.protocol import ControlMessage, ProtocolError, read_control
 from tcppeer.transport import is_usable_ipv6
@@ -68,6 +69,10 @@ class Coordinator:
         self.config = config
         self.peers: dict[tuple[str, str], RegisteredPeer] = {}
         self.known_peers: dict[tuple[str, str], KnownPeer] = {}
+        self.store = CoordinatorStore(config.state_db)
+        for row in self.store.load():
+            known = KnownPeer(**dict(row), online=False)
+            self.known_peers[(known.network, known.peer_id)] = known
         self.servers: list[asyncio.AbstractServer] = []
         self.admin_server: asyncio.AbstractServer | None = None
 
@@ -103,6 +108,12 @@ class Coordinator:
             server.close()
         await asyncio.gather(*(server.wait_closed() for server in self.servers), return_exceptions=True)
         self.servers.clear()
+        self.store.close()
+
+    def _persist(self, known: KnownPeer) -> None:
+        values = asdict(known)
+        values.pop("online", None)
+        self.store.upsert(values)
 
     async def send(self, writer, command: str, **fields: str) -> None:
         writer.write(ControlMessage(command, fields).encode())
@@ -140,12 +151,13 @@ class Coordinator:
                 old.writer.close()
             peer = RegisteredPeer(network, peer_id, writer, observed_address, observed_port)
             self.peers[key] = peer
-            self.known_peers[key] = KnownPeer(
-                network=network,
-                peer_id=peer_id,
-                endpoint=f"{observed_address}:{observed_port}",
-                transport="TCP6" if ipaddress.ip_address(observed_address).version == 6 else "TCP4",
-            )
+            known = self.known_peers.get(key) or KnownPeer(network=network, peer_id=peer_id)
+            known.online = True
+            known.endpoint = f"[{observed_address}]:{observed_port}" if ":" in observed_address else f"{observed_address}:{observed_port}"
+            known.transport = "TCP6" if ipaddress.ip_address(observed_address).version == 6 else "TCP4"
+            known.last_seen = int(time.time())
+            self.known_peers[key] = known
+            self._persist(known)
             LOG.info("Peer %s authenticated on network %s from %s", peer_id, network, observed_address)
             await self.send(writer, "AUTH-OK", **{"Peer-ID": peer_id})
             await self.send(writer, "ENDPOINT-INFO", Address=observed_address, Port=str(observed_port))
@@ -167,6 +179,7 @@ class Coordinator:
                 if known is not None:
                     known.online = False
                     known.last_seen = int(time.time())
+                    self._persist(known)
                 LOG.info("Peer %s disconnected from network %s", peer.peer_id, peer.network)
             writer.close()
             try:
@@ -197,6 +210,7 @@ class Coordinator:
             known.overlay_ipv6 = message.get("Overlay-IPv6") or known.overlay_ipv6
             known.online = True
             known.last_seen = int(time.time())
+            self._persist(known)
             await self.send(peer.writer, "ENDPOINT-INFO", Address=peer.observed_address, Port=str(peer.observed_port))
         elif message.command == "PEER-INFO" and message.get("Action") == "List":
             await self._send_device_list(peer)
@@ -207,6 +221,7 @@ class Coordinator:
             known.overlay_ipv4 = message.get("Overlay-IPv4") or ""
             known.overlay_ipv6 = message.get("Overlay-IPv6") or ""
             known.last_seen = int(time.time())
+            self._persist(known)
 
             LOG.info(
                 "Peer %s overlay updated: IPv4=%s IPv6=%s",
@@ -255,21 +270,44 @@ class Coordinator:
 
             parts = line.split()
 
-            if len(parts) != 3 or parts[0] != "DELETE":
-                writer.write(
-                    b"ERROR expected: DELETE <network> <peer-id>\\n"
-                )
+            if parts == ["LIST"]:
+                for known in sorted(self.known_peers.values(), key=lambda item: (item.network, item.peer_id)):
+                    writer.write(("DEVICE\t" + "\t".join((
+                        known.network, known.peer_id, "online" if known.online else "offline",
+                        known.role, known.platform, known.transport, known.ipv4 or "-",
+                        known.ipv6 or "-", known.overlay_ipv4 or "-", known.overlay_ipv6 or "-",
+                        known.endpoint or "-", str(known.last_seen),
+                    )) + "\n").encode("ascii"))
+                writer.write(b"OK\n")
                 await writer.drain()
                 return
-
-            _command, network, peer_id = parts
+            if len(parts) == 2 and parts[0] == "DELETE-ID":
+                matches = [key for key in self.known_peers if key[1] == parts[1]]
+                if not matches:
+                    writer.write(f"ERROR unknown peer-id {parts[1]}\n".encode("ascii"))
+                    await writer.drain()
+                    return
+                if len(matches) > 1:
+                    writer.write(b"ERROR peer-id exists in multiple networks; use DELETE <network> <peer-id>\n")
+                    await writer.drain()
+                    return
+                network, peer_id = matches[0]
+            elif len(parts) == 3 and parts[0] == "DELETE":
+                _command, network, peer_id = parts
+            else:
+                writer.write(b"ERROR expected LIST, DELETE-ID <peer-id>, or DELETE <network> <peer-id>\n")
+                await writer.drain()
+                return
 
             if any(ord(char) > 127 for char in network + peer_id):
                 writer.write(b"ERROR invalid network or peer-id\\n")
                 await writer.drain()
                 return
 
-            await self._delete_client_direct(network, peer_id)
+            if not await self._delete_client_direct(network, peer_id):
+                writer.write(f"ERROR unknown peer-id {peer_id} in {network}\n".encode("ascii"))
+                await writer.drain()
+                return
 
             writer.write(
                 f"OK deleted {peer_id} from {network}\\n".encode("ascii")
@@ -286,27 +324,35 @@ class Coordinator:
         self,
         network: str,
         target_id: str,
-    ) -> None:
+    ) -> bool:
         if not target_id:
             raise ValueError("invalid client deletion target")
 
-        target = self.peers.get((network, target_id))
+        key = (network, target_id)
+        target = self.peers.pop(key, None)
+        existed = key in self.known_peers
 
         if target is not None:
-            await self.send(
-                target.writer,
-                "DISCONNECT",
-                Reason="deleted by coordinator administrator",
-            )
-            target.writer.close()
+            try:
+                await self.send(
+                    target.writer,
+                    "DISCONNECT",
+                    Reason="deleted by coordinator administrator",
+                )
+            except ConnectionError:
+                pass
+            finally:
+                target.writer.close()
 
-        self.known_peers.pop((network, target_id), None)
+        self.known_peers.pop(key, None)
+        deleted = self.store.delete(network, target_id)
 
         LOG.info(
             "Coordinator administrator deleted peer %s from %s",
             target_id,
             network,
         )
+        return existed or deleted
 
     async def _send_device_list(self, peer: RegisteredPeer) -> None:
         devices = sorted(
@@ -343,6 +389,7 @@ class Coordinator:
             if known is not None:
                 known.transport = transport
                 known.last_seen = int(time.time())
+                self._persist(known)
         left_observed_version = ipaddress.ip_address(left.observed_address).version
         right_observed_version = ipaddress.ip_address(right.observed_address).version
         left_address = left.observed_address if left_observed_version == (6 if both_ipv6 else 4) else (left.declared_ipv6 if both_ipv6 else left.declared_ipv4)

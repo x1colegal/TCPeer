@@ -114,6 +114,12 @@ class Server:
         self._pd_active = False
         self._pd_interface: str | None = None
 
+    def _registration_role(self) -> str:
+        return "Exit-Node"
+
+    def _registration_overlays(self) -> tuple[str, str]:
+        return str(self.config.server_ipv4), str(self._active_server_ipv6)
+
     async def run(self) -> None:
         self.tun.open()
 
@@ -299,6 +305,7 @@ class Server:
             self._registered_ipv4 or "none",
             self._registered_ipv6 or "none",
         )
+        overlay_ipv4, overlay_ipv6 = self._registration_overlays()
         writer.write(ControlMessage("REGISTER", {
             "Peer-ID": self.config.peer_id,
             "IPv4": self._registered_ipv4 or "",
@@ -308,10 +315,10 @@ class Server:
             "Local-IPv4": self._direct_bind_ipv4 or "",
             "Local-IPv6": self._direct_bind_ipv6 or "",
             "Port": str(self.config.direct_port),
-            "Role": "Exit-Node",
+            "Role": self._registration_role(),
             "Platform": "Linux",
-            "Overlay-IPv4": str(self.config.server_ipv4),
-            "Overlay-IPv6": str(self._active_server_ipv6),
+            "Overlay-IPv4": overlay_ipv4,
+            "Overlay-IPv6": overlay_ipv6,
         }).encode())
         if self.config.target_peer:
             writer.write(ControlMessage("PUNCH-READY", {"Peer-ID": self.config.target_peer}).encode())
@@ -496,6 +503,7 @@ class Server:
         if not local_address:
             local_address = "::" if family == socket.AF_INET6 else "0.0.0.0"
         remote = Endpoint(message.get("Address") or "", int(message.get("Port") or 0), family)
+        self._prepare_remote_route(remote.address, family)
         local = Endpoint(local_address, self.config.direct_port, family)
         start_ms = int(message.get("Start-Ms") or 0)
         delay = start_ms / 1000 - time.time()
@@ -556,6 +564,9 @@ class Server:
             initiated=True,
             attempt=attempt,
         )
+
+    def _prepare_remote_route(self, address: str, family: socket.AddressFamily) -> None:
+        """Hook used by full-tunnel clients to keep outer TCP off their TUN."""
 
     async def _adopt_direct(
         self,
@@ -622,6 +633,7 @@ class Server:
                 (session_id, peer_id, 6 if family == socket.AF_INET6 else 4, endpoint, started_at),
             )
         try:
+            await self._before_direct_data(reader, writer, peer_id)
             while True:
                 packet = await read_data(reader)
                 packet_count += 1
@@ -670,6 +682,9 @@ class Server:
                 packet_count,
             )
             writer.close()
+
+    async def _before_direct_data(self, reader, writer, peer_id: str) -> None:
+        """Hook for clients that must negotiate overlay addresses first."""
 
     def _add_bytes(self, peer_id: str, column: str, amount: int) -> None:
         if column not in {"rx_bytes", "tx_bytes"}:

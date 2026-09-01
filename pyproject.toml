@@ -20,6 +20,8 @@ tcppeer = "tcppeer.cli:main"
 tcppeer-configure = "tcppeer.configurator:main"
 tcppeer-coordinator = "tcppeer.coordinator:main"
 tcppeer-server = "tcppeer.server:main"
+tcppeer-client = "tcppeer.client:main"
+tcppeer-devices = "tcppeer.devices_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

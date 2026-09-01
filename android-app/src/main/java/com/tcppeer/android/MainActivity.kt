@@ -434,7 +434,7 @@ private fun SettingsTab(
         item {
             when (selectedSection) {
                 SettingsSection.NETWORK -> NetworkSettingsPanel(configuration, active, onConfigurationChange)
-                SettingsSection.APP -> AppSettingsPanel(configuration, active, onConfigurationChange)
+                SettingsSection.APP -> AppSettingsPanel(configuration, onConfigurationChange)
             }
         }
     }
@@ -777,7 +777,6 @@ private fun NetworkSettingsPanel(
 @Composable
 private fun AppSettingsPanel(
     configuration: VpnConfiguration,
-    active: Boolean,
     onConfigurationChange: (VpnConfiguration) -> Unit,
 ) {
     Surface(shape = RoundedCornerShape(28.dp), color = MaterialTheme.colorScheme.surfaceContainerLow) {
@@ -799,7 +798,7 @@ private fun AppSettingsPanel(
                 title = "Dark",
                 description = "Dark surfaces with brighter accents.",
                 selected = configuration.appTheme == AppThemeMode.DARK,
-                enabled = !active,
+                enabled = true,
                 icon = { Icon(Icons.Default.Check, null) },
             ) {
                 onConfigurationChange(configuration.copy(appTheme = AppThemeMode.DARK))
@@ -808,7 +807,7 @@ private fun AppSettingsPanel(
                 title = "Pure Black",
                 description = "True black surfaces for OLED-style dark mode.",
                 selected = configuration.appTheme == AppThemeMode.PURE_BLACK,
-                enabled = !active,
+                enabled = true,
                 icon = { Icon(Icons.Default.Check, null) },
             ) {
                 onConfigurationChange(configuration.copy(appTheme = AppThemeMode.PURE_BLACK))
@@ -817,7 +816,7 @@ private fun AppSettingsPanel(
                 title = "Light",
                 description = "Light surfaces with darker content and status text.",
                 selected = configuration.appTheme == AppThemeMode.LIGHT,
-                enabled = !active,
+                enabled = true,
                 icon = { Icon(Icons.Default.Info, null) },
             ) {
                 onConfigurationChange(configuration.copy(appTheme = AppThemeMode.LIGHT))
@@ -825,7 +824,7 @@ private fun AppSettingsPanel(
             ThemeSectionTitle("Material color")
             MaterialColorPicker(
                 selected = configuration.materialColor,
-                enabled = !active,
+                enabled = true,
             ) { color ->
                 onConfigurationChange(configuration.copy(materialColor = color))
             }
