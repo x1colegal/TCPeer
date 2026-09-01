@@ -72,6 +72,8 @@ class TcpPeerVpnService : VpnService() {
     private val meshAdoptionLock = Any()
     private val meshConnecting = ConcurrentHashMap.newKeySet<String>()
     private val meshPunchActive = ConcurrentHashMap.newKeySet<String>()
+    private val nextTppPingId = AtomicLong(System.nanoTime())
+    private val pendingTppPings = ConcurrentHashMap<Long, Pair<String, Long>>()
     private val directListeners = mutableMapOf<DirectFamily, ServerSocket>()
     private var tunnel: ParcelFileDescriptor? = null
     private val disconnectRequested = AtomicBoolean(false)
@@ -408,7 +410,7 @@ class TcpPeerVpnService : VpnService() {
             val passiveAcceptJob = launch(Dispatchers.IO) {
                 acceptMeshConnections(
                     config, advertisedIpv4, advertisedIpv6,
-                    peerOutputs, tunOutput,
+                    addresses.second.address, peerOutputs, tunOutput,
                 )
             }
             val coordinatorControlJob = launch(Dispatchers.IO) {
@@ -492,7 +494,7 @@ class TcpPeerVpnService : VpnService() {
                                         try {
                                             connectMeshPeer(
                                                 message, config, advertisedIpv4, advertisedIpv6,
-                                                peerOutputs, tunOutput,
+                                                addresses.second.address, peerOutputs, tunOutput,
                                             )
                                         } finally {
                                             meshPunchActive.remove(punchPeer)
@@ -553,6 +555,7 @@ class TcpPeerVpnService : VpnService() {
         config: VpnConfiguration,
         advertisedIpv4: String,
         advertisedIpv6: String,
+        overlayIpv6: Inet6Address,
         peerOutputs: ConcurrentHashMap<String, java.io.OutputStream>,
         tunOutput: FileOutputStream,
     ) {
@@ -602,8 +605,7 @@ class TcpPeerVpnService : VpnService() {
             try {
                 while (true) {
                     val packet = TcpPeerProtocol.readData(input)
-                    if (AddressNegotiation.isRouterAdvertisement(packet)) continue
-                    synchronized(tunOutput) { tunOutput.write(packet) }
+                    processInboundPacket(packet, peerId, overlayIpv6, output, tunOutput)
                 }
             } finally {
                 peerOutputs.remove(peerId, output)
@@ -622,6 +624,7 @@ class TcpPeerVpnService : VpnService() {
         config: VpnConfiguration,
         advertisedIpv4: String,
         advertisedIpv6: String,
+        overlayIpv6: Inet6Address,
         peerOutputs: ConcurrentHashMap<String, java.io.OutputStream>,
         tunOutput: FileOutputStream,
     ) = coroutineScope {
@@ -646,7 +649,7 @@ class TcpPeerVpnService : VpnService() {
             launch(Dispatchers.IO) {
                 handleAcceptedMeshSocket(
                     socket, config, advertisedIpv4, advertisedIpv6,
-                    peerOutputs, tunOutput,
+                    overlayIpv6, peerOutputs, tunOutput,
                 )
             }
         }
@@ -657,6 +660,7 @@ class TcpPeerVpnService : VpnService() {
         config: VpnConfiguration,
         advertisedIpv4: String,
         advertisedIpv6: String,
+        overlayIpv6: Inet6Address,
         peerOutputs: ConcurrentHashMap<String, java.io.OutputStream>,
         tunOutput: FileOutputStream,
     ) {
@@ -679,8 +683,7 @@ class TcpPeerVpnService : VpnService() {
             if (!adoptMeshSocket(peerId, socket, output, peerOutputs, initiated = false)) return
             while (true) {
                 val packet = TcpPeerProtocol.readData(input)
-                if (AddressNegotiation.isRouterAdvertisement(packet)) continue
-                synchronized(tunOutput) { tunOutput.write(packet) }
+                processInboundPacket(packet, peerId, overlayIpv6, output, tunOutput)
             }
         } catch (error: Exception) {
             Log.w(
@@ -741,6 +744,42 @@ class TcpPeerVpnService : VpnService() {
                 "remote=${socket.remoteSocketAddress} key=$key",
         )
         return true
+    }
+
+    private fun processInboundPacket(
+        packet: ByteArray,
+        peerId: String,
+        overlayIpv6: Inet6Address,
+        output: java.io.OutputStream,
+        tunOutput: FileOutputStream,
+    ): Int {
+        if (AddressNegotiation.isRouterAdvertisement(packet)) return 0
+        val tpp = TppProtocol.parse(packet)
+        return when (tpp?.type) {
+            TppProtocol.ECHO_REQUEST -> {
+                if (tpp.destination == overlayIpv6) {
+                    val reply = TppProtocol.reply(tpp)
+                    synchronized(output) { TcpPeerProtocol.writeData(output, reply) }
+                    Log.d(TAG, "TPP reply sent directly to peer_id=$peerId identifier=${tpp.identifier}")
+                    reply.size
+                } else {
+                    synchronized(tunOutput) { tunOutput.write(packet) }
+                    0
+                }
+            }
+            TppProtocol.ECHO_REPLY -> {
+                pendingTppPings.remove(tpp.identifier)?.let { (pingPeerId, sentAt) ->
+                    val latencyMillis = (System.nanoTime() - sentAt) / 1_000_000.0
+                    TcpPeerRuntime.recordPing(pingPeerId, latencyMillis)
+                    Log.d(TAG, "TPP reply received directly from peer_id=$peerId identifier=${tpp.identifier}")
+                }
+                0
+            }
+            else -> {
+                synchronized(tunOutput) { tunOutput.write(packet) }
+                0
+            }
+        }
     }
 
     private fun awaitPunchGo(input: java.io.InputStream, output: java.io.OutputStream, targetPeerId: String): ControlMessage {
@@ -1115,8 +1154,7 @@ class TcpPeerVpnService : VpnService() {
         tunOutput: FileOutputStream,
     ) = coroutineScope {
         val tunInput = FileInputStream(descriptor.fileDescriptor)
-        val nextPingId = AtomicLong(System.nanoTime())
-        val pendingPings = ConcurrentHashMap<Long, Pair<String, Long>>()
+        pendingTppPings.clear()
         val pendingTxBytes = AtomicLong(0)
         val pendingRxBytes = AtomicLong(0)
         val statistics = launch {
@@ -1172,7 +1210,7 @@ class TcpPeerVpnService : VpnService() {
         }
         val pingRequests = launch(Dispatchers.IO) {
             TcpPeerRuntime.pingTarget.collectLatest { request ->
-                pendingPings.clear()
+                pendingTppPings.clear()
                 if (request == null) return@collectLatest
                 val destination = runCatching { InetAddress.getByName(request.ipv6) as Inet6Address }.getOrNull()
                 if (destination == null) {
@@ -1180,17 +1218,23 @@ class TcpPeerVpnService : VpnService() {
                     return@collectLatest
                 }
                 while (true) {
-                    val identifier = nextPingId.incrementAndGet()
+                    val output = peerOutputs[request.peerId]
+                    if (output == null) {
+                        TcpPeerRuntime.recordPing(request.peerId, null)
+                        delay(1_000)
+                        continue
+                    }
+                    val identifier = nextTppPingId.incrementAndGet()
                     val sentAt = System.nanoTime()
                     val packet = TppProtocol.request(overlayIpv6, destination, identifier, sentAt)
-                    pendingPings[identifier] = request.peerId to sentAt
-                    synchronized(directOutput) {
-                        TcpPeerProtocol.writeData(directOutput, packet)
+                    pendingTppPings[identifier] = request.peerId to sentAt
+                    synchronized(output) {
+                        TcpPeerProtocol.writeData(output, packet)
                     }
                     pendingTxBytes.addAndGet(packet.size.toLong())
                     launch {
                         delay(3_000)
-                        pendingPings.remove(identifier)?.let { (peerId, _) ->
+                        pendingTppPings.remove(identifier)?.let { (peerId, _) ->
                             TcpPeerRuntime.recordPing(peerId, null)
                         }
                     }
@@ -1202,37 +1246,10 @@ class TcpPeerVpnService : VpnService() {
             while (true) {
                 val packet = TcpPeerProtocol.readData(directInput)
                 pendingRxBytes.addAndGet(packet.size.toLong())
-                if (AddressNegotiation.isRouterAdvertisement(packet)) {
-                    // The RA was already consumed during address negotiation and
-                    // its deterministic SLAAC address was installed explicitly by
-                    // VpnService.Builder. Injecting later RAs into Android's IP
-                    // stack enables RFC 8981 temporary addresses, causing the
-                    // kernel to use an address different from the one registered
-                    // with the coordinator.
-                    continue
-                }
-                val tpp = TppProtocol.parse(packet)
-                when (tpp?.type) {
-                    TppProtocol.ECHO_REQUEST -> {
-                        if (tpp.destination == overlayIpv6) {
-                            val reply = TppProtocol.reply(tpp)
-                            synchronized(directOutput) {
-                                TcpPeerProtocol.writeData(directOutput, reply)
-                            }
-                            pendingTxBytes.addAndGet(reply.size.toLong())
-                        } else {
-                            tunOutput.write(packet)
-                        }
-                    }
-                    TppProtocol.ECHO_REPLY -> {
-                        pendingPings.remove(tpp.identifier)?.let { (peerId, sentAt) ->
-                            val latencyMillis =
-                                ((System.nanoTime() - sentAt) / 1_000_000.0)
-                            TcpPeerRuntime.recordPing(peerId, latencyMillis)
-                        }
-                    }
-                    else -> tunOutput.write(packet)
-                }
+                val replyBytes = processInboundPacket(
+                    packet, "primary", overlayIpv6, directOutput, tunOutput,
+                )
+                if (replyBytes > 0) pendingTxBytes.addAndGet(replyBytes.toLong())
             }
         }
         try {
@@ -1243,6 +1260,7 @@ class TcpPeerVpnService : VpnService() {
             peerToTun.cancel()
             pingRequests.cancel()
             statistics.cancel()
+            pendingTppPings.clear()
             synchronized(directOutput) {
                 runCatching { directOutput.flush() }
             }
