@@ -347,9 +347,9 @@ class Coordinator:
         right_observed_version = ipaddress.ip_address(right.observed_address).version
         left_address = left.observed_address if left_observed_version == (6 if both_ipv6 else 4) else (left.declared_ipv6 if both_ipv6 else left.declared_ipv4)
         right_address = right.observed_address if right_observed_version == (6 if both_ipv6 else 4) else (right.declared_ipv6 if both_ipv6 else right.declared_ipv4)
-        # IPv6 does not need a translated NAT port: peers dial the explicitly
-        # registered passive listener. The control connection may use an
-        # unrelated ephemeral source port (notably on Android).
+        # Both families always use TCP hole punching. The mapped port discovered
+        # from the direct local port is therefore preferred even for IPv6; a
+        # globally reachable address does not select a non-punching fast path.
         if both_ipv6:
             left_port = left.mapped_ipv6_port or left.listen_port
             right_port = right.mapped_ipv6_port or right.listen_port
@@ -371,14 +371,21 @@ class Coordinator:
             await self.send(left.writer, "ERROR", Reason="no endpoint for the required address family")
             await self.send(right.writer, "ERROR", Reason="no endpoint for the required address family")
             return
+        traversal = "Simultaneous-Open"
+        LOG.info(
+            "Coordinating %s between %s and %s using %s",
+            transport, left.peer_id, right.peer_id, traversal,
+        )
         start = str(int(time.time() * 1000) + 500)
         await self.send(left.writer, "PUNCH-GO", **{
             "Peer-ID": right.peer_id, "Address": str(right_address),
             "Port": str(right_port), "Family": family, "Start-Ms": start,
+            "Traversal": traversal,
         })
         await self.send(right.writer, "PUNCH-GO", **{
             "Peer-ID": left.peer_id, "Address": str(left_address),
             "Port": str(left_port), "Family": family, "Start-Ms": start,
+            "Traversal": traversal,
         })
         left.ready_for.discard(right.peer_id)
         right.ready_for.discard(left.peer_id)

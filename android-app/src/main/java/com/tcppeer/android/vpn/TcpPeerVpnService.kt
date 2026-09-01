@@ -37,6 +37,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
@@ -66,9 +68,10 @@ class TcpPeerVpnService : VpnService() {
     private var coordinatorSocket: Socket? = null
     private var directSocket: Socket? = null
     private val meshSockets = ConcurrentHashMap<String, Socket>()
+    private val meshSocketKeys = ConcurrentHashMap<String, String>()
+    private val meshAdoptionLock = Any()
     private val meshConnecting = ConcurrentHashMap.newKeySet<String>()
     private val meshPunchActive = ConcurrentHashMap.newKeySet<String>()
-    private val directCandidates = mutableMapOf<DirectFamily, Socket>()
     private val directListeners = mutableMapOf<DirectFamily, ServerSocket>()
     private var tunnel: ParcelFileDescriptor? = null
     private val disconnectRequested = AtomicBoolean(false)
@@ -399,7 +402,15 @@ class TcpPeerVpnService : VpnService() {
             val peerOutputs = ConcurrentHashMap<String, java.io.OutputStream>()
             peerOutputs[targetPeerId] = directOutput
             meshSockets[targetPeerId] = direct
+            meshSocketKeys[targetPeerId] = connectionKey(direct)
             val tunOutput = FileOutputStream(descriptor.fileDescriptor)
+            prepareDirectListener(config.directPort, DirectFamily.IPV6)
+            val passiveAcceptJob = launch(Dispatchers.IO) {
+                acceptMeshConnections(
+                    config, advertisedIpv4, advertisedIpv6,
+                    peerOutputs, tunOutput,
+                )
+            }
             val coordinatorControlJob = launch(Dispatchers.IO) {
                 val devices = mutableListOf<NetworkDevice>()
                 var listInProgress = false
@@ -528,7 +539,10 @@ class TcpPeerVpnService : VpnService() {
                     tunOutput,
                 )
             } finally {
+                closeDirectListeners()
+                meshSockets.values.forEach(::closeQuietly)
                 coordinatorControlJob.cancel()
+                passiveAcceptJob.cancel()
                 closeQuietly(tunOutput)
             }
         }
@@ -552,15 +566,25 @@ class TcpPeerVpnService : VpnService() {
         }
         val address = InetAddress.getByName(punch.field("Address") ?: return)
         val port = punch.field("Port")?.toIntOrNull() ?: return
+        val traversal = "Simultaneous-Open"
         val waitMillis = (punch.field("Start-Ms")?.toLongOrNull() ?: 0L) - System.currentTimeMillis()
         if (waitMillis > 0) delay(waitMillis)
+        val activeLocalPort = config.directPort
+        closeDirectListener(family)
+        Log.i(
+            TAG,
+            "Mesh attempt peer_id=$peerId family=${familyLabel(family)} traversal=$traversal " +
+                "initiated=true local_port=$activeLocalPort remote=${formatEndpoint(address, port)}",
+        )
         val socket = try {
-            openActiveDirect(address, port, config.directPort, family)
+            openActiveDirect(address, port, activeLocalPort, family, peerId)
         } catch (error: Exception) {
             Log.w(TAG, "Direct mesh connection to $peerId failed", error)
             meshConnecting.remove(peerId)
+            if (family == DirectFamily.IPV6) prepareDirectListener(config.directPort, family)
             return
         }
+        if (family == DirectFamily.IPV6) prepareDirectListener(config.directPort, family)
         try {
             val input = BufferedInputStream(socket.getInputStream(), DIRECT_STREAM_BUFFER_BYTES)
             val output = socket.getOutputStream()
@@ -574,13 +598,7 @@ class TcpPeerVpnService : VpnService() {
             if (peerInfo.command != "PEER-INFO" || peerInfo.field("Network") != config.network) {
                 throw ProtocolException("Direct mesh peer handshake failed")
             }
-            val previous = meshSockets.putIfAbsent(peerId, socket)
-            if (previous != null) {
-                socket.close()
-                return
-            }
-            peerOutputs[peerId] = output
-            Log.i(TAG, "Direct mesh connection established with $peerId; no Exit Node relay")
+            if (!adoptMeshSocket(peerId, socket, output, peerOutputs, initiated = true)) return
             try {
                 while (true) {
                     val packet = TcpPeerProtocol.readData(input)
@@ -590,6 +608,7 @@ class TcpPeerVpnService : VpnService() {
             } finally {
                 peerOutputs.remove(peerId, output)
                 meshSockets.remove(peerId, socket)
+                meshSocketKeys.remove(peerId, connectionKey(socket))
             }
         } catch (error: Exception) {
             Log.w(TAG, "Direct mesh connection to $peerId closed", error)
@@ -599,15 +618,148 @@ class TcpPeerVpnService : VpnService() {
         }
     }
 
+    private suspend fun acceptMeshConnections(
+        config: VpnConfiguration,
+        advertisedIpv4: String,
+        advertisedIpv6: String,
+        peerOutputs: ConcurrentHashMap<String, java.io.OutputStream>,
+        tunOutput: FileOutputStream,
+    ) = coroutineScope {
+        while (currentCoroutineContext().isActive) {
+            val socket = try {
+                acceptPassiveDirect(DirectFamily.IPV6)
+            } catch (_: SocketTimeoutException) {
+                continue
+            } catch (error: Exception) {
+                val listenerActive = synchronized(directListeners) {
+                    directListeners[DirectFamily.IPV6]?.isClosed == false
+                }
+                if (!currentCoroutineContext().isActive) break
+                if (!listenerActive) {
+                    delay(100)
+                    continue
+                }
+                Log.w(TAG, "TCP6 passive accept failed; listener remains active", error)
+                delay(100)
+                continue
+            }
+            launch(Dispatchers.IO) {
+                handleAcceptedMeshSocket(
+                    socket, config, advertisedIpv4, advertisedIpv6,
+                    peerOutputs, tunOutput,
+                )
+            }
+        }
+    }
+
+    private fun handleAcceptedMeshSocket(
+        socket: Socket,
+        config: VpnConfiguration,
+        advertisedIpv4: String,
+        advertisedIpv6: String,
+        peerOutputs: ConcurrentHashMap<String, java.io.OutputStream>,
+        tunOutput: FileOutputStream,
+    ) {
+        var peerId = "unknown"
+        var output: java.io.OutputStream? = null
+        try {
+            val input = BufferedInputStream(socket.getInputStream(), DIRECT_STREAM_BUFFER_BYTES)
+            output = socket.getOutputStream()
+            val peerInfo = TcpPeerProtocol.readControl(input)
+            peerId = peerInfo.field("Peer-ID") ?: "unknown"
+            if (peerInfo.command != "PEER-INFO" || peerInfo.field("Network") != config.network) {
+                throw ProtocolException("Accepted mesh peer handshake failed")
+            }
+            TcpPeerProtocol.writeControl(output, ControlMessage("PEER-INFO", linkedMapOf(
+                "Network" to config.network,
+                "Peer-ID" to config.peerId,
+                "IPv4" to advertisedIpv4,
+                "IPv6" to advertisedIpv6,
+            )))
+            if (!adoptMeshSocket(peerId, socket, output, peerOutputs, initiated = false)) return
+            while (true) {
+                val packet = TcpPeerProtocol.readData(input)
+                if (AddressNegotiation.isRouterAdvertisement(packet)) continue
+                synchronized(tunOutput) { tunOutput.write(packet) }
+            }
+        } catch (error: Exception) {
+            Log.w(
+                TAG,
+                "Mesh accepted socket closed peer_id=$peerId family=TCP6 " +
+                    "socket=${socketToken(socket)} local=${socket.localSocketAddress} " +
+                    "remote=${socket.remoteSocketAddress} reason=${error.message}",
+                error,
+            )
+        } finally {
+            output?.let { peerOutputs.remove(peerId, it) }
+            meshSockets.remove(peerId, socket)
+            meshSocketKeys.remove(peerId, connectionKey(socket))
+            closeQuietly(socket)
+        }
+    }
+
+    private fun adoptMeshSocket(
+        peerId: String,
+        socket: Socket,
+        output: java.io.OutputStream,
+        peerOutputs: ConcurrentHashMap<String, java.io.OutputStream>,
+        initiated: Boolean,
+    ): Boolean {
+        val key = connectionKey(socket)
+        var replaced: Socket? = null
+        synchronized(meshAdoptionLock) {
+            val current = meshSockets[peerId]
+            val currentKey = meshSocketKeys[peerId]
+            if (current != null && currentKey != null && key >= currentKey) {
+                Log.i(
+                    TAG,
+                    "Mesh socket rejected peer_id=$peerId family=${socketFamily(socket)} " +
+                        "socket=${socketToken(socket)} initiated=$initiated local=${socket.localSocketAddress} " +
+                        "remote=${socket.remoteSocketAddress} reason=deterministic-loser " +
+                        "winner_key=$currentKey loser_key=$key",
+                )
+                closeQuietly(socket)
+                return false
+            }
+            replaced = current
+            meshSockets[peerId] = socket
+            meshSocketKeys[peerId] = key
+            peerOutputs[peerId] = output
+        }
+        replaced?.takeUnless { it === socket }?.let {
+            Log.i(
+                TAG,
+                "Mesh socket replaced peer_id=$peerId old_socket=${socketToken(it)} " +
+                    "new_socket=${socketToken(socket)} reason=deterministic-winner",
+            )
+            closeQuietly(it)
+        }
+        Log.i(
+            TAG,
+            "Mesh socket adopted peer_id=$peerId family=${socketFamily(socket)} " +
+                "socket=${socketToken(socket)} initiated=$initiated local=${socket.localSocketAddress} " +
+                "remote=${socket.remoteSocketAddress} key=$key",
+        )
+        return true
+    }
+
     private fun awaitPunchGo(input: java.io.InputStream, output: java.io.OutputStream, targetPeerId: String): ControlMessage {
         while (true) {
             when (val message = TcpPeerProtocol.readControl(input)) {
                 is ControlMessage -> when (message.command) {
-                    "PUNCH-GO" -> return message
+                    "PUNCH-GO" -> if (message.field("Peer-ID") == targetPeerId) return message
                     "PEER-INFO" -> if (message.field("Action") == "Punch-Request") {
-                        TcpPeerProtocol.writeControl(output, ControlMessage("PUNCH-READY", mapOf(
-                            "Peer-ID" to (message.field("Peer-ID") ?: targetPeerId),
-                        )))
+                        val requestedPeer = message.field("Peer-ID")
+                        if (requestedPeer == targetPeerId) {
+                            TcpPeerProtocol.writeControl(output, ControlMessage("PUNCH-READY", mapOf(
+                                "Peer-ID" to targetPeerId,
+                            )))
+                        } else {
+                            Log.i(
+                                TAG,
+                                "Deferring mesh punch for peer_id=$requestedPeer until the primary tunnel is ready",
+                            )
+                        }
                     }
                     "PING", "KEEPALIVE" -> TcpPeerProtocol.writeControl(output, ControlMessage("PONG"))
                     "AUTH-ERROR", "DISCONNECT" -> throw ProtocolException(message.field("Reason") ?: "Coordinator disconnected")
@@ -719,6 +871,16 @@ class TcpPeerVpnService : VpnService() {
         }
 
     private fun openActiveDirect(address: InetAddress, port: Int, localPort: Int, family: DirectFamily): Socket {
+        return openActiveDirect(address, port, localPort, family, "primary")
+    }
+
+    private fun openActiveDirect(
+        address: InetAddress,
+        port: Int,
+        localPort: Int,
+        family: DirectFamily,
+        peerId: String,
+    ): Socket {
         val socket = Socket()
         try {
             socket.reuseAddress = true
@@ -727,13 +889,31 @@ class TcpPeerVpnService : VpnService() {
             // used for public mapping discovery. An ephemeral source port makes
             // two-NAT hole punching impossible.
             socket.bind(InetSocketAddress(wildcard, localPort))
+            Log.i(
+                TAG,
+                "Direct bind succeeded peer_id=$peerId family=${familyLabel(family)} " +
+                    "socket=${socketToken(socket)} initiated=true local=${socket.localSocketAddress} " +
+                    "remote=${formatEndpoint(address, port)}",
+            )
             if (!protect(socket)) throw IllegalStateException("Cannot protect the direct socket from the VPN")
             socket.connect(InetSocketAddress(address, port), 12_000)
             socket.tcpNoDelay = true
             socket.soTimeout = 15_000
-            Log.i(TAG, "Direct ${family.name} active connection established to ${formatEndpoint(address, port)}")
+            Log.i(
+                TAG,
+                "Direct connect succeeded peer_id=$peerId family=${familyLabel(family)} " +
+                    "socket=${socketToken(socket)} initiated=true local=${socket.localSocketAddress} " +
+                    "remote=${socket.remoteSocketAddress}",
+            )
             return socket
         } catch (error: Exception) {
+            Log.w(
+                TAG,
+                "Direct connect failed peer_id=$peerId family=${familyLabel(family)} " +
+                    "socket=${socketToken(socket)} initiated=true local=${socket.localSocketAddress} " +
+                    "remote=${formatEndpoint(address, port)} reason=${error.message}",
+                error,
+            )
             socket.close()
             val label = if (family == DirectFamily.IPV6) "TCP6" else "TCP4"
             throw IllegalStateException("$label direct connection failed; no fallback is allowed", error)
@@ -743,7 +923,7 @@ class TcpPeerVpnService : VpnService() {
     private fun acceptPassiveDirect(family: DirectFamily): Socket {
         val listener = synchronized(directListeners) { directListeners[family] }
             ?: throw IllegalStateException("No passive direct listener is available")
-        listener.soTimeout = 12_000
+        listener.soTimeout = 1_000
         return listener.accept().also {
             if (!protect(it)) {
                 it.close()
@@ -751,23 +931,12 @@ class TcpPeerVpnService : VpnService() {
             }
             it.tcpNoDelay = true
             it.soTimeout = 15_000
-            Log.i(TAG, "Direct ${family.name} passive connection accepted from ${it.remoteSocketAddress}")
-        }
-    }
-
-    private fun prepareDirectCandidate(localPort: Int, family: DirectFamily) {
-        synchronized(directCandidates) {
-            if (directCandidates[family]?.isClosed == false) return
-            val socket = Socket()
-            try {
-                socket.reuseAddress = true
-                val wildcard = if (family == DirectFamily.IPV6) InetAddress.getByName("::") else InetAddress.getByName("0.0.0.0")
-                socket.bind(InetSocketAddress(wildcard, localPort))
-                if (!protect(socket)) throw IllegalStateException("Cannot protect the direct candidate socket")
-                directCandidates[family] = socket
-            } catch (_: Exception) {
-                socket.close()
-            }
+            Log.i(
+                TAG,
+                "Direct accept succeeded peer_id=pending family=${familyLabel(family)} " +
+                    "socket=${socketToken(it)} initiated=false local=${it.localSocketAddress} " +
+                    "remote=${it.remoteSocketAddress}",
+            )
         }
     }
 
@@ -778,11 +947,37 @@ class TcpPeerVpnService : VpnService() {
             try {
                 listener.reuseAddress = true
                 val wildcard = if (family == DirectFamily.IPV6) InetAddress.getByName("::") else InetAddress.getByName("0.0.0.0")
-                listener.bind(InetSocketAddress(wildcard, localPort), 4)
+                listener.bind(InetSocketAddress(wildcard, localPort), 32)
                 directListeners[family] = listener
+                Log.i(
+                    TAG,
+                    "Direct listener ready family=${familyLabel(family)} " +
+                        "socket=${socketToken(listener)} local=${listener.localSocketAddress}",
+                )
             } catch (error: Exception) {
                 Log.e(TAG, "Cannot listen for passive ${family.name} direct connections on port $localPort", error)
                 listener.close()
+            }
+        }
+    }
+
+    private fun closeDirectListeners() {
+        synchronized(directListeners) {
+            directListeners.values.forEach(::closeQuietly)
+            directListeners.clear()
+        }
+    }
+
+    private fun closeDirectListener(family: DirectFamily) {
+        synchronized(directListeners) {
+            directListeners.remove(family)?.let { listener ->
+                Log.i(
+                    TAG,
+                    "Direct listener closed family=${familyLabel(family)} " +
+                        "socket=${socketToken(listener)} local=${listener.localSocketAddress} " +
+                        "reason=simultaneous-open",
+                )
+                closeQuietly(listener)
             }
         }
     }
@@ -1066,6 +1261,20 @@ class TcpPeerVpnService : VpnService() {
         }.getOrNull()
     }
 
+    private fun connectionKey(socket: Socket): String = listOf(
+        socket.localSocketAddress?.toString().orEmpty(),
+        socket.remoteSocketAddress?.toString().orEmpty(),
+    ).sorted().joinToString("|")
+
+    private fun socketToken(socket: Any): String =
+        "${socket.javaClass.simpleName}@${Integer.toHexString(System.identityHashCode(socket))}"
+
+    private fun socketFamily(socket: Socket): String =
+        if (socket.inetAddress is Inet6Address) "TCP6" else "TCP4"
+
+    private fun familyLabel(family: DirectFamily): String =
+        if (family == DirectFamily.IPV6) "TCP6" else "TCP4"
+
     private fun networkAddress(address: Inet4Address, prefixLength: Int): InetAddress {
         val bytes = address.address
         for (index in bytes.indices) {
@@ -1094,16 +1303,10 @@ class TcpPeerVpnService : VpnService() {
         directSocket = null
         meshSockets.values.forEach(::closeQuietly)
         meshSockets.clear()
+        meshSocketKeys.clear()
         meshConnecting.clear()
         meshPunchActive.clear()
-        synchronized(directCandidates) {
-            directCandidates.values.forEach(::closeQuietly)
-            directCandidates.clear()
-        }
-        synchronized(directListeners) {
-            directListeners.values.forEach(::closeQuietly)
-            directListeners.clear()
-        }
+        closeDirectListeners()
         closeQuietly(coordinatorSocket)
         coordinatorSocket = null
     }
