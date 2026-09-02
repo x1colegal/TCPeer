@@ -413,9 +413,10 @@ class TcpPeerVpnService : VpnService() {
             meshSocketKeys[targetPeerId] = connectionKey(direct)
             meshEndpoints[targetPeerId] = formatSocketEndpoint(direct)
             val tunOutput = FileOutputStream(descriptor.fileDescriptor)
-            prepareDirectListener(config.directPort, DirectFamily.IPV6)
+            prepareDirectListener(config.directPort, family)
             val passiveAcceptJob = launch(Dispatchers.IO) {
                 acceptMeshConnections(
+                    family,
                     config, advertisedIpv4, advertisedIpv6,
                     addresses.second.address, peerOutputs, tunOutput,
                 )
@@ -592,10 +593,10 @@ class TcpPeerVpnService : VpnService() {
         } catch (error: Exception) {
             Log.w(TAG, "Direct mesh connection to $peerId failed", error)
             meshConnecting.remove(peerId)
-            if (family == DirectFamily.IPV6) prepareDirectListener(config.directPort, family)
+            prepareDirectListener(config.directPort, family)
             return
         }
-        if (family == DirectFamily.IPV6) prepareDirectListener(config.directPort, family)
+        prepareDirectListener(config.directPort, family)
         try {
             val input = BufferedInputStream(socket.getInputStream(), DIRECT_STREAM_BUFFER_BYTES)
             val output = socket.getOutputStream()
@@ -632,6 +633,7 @@ class TcpPeerVpnService : VpnService() {
     }
 
     private suspend fun acceptMeshConnections(
+        family: DirectFamily,
         config: VpnConfiguration,
         advertisedIpv4: String,
         advertisedIpv6: String,
@@ -641,19 +643,19 @@ class TcpPeerVpnService : VpnService() {
     ) = coroutineScope {
         while (currentCoroutineContext().isActive) {
             val socket = try {
-                acceptPassiveDirect(DirectFamily.IPV6)
+                acceptPassiveDirect(family)
             } catch (_: SocketTimeoutException) {
                 continue
             } catch (error: Exception) {
                 val listenerActive = synchronized(directListeners) {
-                    directListeners[DirectFamily.IPV6]?.isClosed == false
+                    directListeners[family]?.isClosed == false
                 }
                 if (!currentCoroutineContext().isActive) break
                 if (!listenerActive) {
                     delay(100)
                     continue
                 }
-                Log.w(TAG, "TCP6 passive accept failed; listener remains active", error)
+                Log.w(TAG, "${familyLabel(family)} passive accept failed; listener remains active", error)
                 delay(100)
                 continue
             }
@@ -699,7 +701,7 @@ class TcpPeerVpnService : VpnService() {
         } catch (error: Exception) {
             Log.w(
                 TAG,
-                "Mesh accepted socket closed peer_id=$peerId family=TCP6 " +
+                "Mesh accepted socket closed peer_id=$peerId family=${socketFamily(socket)} " +
                     "socket=${socketToken(socket)} local=${socket.localSocketAddress} " +
                     "remote=${socket.remoteSocketAddress} reason=${error.message}",
                 error,
