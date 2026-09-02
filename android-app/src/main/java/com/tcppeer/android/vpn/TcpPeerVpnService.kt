@@ -1082,7 +1082,7 @@ class TcpPeerVpnService : VpnService() {
         var slaac: com.tcppeer.android.protocol.SlaacConfiguration? = null
         val deadlineNanos = System.nanoTime() + 15_000_000_000L
         var receivedFrames = 0
-        while (System.nanoTime() < deadlineNanos && receivedFrames < 256) {
+        while (System.nanoTime() < deadlineNanos) {
             val packet = TcpPeerProtocol.readData(input)
             receivedFrames += 1
             var packetKind = "unrecognized"

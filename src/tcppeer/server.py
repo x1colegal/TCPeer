@@ -203,10 +203,14 @@ class Server:
 
     async def _start_direct_listeners(self) -> None:
         candidates = []
-        if self.config.direct_ipv6:
-            candidates.append((self.config.direct_ipv6, socket.AF_INET6))
-        if self.config.direct_ipv4:
-            candidates.append((self.config.direct_ipv4, socket.AF_INET))
+        # Use the effective addresses selected during initialization.  IPv4
+        # may have been discovered automatically even when direct_ipv4 was not
+        # present in the TOML; consulting only the config value silently
+        # omitted the TCP4 passive listener on dual-stack Linux peers.
+        if self._direct_bind_ipv6:
+            candidates.append((self._direct_bind_ipv6, socket.AF_INET6))
+        if self._direct_bind_ipv4:
+            candidates.append((self._direct_bind_ipv4, socket.AF_INET))
         if not candidates:
             candidates = [("::", socket.AF_INET6), ("0.0.0.0", socket.AF_INET)]
         for address, family in candidates:
