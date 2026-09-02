@@ -225,10 +225,24 @@ class TcpPeerVpnService : VpnService() {
 
     private suspend fun runConnection(config: VpnConfiguration) = withContext(Dispatchers.IO) {
         updateConnecting("Resolving the coordinator DNS name.")
-        val activeNetwork = connectivityManager.activeNetwork
-        val activeLinkProperties = activeNetwork?.let(connectivityManager::getLinkProperties)
-        val activeAddresses = activeLinkProperties?.linkAddresses?.map { it.address }.orEmpty()
+        val defaultNetwork = connectivityManager.activeNetwork
+        val physicalNetwork = (
+            listOfNotNull(defaultNetwork) +
+                connectivityManager.allNetworks.filter { it != defaultNetwork }
+            ).firstOrNull { network ->
+                connectivityManager.getNetworkCapabilities(network)?.let { capabilities ->
+                    !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
+                        capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                } == true
+            }
+        val activeLinkProperties = physicalNetwork?.let(connectivityManager::getLinkProperties)
+        val activeAddresses = activeLinkProperties?.linkAddresses?.map { it.address }
         val (localIpv4, localIpv6) = TransportPolicy.localAddresses(activeAddresses)
+        Log.i(
+            TAG,
+            "Endpoint discovery network=$physicalNetwork IPv4=${localIpv4.joinToString { it.hostAddress.orEmpty() }} " +
+                "IPv6=${localIpv6.joinToString { it.hostAddress?.substringBefore('%').orEmpty() }}",
+        )
         val coordinator = openCoordinator(config, localIpv6.isNotEmpty()).also { coordinatorSocket = it }
         val controlInput = coordinator.getInputStream()
         val controlOutput = coordinator.getOutputStream()
