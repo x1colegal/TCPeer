@@ -378,7 +378,13 @@ class Coordinator:
 
     async def _punch_go(self, left: RegisteredPeer, right: RegisteredPeer) -> None:
         same_public_origin = left.observed_address == right.observed_address
-        local_ipv6_path = same_public_origin and self._same_local_network(left.local_ipv6, right.local_ipv6, 6)
+        # A shared GUA /64 is globally unambiguous even when the two control
+        # sockets reached the coordinator through different address families.
+        # Requiring identical observed control endpoints here incorrectly sent
+        # same-LAN peers through their NAPT66 mappings, which may not hairpin.
+        local_ipv6_path = self._can_use_local_candidates(
+            left.local_ipv6, right.local_ipv6, 6, same_public_origin,
+        )
         both_ipv6 = (
             is_usable_ipv6(left.declared_ipv6) and is_usable_ipv6(right.declared_ipv6)
         ) or local_ipv6_path
@@ -405,7 +411,9 @@ class Coordinator:
             right_port = right.mapped_ipv4_port or (right.observed_port if right_observed_version == 4 else right.listen_port)
         local_left = left.local_ipv6 if both_ipv6 else left.local_ipv4
         local_right = right.local_ipv6 if both_ipv6 else right.local_ipv4
-        if same_public_origin and self._same_local_network(local_left, local_right, 6 if both_ipv6 else 4):
+        if self._can_use_local_candidates(
+            local_left, local_right, 6 if both_ipv6 else 4, same_public_origin,
+        ):
             left_address = local_left
             right_address = local_right
             left_port = left.listen_port
@@ -452,6 +460,22 @@ class Coordinator:
         return ipaddress.ip_network(f"{left_address}/{prefix}", strict=False) == ipaddress.ip_network(
             f"{right_address}/{prefix}", strict=False,
         )
+
+    @classmethod
+    def _can_use_local_candidates(
+        cls,
+        left: str | None,
+        right: str | None,
+        version: int,
+        same_public_origin: bool,
+    ) -> bool:
+        if version == 6:
+            return (
+                is_usable_ipv6(left)
+                and is_usable_ipv6(right)
+                and cls._same_local_network(left, right, version)
+            )
+        return same_public_origin and cls._same_local_network(left, right, version)
 
 
 def build_parser() -> argparse.ArgumentParser:
