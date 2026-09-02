@@ -49,6 +49,7 @@ class Client(Server):
         self._direct_adoption_lock = asyncio.Lock()
         self._direct_owner_tokens = {}
         self._direct_owner_keys = {}
+        self._direct_owner_committed = set()
         self._direct_attempt_counter = 0
         self._byte_counters = {}
         self._coordinator_writer = None

@@ -103,6 +103,7 @@ class Server:
         self._direct_adoption_lock = asyncio.Lock()
         self._direct_owner_tokens: dict[str, str] = {}
         self._direct_owner_keys: dict[str, tuple[str, str]] = {}
+        self._direct_owner_committed: set[str] = set()
         self._direct_attempt_counter = 0
         self._byte_counters: dict[tuple[str, str], int] = {}
         self._coordinator_writer = None
@@ -175,6 +176,7 @@ class Server:
             self.direct_writers.clear()
             self._direct_owner_tokens.clear()
             self._direct_owner_keys.clear()
+            self._direct_owner_committed.clear()
             await asyncio.gather(*(listener.wait_closed() for listener in self._listeners), return_exceptions=True)
             self.tun.close()
             self.exit_node.close()
@@ -576,6 +578,15 @@ class Server:
     def _prepare_remote_route(self, address: str, family: socket.AddressFamily) -> None:
         """Hook used by full-tunnel clients to keep outer TCP off their TUN."""
 
+    def _incoming_direct_wins(
+        self,
+        peer_id: str,
+        current_key: tuple[str, str],
+        incoming_key: tuple[str, str],
+    ) -> bool:
+        """Arbitrate duplicates only until the selected stream carries data."""
+        return peer_id not in self._direct_owner_committed and incoming_key < current_key
+
     async def _adopt_direct(
         self,
         reader,
@@ -597,9 +608,10 @@ class Server:
             current_writer = self.direct_writers.get(peer_id)
             current_key = self._direct_owner_keys.get(peer_id)
             if current_writer is not None and current_key is not None:
-                if connection_key >= current_key:
+                owner_committed = peer_id in self._direct_owner_committed
+                if not self._incoming_direct_wins(peer_id, current_key, connection_key):
                     LOG.info(
-                        "direct-adopt loser-close ts=%.6f peer_id=%s family=%s attempt=%s initiated=%s fd=%s local=%s remote=%s winner_key=%s loser_key=%s",
+                        "direct-adopt loser-close ts=%.6f peer_id=%s family=%s attempt=%s initiated=%s fd=%s local=%s remote=%s winner_key=%s loser_key=%s reason=%s",
                         time.time(),
                         peer_id,
                         "tcp6" if family == socket.AF_INET6 else "tcp4",
@@ -610,6 +622,7 @@ class Server:
                         self._peername_text(writer),
                         current_key,
                         connection_key,
+                        "current-owner-has-data" if owner_committed else "deterministic-arbitration",
                     )
                     writer.close()
                     await asyncio.gather(writer.wait_closed(), return_exceptions=True)
@@ -619,6 +632,7 @@ class Server:
             self.direct_writers[peer_id] = writer
             self._direct_owner_tokens[peer_id] = token
             self._direct_owner_keys[peer_id] = connection_key
+            self._direct_owner_committed.discard(peer_id)
 
         if replaced_writer is not None and replaced_writer is not writer:
             LOG.info(
@@ -645,6 +659,24 @@ class Server:
             while True:
                 packet = await read_data(reader)
                 packet_count += 1
+                if packet_count == 1:
+                    async with self._direct_adoption_lock:
+                        if (
+                            self.direct_writers.get(peer_id) is writer
+                            and self._direct_owner_tokens.get(peer_id) == token
+                        ):
+                            self._direct_owner_committed.add(peer_id)
+                            LOG.info(
+                                "direct-adopt owner-committed ts=%.6f peer_id=%s family=%s attempt=%s initiated=%s fd=%s local=%s remote=%s reason=first-data",
+                                time.time(),
+                                peer_id,
+                                "tcp6" if family == socket.AF_INET6 else "tcp4",
+                                attempt,
+                                "yes" if initiated else "no",
+                                self._socket_fd(writer),
+                                self._sockname_text(writer),
+                                self._peername_text(writer),
+                            )
                 self._add_bytes(peer_id, "rx_bytes", len(packet))
                 await self._handle_peer_packet(packet, writer, peer_id)
         except ProtocolError as exc:
@@ -671,6 +703,7 @@ class Server:
                 self.direct_writers.pop(peer_id, None)
                 self._direct_owner_tokens.pop(peer_id, None)
                 self._direct_owner_keys.pop(peer_id, None)
+                self._direct_owner_committed.discard(peer_id)
                 self.store.update_peer(peer_id, transport="Disconnected")
             with self.store.connection:
                 self.store.connection.execute(

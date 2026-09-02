@@ -316,6 +316,11 @@ class TcpPeerVpnService : VpnService() {
                 throw ProtocolException("TCP4 is forbidden when both peers have usable IPv6")
             }
 
+            // Be reachable for the other half of the coordinated punch.  A
+            // directly addressed peer (LAN or GUA) can then adopt the inbound
+            // socket instead of rejecting it while Android only dials out.
+            prepareDirectListener(config.directPort, family)
+
             val startMillis = punch.field("Start-Ms")?.toLongOrNull() ?: 0L
             val waitMillis = startMillis - System.currentTimeMillis()
             if (waitMillis > 0)
@@ -923,6 +928,27 @@ class TcpPeerVpnService : VpnService() {
 
     private suspend fun openDirect(address: InetAddress, port: Int, localPort: Int, family: DirectFamily): Socket =
         withContext(Dispatchers.IO) {
+            try {
+                Log.i(
+                    TAG,
+                    "Direct passive window started peer_id=primary family=${familyLabel(family)} " +
+                        "initiated=false local_port=$localPort remote=${formatEndpoint(address, port)}",
+                )
+                return@withContext acceptPassiveDirect(family).also {
+                    Log.i(
+                        TAG,
+                        "Direct passive winner peer_id=primary family=${familyLabel(family)} " +
+                            "socket=${socketToken(it)} initiated=false local=${it.localSocketAddress} " +
+                            "remote=${it.remoteSocketAddress}",
+                    )
+                }
+            } catch (_: SocketTimeoutException) {
+                Log.i(
+                    TAG,
+                    "Direct passive window expired peer_id=primary family=${familyLabel(family)} " +
+                        "reason=no-inbound-syn",
+                )
+            }
             synchronized(directListeners) {
                 directListeners.remove(family)?.let(::closeQuietly)
             }
@@ -1054,8 +1080,11 @@ class TcpPeerVpnService : VpnService() {
         var offer: com.tcppeer.android.protocol.DhcpOffer? = null
         var acknowledged: com.tcppeer.android.protocol.DhcpOffer? = null
         var slaac: com.tcppeer.android.protocol.SlaacConfiguration? = null
-        repeat(8) {
+        val deadlineNanos = System.nanoTime() + 15_000_000_000L
+        var receivedFrames = 0
+        while (System.nanoTime() < deadlineNanos && receivedFrames < 256) {
             val packet = TcpPeerProtocol.readData(input)
+            receivedFrames += 1
             var packetKind = "unrecognized"
             if (offer == null) {
                 offer = AddressNegotiation.parseDhcpOffer(packet, transactionId)
@@ -1078,7 +1107,10 @@ class TcpPeerVpnService : VpnService() {
             Log.i(TAG, "Address negotiation received $packetKind (${packet.size} bytes); offer=${offer != null} ack=${acknowledged != null} ra=${slaac != null}")
             if (acknowledged != null && slaac != null) return acknowledged!! to slaac!!
         }
-        throw ProtocolException("Address negotiation did not provide both DHCPv4 and SLAAC")
+        throw ProtocolException(
+            "Address negotiation timed out after $receivedFrames frames " +
+                "(offer=${offer != null}, ack=${acknowledged != null}, ra=${slaac != null})",
+        )
     }
 
     private fun establishTunnel(
