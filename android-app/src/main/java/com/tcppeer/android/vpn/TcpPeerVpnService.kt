@@ -636,6 +636,10 @@ class TcpPeerVpnService : VpnService() {
             if (peerInfo.command != "PEER-INFO" || peerInfo.field("Network") != config.network) {
                 throw ProtocolException("Direct mesh peer handshake failed")
             }
+            // The handshake timeout must not become an idle lifetime for the
+            // established raw-IP stream.  Leaving 15 seconds here caused every
+            // quiet mesh connection to be closed and punched again forever.
+            socket.soTimeout = 0
             if (!adoptMeshSocket(peerId, socket, output, peerOutputs, initiated = true)) return
             try {
                 while (true) {
@@ -719,6 +723,9 @@ class TcpPeerVpnService : VpnService() {
                 "IPv4" to advertisedIpv4,
                 "IPv6" to advertisedIpv6,
             )))
+            // Keep the established mesh stream blocking indefinitely after
+            // the bounded handshake, matching the primary direct connection.
+            socket.soTimeout = 0
             if (!adoptMeshSocket(peerId, socket, output, peerOutputs, initiated = false)) return
             while (true) {
                 val packet = TcpPeerProtocol.readData(input)
