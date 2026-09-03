@@ -19,7 +19,7 @@ from tcppeer.address_negotiation import dhcp_discover, dhcp_request, parse_dhcp,
 from tcppeer.config import ClientConfig, ConfigurationError
 from tcppeer.dns import discover_upstream_dns
 from tcppeer.protocol import ControlMessage, ProtocolError, read_data
-from tcppeer.server import Server, discover_direct_ipv4, public_address
+from tcppeer.server import Server, discover_direct_ipv4, discover_direct_ipv6, public_address
 from tcppeer.state import StateStore
 from tcppeer.tpp import ECHO_REPLY, ECHO_REQUEST, build_reply as build_tpp_reply, parse_tpp
 from tcppeer.tun import TunDevice
@@ -39,9 +39,9 @@ class Client(Server):
         self._tasks = set()
         self._listeners = []
         self._direct_bind_ipv4 = config.direct_ipv4 or discover_direct_ipv4({config.tun_name})
-        self._direct_bind_ipv6 = config.direct_ipv6
+        self._direct_bind_ipv6 = config.direct_ipv6 or discover_direct_ipv6({config.tun_name})
         self._registered_ipv4 = public_address(self._direct_bind_ipv4)
-        self._registered_ipv6 = public_address(config.direct_ipv6)
+        self._registered_ipv6 = public_address(self._direct_bind_ipv6)
         self._registered_port_ipv4 = config.direct_port if self._registered_ipv4 else None
         self._registered_port_ipv6 = config.direct_port if self._registered_ipv6 else None
         self._direct_candidates = {}
@@ -86,7 +86,12 @@ class Client(Server):
                 raise ConnectionError("coordinator control loop ended before endpoint registration")
             await self._start_direct_listeners()
             await self._start_admin_listener()
-            self._tasks.update({control, asyncio.create_task(self._tun_loop(), name="tun"), asyncio.create_task(self._statistics_loop(), name="statistics")})
+            self._tasks.update({
+                control,
+                asyncio.create_task(self._tun_loop(), name="tun"),
+                asyncio.create_task(self._statistics_loop(), name="statistics"),
+                asyncio.create_task(self._address_change_loop(), name="address-change"),
+            })
             done, pending = await asyncio.wait(self._tasks, return_when=asyncio.FIRST_EXCEPTION)
             for task in pending:
                 task.cancel()
@@ -106,6 +111,22 @@ class Client(Server):
             self.tun.close()
             self._flush_byte_counters()
             self.store.close()
+
+    async def _address_change_loop(self) -> None:
+        """Reconnect when a usable physical address appears or changes."""
+        initial_ipv4 = self._direct_bind_ipv4
+        initial_ipv6 = self._direct_bind_ipv6
+        while True:
+            await asyncio.sleep(5)
+            current_ipv4 = self.config.direct_ipv4 or discover_direct_ipv4({self.config.tun_name})
+            current_ipv6 = self.config.direct_ipv6 or discover_direct_ipv6({self.config.tun_name})
+            if current_ipv4 != initial_ipv4 or current_ipv6 != initial_ipv6:
+                LOG.warning(
+                    "Physical addresses changed IPv4=%s->%s IPv6=%s->%s; reconnecting to re-register endpoints",
+                    initial_ipv4 or "none", current_ipv4 or "none",
+                    initial_ipv6 or "none", current_ipv6 or "none",
+                )
+                raise ConnectionError("physical direct addresses changed")
 
     async def _before_direct_data(self, reader, writer, peer_id: str) -> None:
         if peer_id != self.config.target_peer or self._configured.is_set():

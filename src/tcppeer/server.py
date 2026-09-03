@@ -77,6 +77,33 @@ def discover_direct_ipv4(excluded_interfaces: set[str] | None = None) -> str | N
     return None
 
 
+def discover_direct_ipv6(excluded_interfaces: set[str] | None = None) -> str | None:
+    """Find a usable IPv6 address on an active physical interface."""
+    excluded = excluded_interfaces or set()
+    interfaces = dict(socket.if_nameindex())
+    try:
+        rows = Path("/proc/net/if_inet6").read_text(encoding="ascii").splitlines()
+    except OSError:
+        return None
+    for row in rows:
+        fields = row.split()
+        if len(fields) != 6:
+            continue
+        raw, _index, _prefix, _scope, flags, name = fields
+        if name in excluded or name.startswith(("lo", "tun", "tap", "tailscale", "docker", "veth")):
+            continue
+        try:
+            address = str(ipaddress.IPv6Address(int(raw, 16)))
+        except ValueError:
+            continue
+        # Tentative/DAD-failed addresses must not be advertised or bound.
+        if int(flags, 16) & 0x48 or not is_usable_ipv6(address):
+            continue
+        if name in interfaces.values():
+            return address
+    return None
+
+
 class Server:
     """Own the TUN device, address services, state, and direct peer streams."""
 

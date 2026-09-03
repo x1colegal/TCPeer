@@ -541,10 +541,14 @@ class TcpPeerVpnService : VpnService() {
                             }
 
                             "ERROR" -> {
-                                throw ProtocolException(
-                                    message.field("Reason")
-                                        ?: "Coordinator rejected the request",
-                                )
+                                val reason = message.field("Reason")
+                                    ?: "Coordinator rejected the mesh request"
+                                // Once the primary tunnel is established, coordinator
+                                // errors belong to optional mesh attempts.  A peer with
+                                // no compatible endpoint must not tear down the healthy
+                                // Exit Node connection and the entire Android VPN.
+                                meshConnecting.clear()
+                                Log.w(TAG, "Mesh request rejected by coordinator: $reason")
                             }
                         }
                     } catch (_: SocketTimeoutException) {
