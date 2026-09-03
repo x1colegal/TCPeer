@@ -426,6 +426,11 @@ class TcpPeerVpnService : VpnService() {
             meshSockets[targetPeerId] = direct
             meshSocketKeys[targetPeerId] = connectionKey(direct)
             meshEndpoints[targetPeerId] = formatSocketEndpoint(direct)
+            updateConnectedUsing(
+                targetPeerId,
+                formatSocketEndpoint(direct),
+                familyLabel(family),
+            )
             val tunOutput = FileOutputStream(descriptor.fileDescriptor)
             prepareDirectListener(config.directPort, family)
             val passiveAcceptJob = launch(Dispatchers.IO) {
@@ -460,7 +465,10 @@ class TcpPeerVpnService : VpnService() {
                                     online = message.field("Online") == "yes",
                                     role = message.field("Role") ?: "Client",
                                     platform = message.field("Platform") ?: "Unknown",
-                                    transport = message.field("Transport") ?: "None",
+                                    transport = message.field("Peer-ID")?.let(meshSockets::get)
+                                        ?.let(::socketFamily)
+                                        ?: message.field("Transport")
+                                        ?: "None",
                                     ipv4 = message.field("IPv4").orEmpty().ifBlank { "-" },
                                     ipv6 = message.field("IPv6").orEmpty().ifBlank { "-" },
                                     overlayIpv4 = message.field("Overlay-IPv4").orEmpty().ifBlank { "-" },
@@ -639,7 +647,7 @@ class TcpPeerVpnService : VpnService() {
                 if (meshSockets.remove(peerId, socket)) {
                     meshSocketKeys.remove(peerId, connectionKey(socket))
                     meshEndpoints.remove(peerId)
-                    updateConnectedUsing(peerId, "-")
+                    updateConnectedUsing(peerId, "-", null)
                 }
             }
         } catch (error: Exception) {
@@ -729,7 +737,7 @@ class TcpPeerVpnService : VpnService() {
             if (meshSockets.remove(peerId, socket)) {
                 meshSocketKeys.remove(peerId, connectionKey(socket))
                 meshEndpoints.remove(peerId)
-                updateConnectedUsing(peerId, "-")
+                updateConnectedUsing(peerId, "-", null)
             }
             closeQuietly(socket)
         }
@@ -778,14 +786,17 @@ class TcpPeerVpnService : VpnService() {
                 "socket=${socketToken(socket)} initiated=$initiated local=${socket.localSocketAddress} " +
                 "remote=${socket.remoteSocketAddress} key=$key",
         )
-        updateConnectedUsing(peerId, formatSocketEndpoint(socket))
+        updateConnectedUsing(peerId, formatSocketEndpoint(socket), socketFamily(socket))
         return true
     }
 
-    private fun updateConnectedUsing(peerId: String, endpoint: String) {
+    private fun updateConnectedUsing(peerId: String, endpoint: String, transport: String?) {
         TcpPeerRuntime.update { state -> state.copy(
             devices = state.devices.map { device ->
-                if (device.peerId == peerId) device.copy(connectedUsing = endpoint) else device
+                if (device.peerId == peerId) device.copy(
+                    connectedUsing = endpoint,
+                    transport = transport ?: device.transport,
+                ) else device
             },
         ) }
     }
