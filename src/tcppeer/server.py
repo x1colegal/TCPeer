@@ -727,6 +727,7 @@ class Server:
                 return
             raise
         finally:
+            released_owner = False
             if (
                 self.direct_writers.get(peer_id) is writer
                 and self._direct_owner_tokens.get(peer_id) == token
@@ -736,6 +737,9 @@ class Server:
                 self._direct_owner_keys.pop(peer_id, None)
                 self._direct_owner_committed.discard(peer_id)
                 self.store.update_peer(peer_id, transport="Disconnected")
+                released_owner = True
+            if released_owner:
+                await self._after_direct_data(peer_id)
             with self.store.connection:
                 self.store.connection.execute(
                     "UPDATE sessions SET state='disconnected', ended_at=? WHERE session_id=?",
@@ -757,6 +761,9 @@ class Server:
 
     async def _before_direct_data(self, reader, writer, peer_id: str) -> None:
         """Hook for clients that must negotiate overlay addresses first."""
+
+    async def _after_direct_data(self, peer_id: str) -> None:
+        """Hook called when the owning direct stream has disconnected."""
 
     def _add_bytes(self, peer_id: str, column: str, amount: int) -> None:
         if column not in {"rx_bytes", "tx_bytes"}:

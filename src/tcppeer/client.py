@@ -150,6 +150,16 @@ class Client(Server):
                 break
         if ack is None or slaac is None:
             raise ProtocolError("address negotiation did not provide both DHCPv4 and SLAAC")
+        old_ipv4 = self._overlay_ipv4
+        old_ipv6 = self._overlay_ipv6
+        old_ipv4_prefix = self._overlay_ipv4_prefix
+        old_ipv6_prefix = self._overlay_ipv6_prefix
+        if old_ipv4 is not None and old_ipv4 != ack.address:
+            self._remove_overlay_route(old_ipv4, old_ipv4_prefix)
+            self.tun.remove_address(str(old_ipv4), old_ipv4_prefix)
+        if old_ipv6 is not None and old_ipv6 != slaac.address:
+            self._remove_overlay_route(old_ipv6, old_ipv6_prefix)
+            self.tun.remove_address(str(old_ipv6), old_ipv6_prefix)
         self._overlay_ipv4, self._overlay_ipv6 = ack.address, slaac.address
         self._overlay_ipv4_prefix, self._overlay_ipv6_prefix = ack.prefix_length, slaac.prefix.prefixlen
         self._active_server_ipv6 = slaac.address
@@ -162,6 +172,30 @@ class Client(Server):
             }).encode())
             await self._coordinator_writer.drain()
         LOG.info("PeerNet addresses configured IPv4=%s/%s IPv6=%s/%s use_exit_node=%s", ack.address, ack.prefix_length, slaac.address, slaac.prefix.prefixlen, self.config.use_exit_node)
+
+    async def _after_direct_data(self, peer_id: str) -> None:
+        if peer_id != self.config.target_peer:
+            return
+        self._configured.clear()
+        LOG.info(
+            "Primary peer %s disconnected; the next direct connection will renegotiate DHCPv4 and SLAAC",
+            peer_id,
+        )
+
+    def _remove_overlay_route(
+        self,
+        address: ipaddress.IPv4Address | ipaddress.IPv6Address,
+        prefix: int,
+    ) -> None:
+        network = ipaddress.ip_network(f"{address}/{prefix}", strict=False)
+        command = ["ip"]
+        if network.version == 6:
+            command.append("-6")
+        command += ["route", "delete", str(network), "dev", self.tun.name]
+        try:
+            subprocess.run(command, check=False, capture_output=True, text=True)
+        except OSError:
+            LOG.warning("Could not remove stale PeerNet route %s", network)
 
     def _configure_routes(self, ipv4_router, ipv6_prefix, dns: tuple[str, ...]) -> None:
         routes = [("ip", "route", "replace", str(ipaddress.ip_network(f"{self._overlay_ipv4}/{self._overlay_ipv4_prefix}", strict=False)), "dev", self.tun.name), ("ip", "-6", "route", "replace", str(ipv6_prefix), "dev", self.tun.name)]

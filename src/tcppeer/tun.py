@@ -50,6 +50,19 @@ class TunDevice:
             except (OSError, subprocess.CalledProcessError) as exc:
                 raise TunError(f"failed to configure {self.name}: {exc}") from exc
 
+    def remove_address(self, address: str, prefix: int) -> None:
+        """Remove a previously negotiated address before its replacement."""
+        family = ("-6",) if ":" in address else ()
+        try:
+            subprocess.run(
+                ("ip", *family, "address", "delete", f"{address}/{prefix}", "dev", self.name),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except OSError as exc:
+            raise TunError(f"failed to remove stale address from {self.name}: {exc}") from exc
+
     def read(self, size: int = 65535) -> bytes:
         if self.fd is None:
             raise TunError("TUN interface is not open")
