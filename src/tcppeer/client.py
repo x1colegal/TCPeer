@@ -41,9 +41,12 @@ class Client(Server):
         self._direct_bind_ipv4 = config.direct_ipv4 or discover_direct_ipv4({config.tun_name})
         self._direct_bind_ipv6 = config.direct_ipv6 or discover_direct_ipv6({config.tun_name})
         self._registered_ipv4 = public_address(self._direct_bind_ipv4)
-        self._registered_ipv6 = public_address(self._direct_bind_ipv6)
+        # A syntactically global IPv6 on the physical interface may still be
+        # the inside address of NAPT66. Only an address observed by the
+        # coordinator may be advertised as the public IPv6 endpoint.
+        self._registered_ipv6 = None
         self._registered_port_ipv4 = config.direct_port if self._registered_ipv4 else None
-        self._registered_port_ipv6 = config.direct_port if self._registered_ipv6 else None
+        self._registered_port_ipv6 = None
         self._direct_candidates = {}
         self._direct_connect_tasks = {}
         self._direct_adoption_lock = asyncio.Lock()
@@ -71,6 +74,37 @@ class Client(Server):
 
     def _registration_overlays(self) -> tuple[str, str]:
         return str(self._overlay_ipv4 or ""), str(self._overlay_ipv6 or "")
+
+    async def _query_observed_endpoint(
+        self, family: socket.AddressFamily,
+    ) -> tuple[str, int] | None:
+        """Discover NAPT endpoints without colliding with the punch socket."""
+        reserved = self._direct_candidates.pop(family, None)
+        if reserved is not None:
+            reserved.close()
+        try:
+            return await super()._query_observed_endpoint(family)
+        finally:
+            local_address = (
+                self._direct_bind_ipv6 if family == socket.AF_INET6
+                else self._direct_bind_ipv4
+            ) or ("::" if family == socket.AF_INET6 else "0.0.0.0")
+            candidate = socket.socket(family, socket.SOCK_STREAM, socket.IPPROTO_TCP)
+            candidate.setblocking(False)
+            candidate.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if hasattr(socket, "SO_REUSEPORT"):
+                candidate.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            try:
+                candidate.bind((local_address, self.config.direct_port))
+            except OSError as exc:
+                candidate.close()
+                LOG.warning(
+                    "Could not restore TCP%s hole-punch candidate after endpoint discovery: %s",
+                    6 if family == socket.AF_INET6 else 4,
+                    exc,
+                )
+            else:
+                self._direct_candidates[family] = candidate
 
     async def run(self) -> None:
         self.tun.open()
