@@ -41,6 +41,9 @@ from tcppeer.tun import TunDevice
 
 LOG = logging.getLogger("tcppeer.server")
 
+CONTROL_IDLE_SECONDS = 30
+CONTROL_REPLY_TIMEOUT_SECONDS = 15
+
 
 def public_address(address: str | None) -> str | None:
     if not address:
@@ -382,12 +385,7 @@ class Server:
         refresh_task.add_done_callback(self._tasks.discard)
 
         while True:
-            try:
-                message = await asyncio.wait_for(read_control(reader), timeout=30)
-            except TimeoutError:
-                writer.write(ControlMessage("KEEPALIVE", {}).encode())
-                await writer.drain()
-                continue
+            message = await self._read_control_alive(reader, writer)
             if message.command == "PING":
                 writer.write(ControlMessage("PONG", {}).encode())
                 await writer.drain()
@@ -431,6 +429,25 @@ class Server:
             elif message.command in {"DISCONNECT", "AUTH-ERROR"}:
                 raise ConnectionError(message.get("Reason", "coordinator disconnected"))
 
+    async def _read_control_alive(self, reader, writer) -> ControlMessage:
+        """Read control traffic while detecting a black-holed TCP session."""
+        try:
+            return await asyncio.wait_for(
+                read_control(reader), timeout=CONTROL_IDLE_SECONDS,
+            )
+        except TimeoutError:
+            writer.write(ControlMessage("KEEPALIVE", {}).encode())
+            await writer.drain()
+            try:
+                # Any valid control message confirms bidirectional liveness;
+                # it may race with the expected PONG.
+                return await asyncio.wait_for(
+                    read_control(reader), timeout=CONTROL_REPLY_TIMEOUT_SECONDS,
+                )
+            except TimeoutError as exc:
+                raise ConnectionError(
+                    "coordinator control connection did not answer keepalive"
+                ) from exc
     def _update_peer_from_directory(self, peer_id: str, message: ControlMessage) -> None:
         values: dict[str, object] = {
             "overlay_ipv4": message.get("Overlay-IPv4") or None,
