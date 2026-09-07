@@ -25,6 +25,8 @@ from tcppeer.transport import is_usable_ipv6
 
 LOG = logging.getLogger("tcppeer.coordinator")
 
+CONTROL_PONG_TIMEOUT_SECONDS = 15
+
 
 @dataclass
 class RegisteredPeer:
@@ -162,7 +164,34 @@ class Coordinator:
             await self.send(writer, "AUTH-OK", **{"Peer-ID": peer_id})
             await self.send(writer, "ENDPOINT-INFO", Address=observed_address, Port=str(observed_port))
             while True:
-                message = await read_control(reader, self.config.max_message_size)
+                try:
+                    message = await asyncio.wait_for(
+                        read_control(reader, self.config.max_message_size),
+                        timeout=self.config.keepalive_seconds,
+                    )
+                except TimeoutError:
+                    LOG.debug(
+                        "Peer %s idle for %ss; sending liveness probe",
+                        peer.peer_id,
+                        self.config.keepalive_seconds,
+                    )
+                    await self.send(writer, "PING")
+                    try:
+                        # Any complete authenticated control message proves the
+                        # socket is alive. Requiring PONG specifically could
+                        # discard a concurrent list/register message and is not
+                        # necessary for failure detection.
+                        message = await asyncio.wait_for(
+                            read_control(reader, self.config.max_message_size),
+                            timeout=CONTROL_PONG_TIMEOUT_SECONDS,
+                        )
+                    except TimeoutError:
+                        LOG.warning(
+                            "Peer %s liveness timeout after %ss; marking offline",
+                            peer.peer_id,
+                            CONTROL_PONG_TIMEOUT_SECONDS,
+                        )
+                        break
                 await self.handle_message(peer, message)
         except (ProtocolError, asyncio.IncompleteReadError) as exc:
             if not writer.is_closing():
