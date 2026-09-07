@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import json
-import ipaddress
 import re
 import subprocess
 
@@ -37,7 +36,7 @@ class ExitNodeFirewall:
         self.interface = interface
         self.nat66_enabled = config.nat66
 
-    def apply(self, protected_ipv6: ipaddress.IPv6Address | None = None) -> None:
+    def apply(self) -> None:
         if self.config.exit_node_enabled:
             self._run(("sysctl", "-q", "-w", "net.ipv4.ip_forward=1"))
             self._run(("sysctl", "-q", "-w", "net.ipv6.conf.all.forwarding=1"))
@@ -45,7 +44,7 @@ class ExitNodeFirewall:
         upstream = self._upstream_interfaces() if (
             self.config.exit_node_enabled and self.config.software_flow_offload
         ) else ()
-        rules = self._ruleset(upstream, protected_ipv6)
+        rules = self._ruleset(upstream)
         try:
             subprocess.run(
                 ("nft", "-f", "-"), input=rules, text=True,
@@ -60,7 +59,7 @@ class ExitNodeFirewall:
             self._delete_tables()
             try:
                 subprocess.run(
-                    ("nft", "-f", "-"), input=self._ruleset((), protected_ipv6), text=True,
+                    ("nft", "-f", "-"), input=self._ruleset(()), text=True,
                     check=True, capture_output=True,
                 )
             except subprocess.CalledProcessError as fallback_exc:
@@ -75,11 +74,7 @@ class ExitNodeFirewall:
     def close(self) -> None:
         self._delete_tables()
 
-    def _ruleset(
-        self,
-        upstream: tuple[str, ...] = (),
-        protected_ipv6: ipaddress.IPv6Address | None = None,
-    ) -> str:
+    def _ruleset(self, upstream: tuple[str, ...] = ()) -> str:
         tun = self.interface
         flowtable = ""
         flow_rules = ""
@@ -93,17 +88,9 @@ class ExitNodeFirewall:
             flow_rules = f'''    iifname "{tun}" oifname != "{tun}" ct state established,related flow add @fastpath
     iifname != "{tun}" oifname "{tun}" ct state established,related flow add @fastpath
 '''
-        protected_input = ""
-        if protected_ipv6 is not None:
-            protected_input = (
-                f'    iifname != "{tun}" iifname != "lo" '
-                f'ip6 daddr {protected_ipv6.compressed} counter drop\n'
-            )
         sections = ['''table inet tcppeer_input {
   chain input {
     type filter hook input priority filter; policy accept;
-''' + protected_input + f'''    iifname "{tun}" meta l4proto {{ tcp, udp, icmp, ipv6-icmp }} accept
-''' + '''
     meta l4proto { tcp, udp } accept
     meta l4proto { icmp, ipv6-icmp } accept
   }

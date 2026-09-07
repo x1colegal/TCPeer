@@ -158,7 +158,7 @@ class Server:
             str(self._active_server_ipv6), self._active_ipv6_prefix.prefixlen,
         )
         self.exit_node.interface = self.tun.name
-        self.exit_node.apply(self._active_server_ipv6)
+        self.exit_node.apply()
         try:
             self._prepare_direct_candidates()
             control_task = asyncio.create_task(self._control_loop(), name="control")
@@ -1115,7 +1115,7 @@ class Server:
             )
 
             self.exit_node.nat66_enabled = False
-            self.exit_node.apply(self._active_server_ipv6)
+            self.exit_node.apply()
 
             await self._broadcast_direct(self._ra_packet())
 
@@ -1129,7 +1129,7 @@ class Server:
             self._active_ipv6_prefix.prefixlen,
         )
 
-        self.exit_node.apply(self._active_server_ipv6)
+        self.exit_node.apply()
 
         await self._broadcast_direct(self._ra_packet())
 
