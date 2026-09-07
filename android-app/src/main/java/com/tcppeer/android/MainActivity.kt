@@ -1018,7 +1018,9 @@ private fun DeviceCard(device: NetworkDevice, isSelf: Boolean, onPing: () -> Uni
                     DetailRow("Role", device.role)
                     DetailRow("Platform", device.platform)
                     DetailRow("Transport", device.transport)
-                    DetailRow("Connected using", device.connectedUsing)
+                    if (!isSelf) {
+                        DetailRow("Direct connection endpoint", device.connectedUsing)
+                    }
                     DetailRow("Public IPv4", device.ipv4)
                     DetailRow("Public IPv6", device.ipv6)
                     DetailRow("PeerNet IPv4", device.overlayIpv4)
