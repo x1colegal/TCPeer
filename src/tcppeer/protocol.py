@@ -365,7 +365,27 @@ def encode_data(packet: bytes) -> bytes:
     if version not in (4, 6):
         raise ProtocolError("DATA is neither IPv4 nor IPv6")
 
-    return packet
+    # A TUN read normally returns exactly one IP packet, but some kernel
+    # offload paths may append bytes beyond the length carried by the IP
+    # header.  Sending those bytes on a framing-free TCP stream permanently
+    # desynchronizes the receiver: the first padding byte becomes the next IP
+    # version.  Keep RAW-IP semantics by transmitting exactly the datagram
+    # described by its own header.
+    if version == 4:
+        if len(packet) < 20:
+            raise ProtocolError("truncated IPv4 header")
+        wire_length = int.from_bytes(packet[2:4], "big")
+        ihl = (packet[0] & 0x0f) * 4
+        if ihl < 20 or wire_length < ihl:
+            raise ProtocolError("invalid IPv4 packet length")
+    else:
+        if len(packet) < 40:
+            raise ProtocolError("truncated IPv6 header")
+        wire_length = 40 + int.from_bytes(packet[4:6], "big")
+
+    if wire_length > len(packet):
+        raise ProtocolError("truncated IP packet")
+    return packet[:wire_length]
 
 
 def _parse_tcpd_header(header: bytes) -> dict[str, str]:
@@ -722,4 +742,3 @@ async def read_data(reader) -> bytes:
     raise ProtocolError(
         f"invalid raw IP version in DATA stream: {version}"
     )
-

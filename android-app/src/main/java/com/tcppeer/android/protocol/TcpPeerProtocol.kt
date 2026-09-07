@@ -325,7 +325,28 @@ object TcpPeerProtocol {
                 "DATA is neither IPv4 nor IPv6"
             )
 
-        output.write(packet, offset, length)
+        val wireLength = when (version) {
+            4 -> {
+                if (length < 20) throw ProtocolException("Truncated IPv4 header")
+                val ihl = (packet[offset].toInt() and 0x0f) * 4
+                val declared =
+                    ((packet[offset + 2].toInt() and 0xff) shl 8) or
+                    (packet[offset + 3].toInt() and 0xff)
+                if (ihl < 20 || declared < ihl) throw ProtocolException("Invalid IPv4 packet length")
+                declared
+            }
+            else -> {
+                if (length < 40) throw ProtocolException("Truncated IPv6 header")
+                40 + (((packet[offset + 4].toInt() and 0xff) shl 8) or
+                    (packet[offset + 5].toInt() and 0xff))
+            }
+        }
+        if (wireLength > length) throw ProtocolException("Truncated IP packet")
+
+        // RAW-IP has no framing.  Write only the datagram length declared in
+        // its IP header so kernel/offload padding cannot become a fake next
+        // packet and desynchronize the TCP stream.
+        output.write(packet, offset, wireLength)
     }
 
     fun readData(input: InputStream): ByteArray {

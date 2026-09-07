@@ -42,7 +42,16 @@ class TcpPeerProtocolTest {
     @Test
     fun binaryIpv4AndIpv6RoundTrip() {
         listOf(4, 6).forEach { version ->
-            val packet = ByteArray(64).also { it[0] = (version shl 4).toByte() }
+            val packet = ByteArray(64).also {
+                it[0] = if (version == 4) 0x45 else 0x60
+                if (version == 4) {
+                    it[2] = 0
+                    it[3] = 64
+                } else {
+                    it[4] = 0
+                    it[5] = 24
+                }
+            }
             val output = ByteArrayOutputStream()
             TcpPeerProtocol.writeData(output, packet)
             assertArrayEquals(packet, TcpPeerProtocol.readData(ByteArrayInputStream(output.toByteArray())))
@@ -51,11 +60,28 @@ class TcpPeerProtocolTest {
 
     @Test
     fun dataHeaderAndPayloadUseOneOutputWrite() {
-        val packet = ByteArray(1_400).also { it[0] = 0x60 }
+        val packet = ByteArray(1_400).also {
+            it[0] = 0x60
+            it[4] = 0x05
+            it[5] = 0x50
+        }
         val output = WriteCountingOutput()
         TcpPeerProtocol.writeData(output, packet)
         assertEquals(1, output.writes)
         assertArrayEquals(packet, TcpPeerProtocol.readData(ByteArrayInputStream(output.toByteArray())))
+    }
+
+    @Test
+    fun trailingTunBytesCannotDesynchronizeRawIpStream() {
+        val padded = ByteArray(80).also {
+            it[0] = 0x60
+            it[4] = 0
+            it[5] = 24
+        }
+        val output = ByteArrayOutputStream()
+        TcpPeerProtocol.writeData(output, padded)
+        assertEquals(64, output.size())
+        assertArrayEquals(padded.copyOf(64), TcpPeerProtocol.readData(ByteArrayInputStream(output.toByteArray())))
     }
 
     @Test
