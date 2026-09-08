@@ -627,7 +627,7 @@ private fun ConnectionHero(
         ) {
             Box(contentAlignment = Alignment.Center) {
                 androidx.compose.foundation.Image(
-                    painterResource(R.drawable.ic_launcher_foreground),
+                    painterResource(R.drawable.tcppeer_logo),
                     null,
                     Modifier.size(82.dp),
                 )
