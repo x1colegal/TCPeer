@@ -43,6 +43,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Devices
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.PlayArrow
@@ -232,7 +233,7 @@ private fun TcpPeerScreen(
                 NavigationBarItem(
                     selected = selectedTab == RootTab.PEERS,
                     onClick = { selectedTab = RootTab.PEERS },
-                    icon = { Icon(Icons.Default.Info, null) },
+                    icon = { Icon(Icons.Default.Devices, null) },
                     label = { Text("Peers") },
                 )
                 NavigationBarItem(
@@ -480,6 +481,42 @@ private fun HelpTab(
             HelpTopic(
                 title = "What is TCP-over-TCP meltdown?",
                 body = "TCP-over-TCP meltdown is the classic performance pathology that appears when a reliable ordered TCP stream is tunneled through another reliable ordered TCP stream. When loss or latency spikes occur, the outer TCP layer retransmits and delays bytes, while the inner TCP layer also interprets the same disruption as congestion or packet loss. Both layers back off, both layers retransmit, and both layers may amplify queueing delay. The consequence can be severe throughput collapse, bursty recovery behavior, latency inflation, and very uneven performance. This is especially painful for interactive traffic, bulk transfers over unstable links, and VPN-style tunneling.",
+            ),
+            HelpTopic(
+                title = "What is a mesh network?",
+                body = "A mesh network is a topology in which participating devices can establish paths directly to one another instead of sending every packet through one permanent central gateway. In TCPeer, the Coordinator remains part of the control plane for authentication, discovery, endpoint exchange, and connection timing, but successful peer traffic uses direct TCP4 or TCP6 sessions. This reduces unnecessary path length and prevents the Coordinator from becoming the default bandwidth bottleneck. The tradeoff is complexity: every peer must track multiple sessions, NAT traversal must succeed for each pair, and one working connection to an Exit Node does not automatically prove that the rest of the mesh is healthy.",
+            ),
+            HelpTopic(
+                title = "What is UDP-over-TCP?",
+                body = "UDP-over-TCP occurs when an application creates UDP datagrams but a VPN or tunnel transports the resulting IP packets through an outer TCP byte stream. TCPeer does this whenever DNS, voice, game, video, QUIC, or another UDP-based flow crosses its current TCP data plane. The inner UDP payload is still UDP from the applications' perspective, but delivery across the direct peer path inherits the ordering, retransmission, flow-control, and congestion-control behavior of outer TCP. This can be useful on networks that block or heavily restrict native UDP, but it also changes the timing properties that led the application to choose UDP in the first place.",
+            ),
+            HelpTopic(
+                title = "What are the benefits of UDP-over-TCP?",
+                body = "The main benefit of UDP-over-TCP is reachability. TCP is commonly permitted through restrictive access networks, enterprise firewalls, mobile providers, and captive environments where arbitrary UDP may be filtered or rate-limited. Outer TCP also guarantees ordered, duplicate-free delivery, automatically retransmits lost bytes, adapts its sending rate to congestion, and provides backpressure when the receiver cannot keep up. Those properties can make small request-and-response protocols behave predictably on clean links. They do not make every UDP workload better, however: reliability added below an application that expects loss can increase latency and memory pressure instead of improving the user experience.",
+            ),
+            HelpTopic(
+                title = "What are the drawbacks of UDP-over-TCP?",
+                body = "The largest drawback is head-of-line blocking. TCP cannot expose later bytes until every earlier missing byte has been retransmitted, even when those later bytes belong to independent UDP datagrams that would still be useful. A single lost outer TCP segment can therefore pause DNS replies, voice frames, game updates, and unrelated flows sharing that peer connection. Retransmitting time-sensitive data may also be pointless because the information can arrive after its playback or simulation deadline. Under loss, congestion, or rapidly changing mobile conditions, the result can be latency spikes, bursty delivery, jitter, queue growth, and unfair interaction with congestion control inside protocols such as QUIC.",
+            ),
+            HelpTopic(
+                title = "How can UDP-over-TCP affect VoIP?",
+                body = "VoIP normally sends short audio frames over RTP or a similar UDP-based media path. A late voice frame is usually less valuable than the next frame, so real-time receivers use jitter buffers and tolerate some packet loss rather than waiting indefinitely. When VoIP crosses TCPeer's outer TCP stream, a lost TCP segment can block every later audio frame until retransmission completes. On a stable low-loss path this may be unnoticeable and TCP can help the call cross a UDP-blocking network. On an unstable path it can cause pauses, robotic bursts, growing mouth-to-ear delay, or temporary silence. TCP preserves the bytes, but preserving every byte is not the same as preserving real-time quality.",
+            ),
+            HelpTopic(
+                title = "What are latency, jitter, and packet loss?",
+                body = "Latency is the time required for traffic to travel to a peer and usually back again when measured as round-trip time. Jitter is the variation in that delay between successive packets. Packet loss means some packets never arrive. These metrics describe different failure modes: a path can have moderate stable latency and still support a call, while low average latency with large jitter spikes can sound terrible. TCP retransmission can hide packet loss from the application, but the recovery appears as extra latency and jitter. Continuous TPP ping is useful for observing delay and timeouts, although application performance can also depend on queueing, packet size, route selection, and traffic load.",
+            ),
+            HelpTopic(
+                title = "What is head-of-line blocking?",
+                body = "Head-of-line blocking happens when later data that has already arrived cannot be delivered because an earlier piece is missing. TCP exposes one ordered byte stream, so the receiver must wait for the gap to be repaired. Inside a VPN, that single ordered stream may contain many unrelated inner flows. Loss affecting one outer segment can then delay packets belonging to several applications at once. UDP itself does not impose ordered delivery across independent datagrams, which is why real-time protocols can ignore obsolete missing data and continue. TCPeer accepts this tradeoff today in exchange for a TCP-only direct transport that works in environments where UDP connectivity may be unavailable.",
+            ),
+            HelpTopic(
+                title = "How do DNS and QUIC behave through TCPeer?",
+                body = "Most ordinary DNS queries use UDP, while modern HTTP/3 uses QUIC over UDP. Both remain valid inner IP traffic inside TCPeer, but their packets travel over the outer TCP connection. Small DNS exchanges often work well, although one lost TCP segment can delay unrelated queries sharing the same peer stream. QUIC is more complicated because it already implements reliability, stream multiplexing, loss recovery, and congestion control above UDP. Carrying QUIC through TCP can hide the network's real loss pattern and introduce outer head-of-line blocking that QUIC was designed to avoid. HTTP/3 can still function, but its latency and recovery advantages may be reduced.",
+            ),
+            HelpTopic(
+                title = "Why can a speed test look good while calls or games feel bad?",
+                body = "A bulk speed test rewards sustained throughput and can fill available buffers continuously. Voice calls, games, remote shells, and interactive applications care much more about delay variation and how quickly short messages are delivered. TCP buffering and retransmission may produce excellent megabits-per-second results while creating occasional pauses that are obvious to a person. This is why bandwidth alone is not a complete measure of tunnel quality. Round-trip latency, jitter under load, loss recovery time, bufferbloat, and connection stability must also be considered when evaluating TCPeer for real-time use.",
             ),
             HelpTopic(
                 title = "Why does TCPeer use TCP on the external transport layer and not UDP?",
