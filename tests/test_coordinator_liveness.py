@@ -48,7 +48,7 @@ class CoordinatorLivenessTests(unittest.IsolatedAsyncioTestCase):
         known = coordinator.known_peers[("home", "phone")]
         self.assertFalse(known.online)
         sent = b"".join(call.args[0] for call in writer.write.call_args_list)
-        self.assertIn(b"TCPeer/1.0 PING\r\n", sent)
+        self.assertIn(b"TPCP/2 PING\r\n", sent)
         coordinator.store.close()
 
     def _state_path(self):

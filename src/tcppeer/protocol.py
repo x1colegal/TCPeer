@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import struct
 from typing import Mapping
 
-PROTOCOL = "TCPeer/1.0"
+PROTOCOL = "TPCP/2"
 BLOCK_END = b"\r\n\r\n"
 MAX_CONTROL_SIZE = 16_384
 DATA_MAGIC = b"TCPD"

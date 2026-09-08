@@ -5,9 +5,11 @@ from __future__ import annotations
 import hashlib
 import hmac
 
+from .protocol import PROTOCOL
+
 
 def authentication_proof(secret: str, network: str, peer_id: str, nonce: str) -> str:
-    message = f"TCPeer/1.0\n{network}\n{peer_id}\n{nonce}".encode("ascii")
+    message = f"{PROTOCOL}\n{network}\n{peer_id}\n{nonce}".encode("ascii")
     return hmac.new(secret.encode("ascii"), message, hashlib.sha256).hexdigest()
 
 

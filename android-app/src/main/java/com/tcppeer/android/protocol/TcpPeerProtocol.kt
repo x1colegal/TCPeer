@@ -6,7 +6,7 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.nio.charset.StandardCharsets
 
-private const val PROTOCOL = "TCPeer/1.0"
+internal const val CONTROL_PROTOCOL = "TPCP/2"
 private const val MAX_CONTROL_SIZE = 16_384
 private const val MAX_PACKET_SIZE = 65_535
 
@@ -23,7 +23,7 @@ data class ControlMessage(
     fun encode(): ByteArray {
         require(command.matches(Regex("[A-Z][A-Z0-9-]*"))) { "Invalid control command" }
         val text = buildString {
-            append(PROTOCOL).append(' ').append(command).append("\r\n")
+            append(CONTROL_PROTOCOL).append(' ').append(command).append("\r\n")
             fields.forEach { (name, value) ->
                 require(name.isNotEmpty() && ':' !in name && '\r' !in name && '\n' !in name) {
                     "Invalid control field name"
@@ -61,7 +61,7 @@ object TcpPeerProtocol {
         if (text.any { it.code > 127 }) throw ProtocolException("Control messages must contain ASCII only")
         val lines = text.removeSuffix("\r\n\r\n").split("\r\n")
         val header = lines.firstOrNull()?.split(' ', limit = 2)
-        if (header?.size != 2 || header[0] != PROTOCOL) throw ProtocolException("Invalid control header")
+        if (header?.size != 2 || header[0] != CONTROL_PROTOCOL) throw ProtocolException("Invalid control header")
         val fields = linkedMapOf<String, String>()
         lines.drop(1).forEach { line ->
             val separator = line.indexOf(": ")

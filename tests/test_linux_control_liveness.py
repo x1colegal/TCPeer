@@ -24,7 +24,7 @@ class LinuxControlLivenessTests(unittest.IsolatedAsyncioTestCase):
                 await server._read_control_alive(reader, writer)
 
         sent = b"".join(call.args[0] for call in writer.write.call_args_list)
-        self.assertIn(b"TCPeer/1.0 KEEPALIVE\r\n", sent)
+        self.assertIn(b"TPCP/2 KEEPALIVE\r\n", sent)
         writer.drain.assert_awaited_once()
 
 

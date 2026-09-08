@@ -426,6 +426,30 @@ Control-plane messages have their own protocol.
 
 They are not raw IP packets.
 
+### TPCP/2
+
+**TPCP** means **TCPeer Control Protocol**. `TPCP/2` is the protocol and
+version identifier carried at the beginning of every TCPeer control-plane
+message exchanged by Coordinators, Exit Nodes, Linux Clients, and Android
+Clients.
+
+TPCP is responsible for control operations such as authentication, peer and
+endpoint registration, peer discovery, direct-connection coordination,
+address negotiation, device synchronization, keepalives, and disconnect
+signaling. A control message starts with the `TPCP/2` identifier followed by
+its command, for example:
+
+```text
+TPCP/2 REGISTER
+Peer-ID: android-phone
+Network: home
+```
+
+TPCP does not carry tunneled Internet or PeerNet traffic. After a direct TCP4
+or TCP6 connection is established, the TCPeer data plane continues to carry
+raw IPv4 and IPv6 packets without a TPCP, TCPD, or other per-packet wrapper.
+TPCP is also distinct from **TPP**, the IPv6-only TCPPeerPing protocol.
+
 ## Data plane
 
 After direct connectivity is established, the peer-to-peer data stream carries:
