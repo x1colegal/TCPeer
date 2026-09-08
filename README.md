@@ -426,29 +426,55 @@ Control-plane messages have their own protocol.
 
 They are not raw IP packets.
 
-### TPCP/2
+### TCPeer Control Protocol
 
-**TPCP** means **TCPeer Control Protocol**. `TPCP/2` is the protocol and
-version identifier carried at the beginning of every TCPeer control-plane
-message exchanged by Coordinators, Exit Nodes, Linux Clients, and Android
-Clients.
+**TPCP** means **TCPeer Control Protocol**. It is TCPeer's application-layer
+control protocol and is shared by Coordinators, Exit Nodes, Linux Clients, and
+Android Clients. TPCP gives every implementation the same vocabulary and
+state transitions for joining a PeerNet and arranging direct peer-to-peer
+connections.
 
-TPCP is responsible for control operations such as authentication, peer and
-endpoint registration, peer discovery, direct-connection coordination,
-address negotiation, device synchronization, keepalives, and disconnect
-signaling. A control message starts with the `TPCP/2` identifier followed by
-its command, for example:
+TPCP runs over a persistent TCP control connection between each peer and the
+Coordinator. Messages are cleartext ASCII blocks terminated by an empty CRLF
+line. The first line contains the TPCP wire-version identifier and a command;
+the remaining lines contain command-specific `Name: Value` fields. The wire
+version is deliberately not fixed in this document because it can change as
+the control protocol evolves. Peers must use a mutually compatible version;
+an unsupported identifier is rejected instead of being interpreted as a
+different message format.
 
-```text
-TPCP/2 REGISTER
-Peer-ID: android-phone
-Network: home
-```
+TPCP is responsible for:
 
-TPCP does not carry tunneled Internet or PeerNet traffic. After a direct TCP4
-or TCP6 connection is established, the TCPeer data plane continues to carry
-raw IPv4 and IPv6 packets without a TPCP, TCPD, or other per-packet wrapper.
-TPCP is also distinct from **TPP**, the IPv6-only TCPPeerPing protocol.
+- Issuing authentication challenges and validating HMAC-SHA256 proofs
+- Associating a Peer ID with an authenticated PeerNet
+- Registering platform, role, transport, address, and endpoint information
+- Reporting observed public IPv4 and IPv6 endpoints
+- Distributing local and public connection candidates
+- Coordinating TCP simultaneous-open and TCP hole punching
+- Exchanging readiness and start signals for direct connections
+- Negotiating PeerNet IPv4 and IPv6 address information
+- Synchronizing online and offline device state
+- Maintaining control-connection liveness with keepalives
+- Reporting protocol errors and orderly disconnects
+
+The Secret Key is never included directly in a TPCP message. Authentication
+uses a Coordinator-provided nonce and an HMAC proof bound to the protocol
+identifier, PeerNet name, Peer ID, and nonce. This proves knowledge of the
+shared Secret Key, but it does not encrypt the control connection or provide
+confidentiality for its metadata.
+
+The Coordinator uses TPCP only as a control-plane rendezvous point. It can
+authenticate peers, observe their endpoints, select candidates, and tell both
+sides when to begin simultaneous-open, but it does not relay their tunneled
+traffic. Losing the TPCP connection affects discovery, state synchronization,
+and future connection coordination; it does not turn the Coordinator into a
+data-plane path.
+
+TPCP ends at the control plane. Once a direct TCP4 or TCP6 connection is
+established, TCPeer carries raw IPv4 and IPv6 packets on the peer-to-peer data
+stream without a TPCP, TCPD, or other per-packet wrapper. TPCP is also distinct
+from **TPP**, the IPv6-only TCPPeerPing protocol carried inside an IPv6 packet
+with Next Header 99.
 
 ## Data plane
 
