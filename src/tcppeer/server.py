@@ -728,9 +728,9 @@ class Server:
                 self._add_bytes(peer_id, "rx_bytes", len(packet))
                 await self._handle_peer_packet(packet, writer, peer_id)
         except ProtocolError as exc:
-            if packet_count == 0 and "connection closed while reading IP version" in str(exc):
+            if "connection closed while reading IP version" in str(exc):
                 LOG.info(
-                    "direct-adopt early-eof ts=%.6f peer_id=%s family=%s attempt=%s initiated=%s fd=%s local=%s remote=%s reason=%s",
+                    "direct-adopt eof ts=%.6f peer_id=%s family=%s attempt=%s initiated=%s fd=%s local=%s remote=%s packets=%s reason=%s",
                     time.time(),
                     peer_id,
                     "tcp6" if family == socket.AF_INET6 else "tcp4",
@@ -739,6 +739,7 @@ class Server:
                     self._socket_fd(writer),
                     self._sockname_text(writer),
                     self._peername_text(writer),
+                    packet_count,
                     exc,
                 )
                 return

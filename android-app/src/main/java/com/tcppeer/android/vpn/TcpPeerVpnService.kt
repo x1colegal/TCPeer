@@ -104,6 +104,7 @@ class TcpPeerVpnService : VpnService() {
 
     override fun onCreate() {
         super.onCreate()
+        TcpPeerRuntime.setServiceActive(true)
         createNotificationChannel()
         connectivityManager = getSystemService(ConnectivityManager::class.java)
         connectivityManager.registerDefaultNetworkCallback(networkCallback)
@@ -125,6 +126,7 @@ class TcpPeerVpnService : VpnService() {
     override fun onDestroy() {
         runCatching { connectivityManager.unregisterNetworkCallback(networkCallback) }
         closeResources()
+        TcpPeerRuntime.setServiceActive(false)
         serviceScope.cancel()
         super.onDestroy()
     }
@@ -1403,6 +1405,7 @@ class TcpPeerVpnService : VpnService() {
         connectionJob?.cancel()
         closeResources()
         TcpPeerRuntime.replace(VpnRuntimeState())
+        TcpPeerRuntime.setServiceActive(false)
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }

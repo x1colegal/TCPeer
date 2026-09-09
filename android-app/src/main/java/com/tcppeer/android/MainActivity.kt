@@ -127,9 +127,11 @@ class MainActivity : ComponentActivity() {
             ) {
                 ApplySystemBars(window = window, appTheme = configuration.appTheme)
                 val runtime by TcpPeerRuntime.state.collectAsStateWithLifecycle()
+                val serviceActive by TcpPeerRuntime.serviceActive.collectAsStateWithLifecycle()
                 TcpPeerScreen(
                     configuration = configuration,
                     runtime = runtime,
+                    serviceActive = serviceActive,
                     onConfigurationChange = { updated ->
                         configuration = updated
                         runCatching { store.save(updated) }
@@ -181,6 +183,7 @@ private enum class SettingsSection {
 private fun TcpPeerScreen(
     configuration: VpnConfiguration,
     runtime: VpnRuntimeState,
+    serviceActive: Boolean,
     onConfigurationChange: (VpnConfiguration) -> Unit,
     onConnect: (VpnConfiguration) -> Unit,
     onDisconnect: () -> Unit,
@@ -190,7 +193,7 @@ private fun TcpPeerScreen(
     // NO_DIRECT_CONNECTION is a retry state, not a user-requested disconnect.
     // Keep the switch on while the foreground service owns the VPN session so
     // the next tap reliably means "disconnect" instead of a lost connect tap.
-    val active = runtime.status != ConnectionStatus.DISCONNECTED
+    val active = serviceActive
     val connected = runtime.status == ConnectionStatus.COORDINATOR_ONLY ||
         runtime.status == ConnectionStatus.TCP4_DIRECT ||
         runtime.status == ConnectionStatus.TCP6_DIRECT

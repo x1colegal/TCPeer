@@ -215,6 +215,14 @@ class Client(Server):
             "Primary peer %s disconnected; the next direct connection will renegotiate DHCPv4 and SLAAC",
             peer_id,
         )
+        writer = getattr(self, "_coordinator_writer", None)
+        if writer is not None and not writer.is_closing():
+            try:
+                writer.write(ControlMessage("PUNCH-READY", {"Peer-ID": peer_id}).encode())
+                await writer.drain()
+                LOG.info("Requested a fresh direct connection to primary peer %s", peer_id)
+            except (ConnectionError, OSError) as exc:
+                LOG.warning("Could not request immediate reconnect to primary peer %s: %s", peer_id, exc)
 
     def _remove_overlay_route(
         self,

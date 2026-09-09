@@ -47,6 +47,8 @@ data class VpnRuntimeState(
 object TcpPeerRuntime {
     private val mutableState = MutableStateFlow(VpnRuntimeState())
     val state: StateFlow<VpnRuntimeState> = mutableState.asStateFlow()
+    private val mutableServiceActive = MutableStateFlow(false)
+    val serviceActive: StateFlow<Boolean> = mutableServiceActive.asStateFlow()
     private val mutablePingTarget = MutableStateFlow<TppPingRequest?>(null)
     val pingTarget: StateFlow<TppPingRequest?> = mutablePingTarget.asStateFlow()
 
@@ -56,6 +58,10 @@ object TcpPeerRuntime {
 
     fun replace(value: VpnRuntimeState) {
         mutableState.value = value
+    }
+
+    fun setServiceActive(active: Boolean) {
+        mutableServiceActive.value = active
     }
 
     fun startContinuousPing(peerId: String, ipv6: String) {
