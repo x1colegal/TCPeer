@@ -1289,29 +1289,38 @@ class TcpPeerVpnService : VpnService() {
         val properties = connectivityManager.activeNetwork?.let(connectivityManager::getLinkProperties)
         val excluded = properties?.linkAddresses.orEmpty()
             .filterNot { it.address.isAnyLocalAddress || it.address.isLoopbackAddress }
-            .map { IpPrefix(it.address, it.prefixLength) }
+            // IpPrefix(InetAddress, int) was added only in API 33. Keep the
+            // common representation API-26-safe and construct IpPrefix only
+            // inside the guarded Android 13+ branch below.
+            .map { RoutePrefix(it.address.address, it.prefixLength) }
             // An overlapping physical prefix cannot be excluded without also
             // bypassing the TCPeer overlay. In that ambiguous case VPN wins.
-            .filterNot { it.contains(tunnelIpv4) || it.contains(tunnelIpv6) }
-            .distinctBy(IpPrefix::toString)
+            .filterNot { contains(it, tunnelIpv4.address) || contains(it, tunnelIpv6.address) }
+            .distinctBy { "${InetAddress.getByAddress(it.address).hostAddress}/${it.prefixLength}" }
         if (useExitNode) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 builder.addRoute("0.0.0.0", 0).addRoute("::", 0)
-                excluded.forEach(builder::excludeRoute)
+                excluded.forEach {
+                    builder.excludeRoute(IpPrefix(InetAddress.getByAddress(it.address), it.prefixLength))
+                }
             } else {
                 var routes = listOf(
                     RoutePrefix(ByteArray(4), 0),
                     RoutePrefix(ByteArray(16), 0),
                 )
                 excluded.forEach { prefix ->
-                    val blocked = RoutePrefix(prefix.address.address, prefix.prefixLength)
-                    routes = routes.flatMap { subtractPrefix(it, blocked) }
+                    routes = routes.flatMap { route -> subtractPrefix(route, prefix) }
                 }
                 routes.forEach { builder.addRoute(InetAddress.getByAddress(it.address), it.prefixLength) }
             }
         }
         if (excluded.isNotEmpty()) {
-            Log.i(TAG, "Keeping directly connected networks outside TCPeer: ${excluded.joinToString()}")
+            Log.i(
+                TAG,
+                "Keeping directly connected networks outside TCPeer: " + excluded.joinToString {
+                    "${InetAddress.getByAddress(it.address).hostAddress}/${it.prefixLength}"
+                },
+            )
         }
     }
 
