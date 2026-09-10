@@ -133,8 +133,16 @@ class MainActivity : ComponentActivity() {
                     runtime = runtime,
                     serviceActive = serviceActive,
                     onConfigurationChange = { updated ->
+                        val renamed = updated.deviceName != configuration.deviceName
                         configuration = updated
                         runCatching { store.save(updated) }
+                        if (renamed && serviceActive) {
+                            startService(
+                                Intent(this, TcpPeerVpnService::class.java)
+                                    .setAction(TcpPeerVpnService.ACTION_RENAME_DEVICE)
+                                    .putExtra(TcpPeerVpnService.EXTRA_DEVICE_NAME, updated.deviceName),
+                            )
+                        }
                     },
                     onConnect = ::requestVpn,
                     onDisconnect = ::stopVpn,
@@ -267,6 +275,7 @@ private fun TcpPeerScreen(
                 modifier = Modifier.padding(innerPadding),
                 configuration = configuration,
                 runtime = runtime,
+                onRenameSelf = { name -> onConfigurationChange(configuration.copy(deviceName = name)) },
             )
             RootTab.SETTINGS -> SettingsTab(
                 modifier = Modifier.padding(innerPadding),
@@ -313,7 +322,7 @@ private fun HomeTab(
         item {
             InfoCard(
                 title = configuration.network,
-                body = "This device joins your PeerNet as ${configuration.peerId}. " +
+                body = "This device joins your PeerNet as ${configuration.deviceName}. " +
                     "This screen shows the current connection state, short transport logs, and the active overlay addresses.",
             )
         }
@@ -350,6 +359,7 @@ private fun PeersTab(
     modifier: Modifier = Modifier,
     configuration: VpnConfiguration,
     runtime: VpnRuntimeState,
+    onRenameSelf: (String) -> Unit,
 ) {
     LazyColumn(
         modifier = modifier.fillMaxSize(),
@@ -392,6 +402,7 @@ private fun PeersTab(
                 DeviceCard(
                     device = device,
                     isSelf = device.peerId == configuration.peerId,
+                    onRename = onRenameSelf,
                 ) {
                     TcpPeerRuntime.startContinuousPing(device.peerId, device.overlayIpv6)
                 }
@@ -766,14 +777,13 @@ private fun NetworkSettingsPanel(
                 Text("Network Settings", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
             }
             Text(
-                "Choose the coordinator address, the identity of this device, the preferred peer, and the basic transport parameters for the PeerNet session.",
+                "Choose the coordinator address, preferred peer, and basic transport parameters for the PeerNet session. This device's stable identity is managed automatically.",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.bodyMedium,
             )
             SettingsField(configuration.coordinatorAddress, { onConfigurationChange(configuration.copy(coordinatorAddress = it)) }, "Coordinator DNS name or IP", active)
             SettingsField(configuration.coordinatorPort.toString(), { it.toIntOrNull()?.let { value -> onConfigurationChange(configuration.copy(coordinatorPort = value)) } }, "Coordinator TCP port", active, true)
             SettingsField(configuration.network, { onConfigurationChange(configuration.copy(network = it)) }, "PeerNet name", active)
-            SettingsField(configuration.peerId, { onConfigurationChange(configuration.copy(peerId = it)) }, "This peer ID", active)
             Surface(color = MaterialTheme.colorScheme.surfaceContainerHighest, shape = RoundedCornerShape(20.dp)) {
                 Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
@@ -997,8 +1007,15 @@ private fun SettingsField(value: String, onValueChange: (String) -> Unit, label:
 }
 
 @Composable
-private fun DeviceCard(device: NetworkDevice, isSelf: Boolean, onPing: () -> Unit) {
+private fun DeviceCard(
+    device: NetworkDevice,
+    isSelf: Boolean,
+    onRename: (String) -> Unit,
+    onPing: () -> Unit,
+) {
     var expanded by remember { mutableStateOf(false) }
+    var renaming by remember { mutableStateOf(false) }
+    var editedName by remember(device.displayName) { mutableStateOf(device.displayName) }
     val context = androidx.compose.ui.platform.LocalContext.current
 
     fun copyAddress(label: String, value: String) {
@@ -1028,7 +1045,7 @@ private fun DeviceCard(device: NetworkDevice, isSelf: Boolean, onPing: () -> Uni
                     }
                     Spacer(Modifier.size(13.dp))
                     Column {
-                        Text(device.peerId, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                        Text(device.displayName, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                         Text(
                             "${device.role} • ${if (device.online) "Online" else "Offline"}",
                             style = MaterialTheme.typography.bodySmall,
@@ -1056,6 +1073,7 @@ private fun DeviceCard(device: NetworkDevice, isSelf: Boolean, onPing: () -> Uni
                         style = MaterialTheme.typography.bodySmall,
                     )
                     DetailRow("Status", if (device.online) "Online" else "Offline")
+                    DetailRow("Peer ID", device.peerId)
                     DetailRow("Role", device.role)
                     DetailRow("Platform", device.platform)
                     DetailRow("Transport", device.transport)
@@ -1087,6 +1105,42 @@ private fun DeviceCard(device: NetworkDevice, isSelf: Boolean, onPing: () -> Uni
                             enabled = device.online && device.overlayIpv6 != "-",
                             modifier = Modifier.fillMaxWidth(),
                         ) { Text("Open continuous TPP ping") }
+                    } else {
+                        Button(
+                            onClick = { editedName = device.displayName; renaming = true },
+                            modifier = Modifier.fillMaxWidth(),
+                        ) { Text("Rename this device") }
+                    }
+                }
+            }
+        }
+    }
+    if (renaming) {
+        Dialog(onDismissRequest = { renaming = false }) {
+            Surface(shape = RoundedCornerShape(28.dp), tonalElevation = 6.dp) {
+                Column(
+                    Modifier.fillMaxWidth().padding(22.dp),
+                    verticalArrangement = Arrangement.spacedBy(16.dp),
+                ) {
+                    Text("Rename this device", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                    Text(
+                        "This changes only the visible name. The stable Peer ID remains unchanged, so no duplicate or ghost device is created.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    OutlinedTextField(
+                        value = editedName,
+                        onValueChange = { editedName = it.filter { char -> char.code in 32..126 }.take(64) },
+                        label = { Text("Device name") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        TextButton(onClick = { renaming = false }, modifier = Modifier.weight(1f)) { Text("Cancel") }
+                        Button(
+                            onClick = { onRename(editedName.trim()); renaming = false },
+                            enabled = editedName.trim().isNotEmpty(),
+                            modifier = Modifier.weight(1f),
+                        ) { Text("Save") }
                     }
                 }
             }

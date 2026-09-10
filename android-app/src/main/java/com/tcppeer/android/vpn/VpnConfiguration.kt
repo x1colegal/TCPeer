@@ -1,7 +1,9 @@
 package com.tcppeer.android.vpn
 
 import android.content.Context
+import android.os.Build
 import androidx.core.content.edit
+import java.util.UUID
 
 enum class AppThemeMode(val storageValue: String, val label: String) {
     LIGHT("light", "Light"),
@@ -45,6 +47,7 @@ data class VpnConfiguration(
     val coordinatorPort: Int = 7443,
     val network: String = "home",
     val peerId: String = "android",
+    val deviceName: String = "Android device",
     val secret: String = "",
     val useExitNode: Boolean = true,
     val targetPeerId: String = "main-server",
@@ -59,6 +62,9 @@ data class VpnConfiguration(
         require(coordinatorPort in 1..65535) { "Coordinator port must be between 1 and 65535" }
         require(network.isNotBlank() && network.all { it.code in 1..127 }) { "Network must be ASCII" }
         require(peerId.isNotBlank() && peerId.all { it.code in 1..127 }) { "Peer ID must be ASCII" }
+        require(deviceName.length in 1..64 && deviceName.all { it.code in 32..126 }) {
+            "Device name must contain 1-64 printable ASCII characters"
+        }
         require(secret.all { it.code in 0..127 }) { "Secret must be ASCII" }
         require(targetPeerId.isNotBlank() && targetPeerId.all { it.code in 1..127 }) {
             "Server or exit node peer ID must be ASCII"
@@ -71,11 +77,26 @@ data class VpnConfiguration(
 class ConfigurationStore(context: Context) {
     private val preferences = context.getSharedPreferences("tcppeer", Context.MODE_PRIVATE)
 
+    private fun stablePeerId(): String {
+        preferences.getString("peer_id", null)?.takeIf { it.isNotBlank() }?.let { return it }
+        val generated = "android-${UUID.randomUUID().toString().take(12)}"
+        preferences.edit(commit = true) { putString("peer_id", generated) }
+        return generated
+    }
+
+    private fun defaultDeviceName(): String = Build.MODEL
+        .filter { it.code in 32..126 }
+        .trim()
+        .take(64)
+        .ifBlank { "Android device" }
+
     fun load(): VpnConfiguration = VpnConfiguration(
         coordinatorAddress = preferences.getString("coordinator_address", "") ?: "",
         coordinatorPort = preferences.getInt("coordinator_port", 7443),
         network = preferences.getString("network", "home") ?: "home",
-        peerId = preferences.getString("peer_id", "android") ?: "android",
+        peerId = stablePeerId(),
+        deviceName = preferences.getString("device_name", null)?.takeIf { it.isNotBlank() }
+            ?: defaultDeviceName(),
         secret = preferences.getString("secret", "") ?: "",
         useExitNode = preferences.getBoolean("use_exit_node", true),
         targetPeerId = preferences.getString("target_peer_id", "main-server") ?: "main-server",
@@ -94,6 +115,7 @@ class ConfigurationStore(context: Context) {
             putInt("coordinator_port", value.coordinatorPort)
             putString("network", value.network)
             putString("peer_id", value.peerId)
+            putString("device_name", value.deviceName)
             putString("secret", value.secret)
             putBoolean("use_exit_node", value.useExitNode)
             putString("target_peer_id", value.targetPeerId)

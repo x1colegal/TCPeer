@@ -59,7 +59,7 @@ def main() -> None:
             if not lines:
                 print("No known devices.")
                 return
-            print("NETWORK\tPEER-ID\tSTATUS\tROLE\tPLATFORM\tTRANSPORT\tIPv4\tIPv6\tOVERLAY IPv4\tOVERLAY IPv6\tENDPOINT\tLAST SEEN")
+            print("NETWORK\tPEER-ID\tNAME\tSTATUS\tROLE\tPLATFORM\tTRANSPORT\tIPv4\tIPv6\tOVERLAY IPv4\tOVERLAY IPv6\tENDPOINT\tLAST SEEN")
             for line in lines:
                 fields = line.split("\t")
                 if fields and fields[0] == "DEVICE":

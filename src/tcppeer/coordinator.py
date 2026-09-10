@@ -35,6 +35,7 @@ class RegisteredPeer:
     writer: Any
     observed_address: str
     observed_port: int
+    display_name: str = ""
     declared_ipv4: str | None = None
     declared_ipv6: str | None = None
     mapped_ipv4_port: int | None = None
@@ -53,6 +54,7 @@ class RegisteredPeer:
 class KnownPeer:
     network: str
     peer_id: str
+    display_name: str = ""
     online: bool = True
     role: str = "Client"
     platform: str = "Unknown"
@@ -223,6 +225,11 @@ class Coordinator:
 
     async def handle_message(self, peer: RegisteredPeer, message: ControlMessage) -> None:
         if message.command == "REGISTER":
+            display_name = message.get("Device-Name") or peer.peer_id
+            if not self._valid_display_name(display_name):
+                await self.send(peer.writer, "ERROR", Reason="invalid device name")
+                return
+            peer.display_name = display_name
             peer.declared_ipv4 = message.get("IPv4")
             peer.declared_ipv6 = message.get("IPv6")
             mapped_ipv4_port = message.get("Mapped-IPv4-Port")
@@ -236,6 +243,7 @@ class Coordinator:
             peer.role = message.get("Role") or "Client"
             peer.platform = message.get("Platform") or "Unknown"
             known = self.known_peers[(peer.network, peer.peer_id)]
+            known.display_name = display_name
             known.role = peer.role
             known.platform = peer.platform
             known.ipv4 = peer.declared_ipv4 or ""
@@ -269,6 +277,18 @@ class Coordinator:
                 known.overlay_ipv4 or "-",
                 known.overlay_ipv6 or "-",
             )
+        elif message.command == "PEER-INFO" and message.get("Action") == "Rename":
+            display_name = message.get("Device-Name") or ""
+            if not self._valid_display_name(display_name):
+                await self.send(peer.writer, "ERROR", Reason="invalid device name")
+                return
+            peer.display_name = display_name
+            known = self.known_peers[(peer.network, peer.peer_id)]
+            known.display_name = display_name
+            known.last_seen = int(time.time())
+            self._persist(known)
+            await self.send(peer.writer, "PEER-INFO", Action="Rename-OK", **{"Device-Name": display_name})
+            LOG.info("Peer %s renamed to %s", peer.peer_id, display_name)
         elif message.command in {"PING", "KEEPALIVE"}:
             await self.send(peer.writer, "PONG")
         elif message.command == "PUNCH-READY":
@@ -303,6 +323,10 @@ class Coordinator:
         admin_socket.chmod(0o660)
         LOG.info("Coordinator admin socket listening on %s", admin_socket)
 
+    @staticmethod
+    def _valid_display_name(value: str) -> bool:
+        return 1 <= len(value) <= 64 and all(32 <= ord(char) <= 126 for char in value)
+
     async def _handle_admin_client(self, reader, writer) -> None:
         try:
             line = (
@@ -314,7 +338,8 @@ class Coordinator:
             if parts == ["LIST"]:
                 for known in sorted(self.known_peers.values(), key=lambda item: (item.network, item.peer_id)):
                     writer.write(("DEVICE\t" + "\t".join((
-                        known.network, known.peer_id, "online" if known.online else "offline",
+                        known.network, known.peer_id, known.display_name or known.peer_id,
+                        "online" if known.online else "offline",
                         known.role, known.platform, known.transport, known.ipv4 or "-",
                         known.ipv6 or "-", known.overlay_ipv4 or "-", known.overlay_ipv6 or "-",
                         known.endpoint or "-", str(known.last_seen),
@@ -404,6 +429,7 @@ class Coordinator:
             await self.send(peer.writer, "PEER-INFO", **{
                 "Action": "Device",
                 "Peer-ID": known.peer_id,
+                "Device-Name": known.display_name or known.peer_id,
                 "Online": "yes" if known.online else "no",
                 "Role": known.role,
                 "Platform": known.platform,

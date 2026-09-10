@@ -15,6 +15,7 @@ enum class ConnectionStatus(val label: String) {
 
 data class NetworkDevice(
     val peerId: String,
+    val displayName: String,
     val online: Boolean,
     val role: String,
     val platform: String,

@@ -10,6 +10,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS known_peers (
     network TEXT NOT NULL,
     peer_id TEXT NOT NULL,
+    display_name TEXT NOT NULL DEFAULT '',
     role TEXT NOT NULL DEFAULT 'Client',
     platform TEXT NOT NULL DEFAULT 'Unknown',
     transport TEXT NOT NULL DEFAULT 'None',
@@ -28,7 +29,7 @@ class CoordinatorStore:
     """SQLite-backed inventory; online state intentionally remains ephemeral."""
 
     FIELDS = (
-        "network", "peer_id", "role", "platform", "transport", "ipv4", "ipv6",
+        "network", "peer_id", "display_name", "role", "platform", "transport", "ipv4", "ipv6",
         "overlay_ipv4", "overlay_ipv6", "endpoint", "last_seen",
     )
 
@@ -39,6 +40,9 @@ class CoordinatorStore:
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA journal_mode = WAL")
         self.connection.executescript(SCHEMA)
+        columns = {row[1] for row in self.connection.execute("PRAGMA table_info(known_peers)")}
+        if "display_name" not in columns:
+            self.connection.execute("ALTER TABLE known_peers ADD COLUMN display_name TEXT NOT NULL DEFAULT ''")
         self.connection.commit()
 
     def load(self) -> list[sqlite3.Row]:

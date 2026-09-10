@@ -152,9 +152,25 @@ class TcpPeerVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_DISCONNECT -> disconnect()
+            ACTION_RENAME_DEVICE -> renameDevice(intent.getStringExtra(EXTRA_DEVICE_NAME).orEmpty())
             else -> if (connectionJob?.isActive != true) connect()
         }
         return Service.START_NOT_STICKY
+    }
+
+    private fun renameDevice(displayName: String) {
+        if (displayName.length !in 1..64 || displayName.any { it.code !in 32..126 }) return
+        serviceScope.launch {
+            runCatching {
+                coordinatorSocket?.takeUnless { it.isClosed }?.getOutputStream()?.let { output ->
+                    synchronized(output) {
+                        TcpPeerProtocol.writeControl(output, ControlMessage("PEER-INFO", linkedMapOf(
+                            "Action" to "Rename", "Device-Name" to displayName,
+                        )))
+                    }
+                }
+            }.onFailure { Log.w(TAG, "Could not rename this device while connected", it) }
+        }
     }
 
     override fun onRevoke() {
@@ -318,6 +334,7 @@ class TcpPeerVpnService : VpnService() {
 
         TcpPeerProtocol.writeControl(controlOutput, ControlMessage("REGISTER", linkedMapOf(
             "Peer-ID" to config.peerId,
+            "Device-Name" to config.deviceName,
             "IPv4" to advertisedIpv4,
             "IPv6" to advertisedIpv6,
             "Mapped-IPv4-Port" to (mappedIpv4Port?.toString() ?: ""),
@@ -511,6 +528,8 @@ class TcpPeerVpnService : VpnService() {
                             "PEER-INFO" -> when (message.field("Action")) {
                                 "Device" -> devices += NetworkDevice(
                                     peerId = message.field("Peer-ID") ?: "unknown",
+                                    displayName = message.field("Device-Name")
+                                        ?: message.field("Peer-ID") ?: "Unknown device",
                                     online = message.field("Online") == "yes",
                                     role = message.field("Role") ?: "Client",
                                     platform = message.field("Platform") ?: "Unknown",
@@ -970,6 +989,8 @@ class TcpPeerVpnService : VpnService() {
                 }
                 "Device" -> devices += NetworkDevice(
                     peerId = message.field("Peer-ID") ?: "unknown",
+                    displayName = message.field("Device-Name")
+                        ?: message.field("Peer-ID") ?: "Unknown device",
                     online = message.field("Online") == "yes",
                     role = message.field("Role") ?: "Client",
                     platform = message.field("Platform") ?: "Unknown",
@@ -1567,6 +1588,8 @@ class TcpPeerVpnService : VpnService() {
     companion object {
         const val ACTION_CONNECT = "com.tcppeer.android.CONNECT"
         const val ACTION_DISCONNECT = "com.tcppeer.android.DISCONNECT"
+        const val ACTION_RENAME_DEVICE = "com.tcppeer.android.RENAME_DEVICE"
+        const val EXTRA_DEVICE_NAME = "device_name"
         private const val CHANNEL_ID = "tcppeer_vpn"
         private const val NOTIFICATION_ID = 7443
         private const val COORDINATOR_TIMEOUT_MS = 35_000

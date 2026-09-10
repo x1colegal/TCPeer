@@ -351,6 +351,7 @@ class Server:
         overlay_ipv4, overlay_ipv6 = self._registration_overlays()
         writer.write(ControlMessage("REGISTER", {
             "Peer-ID": self.config.peer_id,
+            "Device-Name": self.store.metadata("device_name", self.config.peer_id),
             "IPv4": self._registered_ipv4 or "",
             "IPv6": self._registered_ipv6 or "",
             "Mapped-IPv4-Port": str(self._registered_port_ipv4 or ""),
@@ -885,9 +886,28 @@ class Server:
                 await asyncio.wait_for(reader.readline(), timeout=5)
             ).decode("ascii").strip()
 
+            if line.startswith("RENAME "):
+                display_name = line[7:].strip()
+                if not (1 <= len(display_name) <= 64) or any(
+                    not 32 <= ord(char) <= 126 for char in display_name
+                ):
+                    writer.write(b"ERROR device name must contain 1-64 printable ASCII characters\n")
+                    await writer.drain()
+                    return
+                self.store.set_metadata("device_name", display_name)
+                coordinator = self._coordinator_writer
+                if coordinator is not None and not coordinator.is_closing():
+                    coordinator.write(ControlMessage("PEER-INFO", {
+                        "Action": "Rename", "Device-Name": display_name,
+                    }).encode())
+                    await coordinator.drain()
+                writer.write(f"OK renamed to {display_name}\n".encode("ascii"))
+                await writer.drain()
+                return
+
             parts = line.split()
             if len(parts) != 2 or parts[0] != "PING":
-                writer.write(b"ERROR expected: PING <peer-id>\n")
+                writer.write(b"ERROR expected: PING <peer-id> or RENAME <device-name>\n")
                 await writer.drain()
                 return
 

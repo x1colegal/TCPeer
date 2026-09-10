@@ -11,6 +11,7 @@ from pathlib import Path
 import sqlite3
 import sys
 import time
+import socket
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -69,6 +70,10 @@ def run_command(config: LinuxConfig, command: str, peer_id: str | None = None) -
             if command == "status":
                 connected = sum(row["transport"] not in {"Disconnected", "No Direct Connection"} for row in peers)
                 role = "Client" if isinstance(config, ClientConfig) else "Server"
+                name_row = connection.execute(
+                    "SELECT value FROM metadata WHERE key='device_name'",
+                ).fetchone()
+                print(f"{role} device name: {name_row[0] if name_row else config.peer_id}")
                 print(f"{role} peer ID: {config.peer_id}")
                 print(f"TUN interface: {config.tun_name}")
                 print(f"Connected peers: {connected}")
@@ -90,7 +95,6 @@ def run_command(config: LinuxConfig, command: str, peer_id: str | None = None) -
 
 def _run_ping(config: LinuxConfig, peer_id: str) -> None:
     import re
-    import socket
     import statistics
 
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -173,11 +177,28 @@ def _run_ping(config: LinuxConfig, peer_id: str) -> None:
                 )
 
 
+def _rename_device(name: str) -> None:
+    if not (1 <= len(name) <= 64) or any(not 32 <= ord(char) <= 126 for char in name):
+        raise SystemExit("Device name must contain 1-64 printable ASCII characters")
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        client.connect("/run/tcppeer/server-admin.sock")
+        client.sendall(f"RENAME {name}\n".encode("ascii"))
+        response = client.makefile("r", encoding="ascii").readline().strip()
+    finally:
+        client.close()
+    if response.startswith("ERROR "):
+        raise SystemExit(response[6:])
+    if not response.startswith("OK "):
+        raise SystemExit("TCPeer service returned an invalid rename response")
+    print(response[3:])
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Inspect TCPeer Linux server or client state")
     parser.add_argument("--config", help="configuration file (auto-detects server.toml or client.toml by default)")
-    parser.add_argument("command", choices=("status", "peers", "leases", "sessions", "addresses", "transport", "stats", "ping"))
-    parser.add_argument("peer_id", nargs="?")
+    parser.add_argument("command", choices=("status", "peers", "leases", "sessions", "addresses", "transport", "stats", "ping", "rename"))
+    parser.add_argument("peer_id", nargs="?", help="Peer-ID, or the new device name for rename")
     return parser
 
 
@@ -190,6 +211,10 @@ def main() -> None:
             if not args.peer_id:
                 raise SystemExit("Usage: tcppeer ping <peer-id>")
             _run_ping(config, args.peer_id)
+        elif args.command == "rename":
+            if not args.peer_id:
+                raise SystemExit('Usage: tcppeer rename "Device name"')
+            _rename_device(args.peer_id)
         else:
             run_command(config, args.command, args.peer_id)
     except (OSError, ConfigurationError, sqlite3.Error) as exc:

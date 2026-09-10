@@ -72,6 +72,20 @@ class StateStore:
     def close(self) -> None:
         self.connection.close()
 
+    def metadata(self, key: str, default: str = "") -> str:
+        row = self.connection.execute(
+            "SELECT value FROM metadata WHERE key = ?", (key,),
+        ).fetchone()
+        return str(row[0]) if row is not None else default
+
+    def set_metadata(self, key: str, value: str) -> None:
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO metadata(key, value) VALUES(?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
+            )
+
     @contextmanager
     def immediate(self) -> Iterator[sqlite3.Connection]:
         self.connection.execute("BEGIN IMMEDIATE")
