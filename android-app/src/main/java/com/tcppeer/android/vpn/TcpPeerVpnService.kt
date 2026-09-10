@@ -564,7 +564,7 @@ class TcpPeerVpnService : VpnService() {
                                         state.copy(
                                             devices = devices.sortedWith(
                                                 compareByDescending<NetworkDevice> { it.online }
-                                                    .thenBy { it.peerId },
+                                                    .thenBy { it.displayName.lowercase() },
                                             ),
                                         )
                                     }
@@ -983,7 +983,7 @@ class TcpPeerVpnService : VpnService() {
             when (message.field("Action")) {
                 "List-End" -> {
                     TcpPeerRuntime.update { state -> state.copy(devices = devices.sortedWith(
-                        compareByDescending<NetworkDevice> { it.online }.thenBy { it.peerId },
+                        compareByDescending<NetworkDevice> { it.online }.thenBy { it.displayName.lowercase() },
                     )) }
                     return
                 }

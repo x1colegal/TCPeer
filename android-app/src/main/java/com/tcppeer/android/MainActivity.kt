@@ -275,7 +275,12 @@ private fun TcpPeerScreen(
                 modifier = Modifier.padding(innerPadding),
                 configuration = configuration,
                 runtime = runtime,
-                onRenameSelf = { name -> onConfigurationChange(configuration.copy(deviceName = name)) },
+                onRenameSelf = { name, automatic ->
+                    onConfigurationChange(configuration.copy(
+                        deviceName = name,
+                        automaticDeviceName = automatic,
+                    ))
+                },
             )
             RootTab.SETTINGS -> SettingsTab(
                 modifier = Modifier.padding(innerPadding),
@@ -359,7 +364,7 @@ private fun PeersTab(
     modifier: Modifier = Modifier,
     configuration: VpnConfiguration,
     runtime: VpnRuntimeState,
-    onRenameSelf: (String) -> Unit,
+    onRenameSelf: (String, Boolean) -> Unit,
 ) {
     LazyColumn(
         modifier = modifier.fillMaxSize(),
@@ -1010,7 +1015,7 @@ private fun SettingsField(value: String, onValueChange: (String) -> Unit, label:
 private fun DeviceCard(
     device: NetworkDevice,
     isSelf: Boolean,
-    onRename: (String) -> Unit,
+    onRename: (String, Boolean) -> Unit,
     onPing: () -> Unit,
 ) {
     var expanded by remember { mutableStateOf(false) }
@@ -1137,11 +1142,18 @@ private fun DeviceCard(
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         TextButton(onClick = { renaming = false }, modifier = Modifier.weight(1f)) { Text("Cancel") }
                         Button(
-                            onClick = { onRename(editedName.trim()); renaming = false },
+                            onClick = { onRename(editedName.trim(), false); renaming = false },
                             enabled = editedName.trim().isNotEmpty(),
                             modifier = Modifier.weight(1f),
                         ) { Text("Save") }
                     }
+                    TextButton(
+                        onClick = {
+                            onRename(ConfigurationStore(context).automaticDeviceName(), true)
+                            renaming = false
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("Use automatic device name") }
                 }
             }
         }

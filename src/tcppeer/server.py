@@ -468,6 +468,7 @@ class Server:
                 ) from exc
     def _update_peer_from_directory(self, peer_id: str, message: ControlMessage) -> None:
         values: dict[str, object] = {
+            "display_name": message.get("Device-Name") or peer_id,
             "overlay_ipv4": message.get("Overlay-IPv4") or None,
             "overlay_ipv6": message.get("Overlay-IPv6") or None,
         }

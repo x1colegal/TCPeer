@@ -2,6 +2,7 @@ package com.tcppeer.android.vpn
 
 import android.content.Context
 import android.os.Build
+import android.provider.Settings
 import androidx.core.content.edit
 import java.util.UUID
 
@@ -48,6 +49,7 @@ data class VpnConfiguration(
     val network: String = "home",
     val peerId: String = "android",
     val deviceName: String = "Android device",
+    val automaticDeviceName: Boolean = true,
     val secret: String = "",
     val useExitNode: Boolean = true,
     val targetPeerId: String = "main-server",
@@ -74,7 +76,7 @@ data class VpnConfiguration(
     }
 }
 
-class ConfigurationStore(context: Context) {
+class ConfigurationStore(private val context: Context) {
     private val preferences = context.getSharedPreferences("tcppeer", Context.MODE_PRIVATE)
 
     private fun stablePeerId(): String {
@@ -84,19 +86,30 @@ class ConfigurationStore(context: Context) {
         return generated
     }
 
-    private fun defaultDeviceName(): String = Build.MODEL
+    private fun defaultDeviceName(): String = (
+        Settings.Global.getString(context.contentResolver, "device_name")
+            ?: Settings.Secure.getString(context.contentResolver, "bluetooth_name")
+            ?: Build.MODEL
+    )
         .filter { it.code in 32..126 }
         .trim()
         .take(64)
         .ifBlank { "Android device" }
+
+    fun automaticDeviceName(): String = defaultDeviceName()
 
     fun load(): VpnConfiguration = VpnConfiguration(
         coordinatorAddress = preferences.getString("coordinator_address", "") ?: "",
         coordinatorPort = preferences.getInt("coordinator_port", 7443),
         network = preferences.getString("network", "home") ?: "home",
         peerId = stablePeerId(),
-        deviceName = preferences.getString("device_name", null)?.takeIf { it.isNotBlank() }
-            ?: defaultDeviceName(),
+        automaticDeviceName = preferences.getBoolean("automatic_device_name", true),
+        deviceName = if (preferences.getBoolean("automatic_device_name", true)) {
+            defaultDeviceName()
+        } else {
+            preferences.getString("device_name", null)?.takeIf { it.isNotBlank() }
+                ?: defaultDeviceName()
+        },
         secret = preferences.getString("secret", "") ?: "",
         useExitNode = preferences.getBoolean("use_exit_node", true),
         targetPeerId = preferences.getString("target_peer_id", "main-server") ?: "main-server",
@@ -116,6 +129,7 @@ class ConfigurationStore(context: Context) {
             putString("network", value.network)
             putString("peer_id", value.peerId)
             putString("device_name", value.deviceName)
+            putBoolean("automatic_device_name", value.automaticDeviceName)
             putString("secret", value.secret)
             putBoolean("use_exit_node", value.useExitNode)
             putString("target_peer_id", value.targetPeerId)

@@ -423,7 +423,7 @@ class Coordinator:
     async def _send_device_list(self, peer: RegisteredPeer) -> None:
         devices = sorted(
             (known for known in self.known_peers.values() if known.network == peer.network),
-            key=lambda known: (not known.online, known.peer_id),
+            key=lambda known: (not known.online, (known.display_name or known.peer_id).casefold(), known.peer_id),
         )
         for known in devices:
             await self.send(peer.writer, "PEER-INFO", **{

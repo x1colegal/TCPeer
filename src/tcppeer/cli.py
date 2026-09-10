@@ -62,11 +62,12 @@ def _load_config(path: str | Path) -> LinuxConfig:
     return ServerConfig.from_file(config_path)
 
 
-def run_command(config: LinuxConfig, command: str, peer_id: str | None = None) -> None:
+def run_command(config: LinuxConfig, command: str, use_peer_id: bool = False) -> None:
     connection = sqlite3.connect(f"file:{config.state_db}?mode=ro", uri=True)
     try:
         if command in {"status", "peers", "addresses", "transport", "stats"}:
-            peers = _rows(connection, "SELECT * FROM peers ORDER BY peer_id")
+            peers = _rows(connection, "SELECT COALESCE(NULLIF(display_name, ''), peer_id) AS name, * FROM peers ORDER BY name")
+            identity = "peer_id" if use_peer_id else "name"
             if command == "status":
                 connected = sum(row["transport"] not in {"Disconnected", "No Direct Connection"} for row in peers)
                 role = "Client" if isinstance(config, ClientConfig) else "Server"
@@ -78,13 +79,13 @@ def run_command(config: LinuxConfig, command: str, peer_id: str | None = None) -
                 print(f"TUN interface: {config.tun_name}")
                 print(f"Connected peers: {connected}")
             elif command == "peers":
-                _print_table(peers, ["peer_id", "overlay_ipv4", "overlay_ipv6", "transport", "endpoint"])
+                _print_table(peers, [identity, "overlay_ipv4", "overlay_ipv6", "transport", "endpoint"])
             elif command == "addresses":
-                _print_table(peers, ["peer_id", "overlay_ipv4", "overlay_ipv6"])
+                _print_table(peers, [identity, "overlay_ipv4", "overlay_ipv6"])
             elif command == "transport":
-                _print_table(peers, ["peer_id", "transport", "endpoint"])
+                _print_table(peers, [identity, "transport", "endpoint"])
             else:
-                _print_table(peers, ["peer_id", "rx_bytes", "tx_bytes", "connected_at"])
+                _print_table(peers, [identity, "rx_bytes", "tx_bytes", "connected_at"])
         elif command == "leases":
             _print_table(_rows(connection, "SELECT * FROM leases ORDER BY address"), ["client_id", "address", "state", "starts_at", "expires_at"])
         elif command == "sessions":
@@ -194,11 +195,31 @@ def _rename_device(name: str) -> None:
     print(response[3:])
 
 
+def _resolve_peer(config: LinuxConfig, value: str, use_peer_id: bool) -> str:
+    if use_peer_id:
+        return value
+    connection = sqlite3.connect(f"file:{config.state_db}?mode=ro", uri=True)
+    try:
+        rows = connection.execute(
+            "SELECT peer_id FROM peers WHERE display_name = ? OR "
+            "(COALESCE(display_name, '') = '' AND peer_id = ?)",
+            (value, value),
+        ).fetchall()
+    finally:
+        connection.close()
+    if not rows:
+        raise SystemExit(f"Unknown device name: {value}. Use --peer-id to select by Peer ID.")
+    if len(rows) > 1:
+        raise SystemExit(f"Device name is ambiguous: {value}. Use --peer-id with the exact Peer ID.")
+    return str(rows[0][0])
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Inspect TCPeer Linux server or client state")
     parser.add_argument("--config", help="configuration file (auto-detects server.toml or client.toml by default)")
+    parser.add_argument("--peer-id", action="store_true", dest="use_peer_id", help="show and select peers by stable Peer ID instead of device name")
     parser.add_argument("command", choices=("status", "peers", "leases", "sessions", "addresses", "transport", "stats", "ping", "rename"))
-    parser.add_argument("peer_id", nargs="?", help="Peer-ID, or the new device name for rename")
+    parser.add_argument("target", nargs="?", help="Device name, or a Peer-ID when --peer-id is used")
     return parser
 
 
@@ -208,15 +229,15 @@ def main() -> None:
         config_path = Path(args.config) if args.config else _default_config_path()
         config = _load_config(config_path)
         if args.command == "ping":
-            if not args.peer_id:
-                raise SystemExit("Usage: tcppeer ping <peer-id>")
-            _run_ping(config, args.peer_id)
+            if not args.target:
+                raise SystemExit('Usage: tcppeer ping "Device name" [--peer-id]')
+            _run_ping(config, _resolve_peer(config, args.target, args.use_peer_id))
         elif args.command == "rename":
-            if not args.peer_id:
+            if not args.target:
                 raise SystemExit('Usage: tcppeer rename "Device name"')
-            _rename_device(args.peer_id)
+            _rename_device(args.target)
         else:
-            run_command(config, args.command, args.peer_id)
+            run_command(config, args.command, args.use_peer_id)
     except (OSError, ConfigurationError, sqlite3.Error) as exc:
         raise SystemExit(f"Cannot read TCPeer state: {exc}") from exc
 
