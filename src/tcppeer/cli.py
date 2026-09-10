@@ -222,7 +222,13 @@ def _resolve_peer(config: LinuxConfig, value: str, use_peer_id: bool) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Inspect TCPeer Linux server or client state")
+    parser = argparse.ArgumentParser(
+        description="Inspect TCPeer Linux server or client state",
+        usage=(
+            "tcppeer [--config CONFIG] COMMAND [TARGET]\n\n"
+            "Peer selection: (--peer-id: Optional. Use Peer ID instead of Device Name.)"
+        ),
+    )
     parser.add_argument("--config", help="configuration file (auto-detects server.toml or client.toml by default)")
     parser.add_argument(
         "--peer-id", action="store_true", dest="use_peer_id",
@@ -244,7 +250,10 @@ def main() -> None:
         config = _load_config(config_path)
         if args.command == "ping":
             if not args.target:
-                raise SystemExit('Usage: tcppeer ping "Device name" [--peer-id]')
+                raise SystemExit(
+                    'Usage: tcppeer ping "Device Name"\n'
+                    '(--peer-id: Optional. Use Peer ID instead of Device Name.)'
+                )
             _run_ping(config, _resolve_peer(config, args.target, args.use_peer_id))
         elif args.command == "rename":
             if args.automatic and args.target:

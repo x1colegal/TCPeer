@@ -1318,6 +1318,12 @@ tcppeer rename "My device name"
 tcppeer rename --automatic
 ```
 
+For commands that select or display peers:
+
+```text
+(--peer-id: Optional. Use Peer ID instead of Device Name.)
+```
+
 `tcppeer rename` changes only the device name shown by PeerNet clients. The
 stable Peer ID from the Linux configuration remains unchanged, so leases,
 authentication, mesh identity, and the coordinator's persisted record are
