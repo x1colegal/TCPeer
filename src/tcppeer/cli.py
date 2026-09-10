@@ -224,10 +224,8 @@ def _resolve_peer(config: LinuxConfig, value: str, use_peer_id: bool) -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Inspect TCPeer Linux server or client state",
-        usage=(
-            "tcppeer [--config CONFIG] COMMAND [TARGET]\n\n"
-            "Peer selection: (--peer-id: Optional. Use Peer ID instead of Device Name.)"
-        ),
+        usage="tcppeer [--config CONFIG] COMMAND [TARGET]",
+        epilog="(--peer-id: Optional. Use Peer ID instead of Device Name.)",
     )
     parser.add_argument("--config", help="configuration file (auto-detects server.toml or client.toml by default)")
     parser.add_argument(
