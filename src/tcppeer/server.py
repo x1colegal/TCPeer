@@ -968,8 +968,41 @@ class Server:
             peer_id = self._peer_for_packet(packet)
             writer = self.direct_writers.get(peer_id) if peer_id else None
             if writer is not None and peer_id is not None:
-                await self._write_data(writer, packet)
+                try:
+                    await self._write_data(writer, packet)
+                except (ConnectionError, OSError) as exc:
+                    # The direct reader can observe EOF and release this owner
+                    # while a write already captured the same writer.  A
+                    # subsequent drain then raises ECONNRESET.  This is a
+                    # per-peer disconnect, not a fatal TUN/server failure.
+                    await self._discard_direct_writer(
+                        peer_id, writer, f"tun-write-failed: {exc}",
+                    )
+                    continue
                 self._add_bytes(peer_id, "tx_bytes", len(packet))
+
+    async def _discard_direct_writer(self, peer_id: str, writer, reason: str) -> bool:
+        """Release *writer* without ever evicting a newer direct owner."""
+        released_owner = False
+        async with self._direct_adoption_lock:
+            if self.direct_writers.get(peer_id) is writer:
+                self.direct_writers.pop(peer_id, None)
+                self._direct_owner_tokens.pop(peer_id, None)
+                self._direct_owner_keys.pop(peer_id, None)
+                self._direct_owner_committed.discard(peer_id)
+                self.store.update_peer(peer_id, transport="Disconnected")
+                released_owner = True
+        LOG.info(
+            "direct-write close ts=%.6f peer_id=%s fd=%s local=%s remote=%s owner=%s reason=%s",
+            time.time(), peer_id, self._socket_fd(writer),
+            self._sockname_text(writer), self._peername_text(writer),
+            "yes" if released_owner else "no", reason,
+        )
+        writer.close()
+        await asyncio.gather(writer.wait_closed(), return_exceptions=True)
+        if released_owner:
+            await self._after_direct_data(peer_id)
+        return released_owner
 
     async def _read_tun(self) -> bytes:
         if self.tun.fd is None:
