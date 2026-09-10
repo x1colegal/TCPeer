@@ -1364,11 +1364,12 @@ class TcpPeerVpnService : VpnService() {
                 }
                 val output = selectedOutput ?: directOutput
                 synchronized(output) {
-                    output.write(
-                        buffer,
-                        0,
-                        count,
-                    )
+                    // Raw IP uses the packet's own IPv4/IPv6 length as its
+                    // boundary in the TCP byte stream.  A TUN read may carry
+                    // trailing kernel/offload bytes, so sending `count`
+                    // directly can desynchronise every subsequent packet and
+                    // leave the receiver blocked while TCP stays ESTABLISHED.
+                    TcpPeerProtocol.writeData(output, buffer, 0, count)
                 }
 
                 pendingTxBytes.addAndGet(count.toLong())
