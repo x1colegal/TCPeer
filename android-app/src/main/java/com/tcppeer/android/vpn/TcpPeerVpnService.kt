@@ -81,26 +81,64 @@ class TcpPeerVpnService : VpnService() {
     private val restartRequested = AtomicBoolean(false)
     private lateinit var connectivityManager: ConnectivityManager
     @Volatile private var underlyingNetworkSignature: String? = null
+    @Volatile private var underlyingNetwork: Network? = null
 
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            val linkProperties = connectivityManager.getLinkProperties(network) ?: return
+            handleUnderlyingNetwork(network, linkProperties, "available")
+        }
+
         override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
-            val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return
-            if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return
-            val signature = buildString {
-                append(network.toString()).append('|')
-                linkProperties.linkAddresses.map { it.toString() }.sorted().forEach { append(it).append(',') }
+            handleUnderlyingNetwork(network, linkProperties, "addresses-changed")
+        }
+
+        override fun onLost(network: Network) {
+            val lostActiveNetwork = synchronized(this@TcpPeerVpnService) {
+                if (underlyingNetwork != network) {
+                    false
+                } else {
+                    underlyingNetwork = null
+                    underlyingNetworkSignature = null
+                    true
+                }
             }
-            val previous = underlyingNetworkSignature
-            underlyingNetworkSignature = signature
-            val established = TcpPeerRuntime.state.value.status in setOf(
-                ConnectionStatus.TCP4_DIRECT,
-                ConnectionStatus.TCP6_DIRECT,
-            )
-            if (previous != null && previous != signature && connectionJob?.isActive == true && established) {
+            if (lostActiveNetwork && connectionJob?.isActive == true && !disconnectRequested.get()) {
+                Log.i(TAG, "Physical underlay lost network=$network; abandoning the old TCPeer session")
                 restartForNetworkChange()
             }
         }
     }
+
+    private fun handleUnderlyingNetwork(network: Network, linkProperties: LinkProperties, reason: String) {
+            val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return
+            if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return
+            if (!capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) return
+            val addresses = linkProperties.linkAddresses.map { it.address }
+            val (ipv4, ipv6) = TransportPolicy.localAddresses(addresses)
+            val signature = buildString {
+                append(network.toString()).append('|')
+                ipv4.mapNotNull { it.hostAddress }.sorted().forEach { append(it).append(',') }
+                append('|')
+                ipv6.mapNotNull { it.hostAddress?.substringBefore('%') }.sorted().forEach { append(it).append(',') }
+            }
+            val changed = synchronized(this) {
+                val previous = underlyingNetworkSignature
+                underlyingNetwork = network
+                underlyingNetworkSignature = signature
+                previous != null && previous != signature
+            }
+            if (changed && connectionJob?.isActive == true && !disconnectRequested.get()) {
+                Log.i(
+                    TAG,
+                    "Physical underlay changed reason=$reason network=$network " +
+                        "IPv4=${ipv4.joinToString { it.hostAddress.orEmpty() }} " +
+                        "IPv6=${ipv6.joinToString { it.hostAddress?.substringBefore('%').orEmpty() }}; " +
+                        "abandoning the old TCPeer session",
+                )
+                restartForNetworkChange()
+            }
+        }
 
     override fun onCreate() {
         super.onCreate()
