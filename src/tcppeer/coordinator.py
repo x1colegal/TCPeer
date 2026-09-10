@@ -77,6 +77,7 @@ class Coordinator:
             self.known_peers[(known.network, known.peer_id)] = known
         self.servers: list[asyncio.AbstractServer] = []
         self.admin_server: asyncio.AbstractServer | None = None
+        self._punch_lock = asyncio.Lock()
 
     async def start(self) -> None:
         await self._start_admin_listener()
@@ -262,18 +263,19 @@ class Coordinator:
             await self.send(peer.writer, "PONG")
         elif message.command == "PUNCH-READY":
             target_id = message.get("Peer-ID") or ""
-            peer.ready_for.add(target_id)
-            target = self.peers.get((peer.network, target_id))
-            if target is None:
-                await self.send(peer.writer, "ERROR", Reason="requested peer is unavailable")
-                return
-            if peer.peer_id not in target.ready_for:
-                await self.send(target.writer, "PEER-INFO", **{
-                    "Peer-ID": peer.peer_id,
-                    "Action": "Punch-Request",
-                })
-            if peer.peer_id in target.ready_for:
-                await self._punch_go(peer, target)
+            async with self._punch_lock:
+                peer.ready_for.add(target_id)
+                target = self.peers.get((peer.network, target_id))
+                if target is None:
+                    await self.send(peer.writer, "ERROR", Reason="requested peer is unavailable")
+                    return
+                if peer.peer_id not in target.ready_for:
+                    await self.send(target.writer, "PEER-INFO", **{
+                        "Peer-ID": peer.peer_id,
+                        "Action": "Punch-Request",
+                    })
+                if peer.peer_id in target.ready_for:
+                    await self._punch_go(peer, target)
         elif message.command == "DISCONNECT":
             peer.writer.close()
         else:
@@ -460,6 +462,12 @@ class Coordinator:
             "Coordinating %s between %s and %s using %s",
             transport, left.peer_id, right.peer_id, traversal,
         )
+        # Consume readiness before yielding to either socket write. Two peers
+        # can send PUNCH-READY concurrently; leaving these flags set until
+        # after both drains allowed a second handler to coordinate the same
+        # pair in reverse and cancel the first simultaneous-open attempt.
+        left.ready_for.discard(right.peer_id)
+        right.ready_for.discard(left.peer_id)
         start = str(int(time.time() * 1000) + 500)
         await self.send(left.writer, "PUNCH-GO", **{
             "Peer-ID": right.peer_id, "Address": str(right_address),
@@ -471,8 +479,6 @@ class Coordinator:
             "Port": str(left_port), "Family": family, "Start-Ms": start,
             "Traversal": traversal,
         })
-        left.ready_for.discard(right.peer_id)
-        right.ready_for.discard(left.peer_id)
 
     @staticmethod
     def _same_local_network(left: str | None, right: str | None, version: int) -> bool:

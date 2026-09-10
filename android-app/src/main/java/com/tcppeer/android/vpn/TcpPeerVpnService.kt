@@ -289,8 +289,12 @@ class TcpPeerVpnService : VpnService() {
             "Role" to "Client",
             "Platform" to "Android",
         )))
-        val registration = TcpPeerProtocol.readControl(controlInput)
-        if (registration.command != "ENDPOINT-INFO") throw ProtocolException("Coordinator did not accept registration")
+        val registration = readExpectedControl(
+            controlInput,
+            controlOutput,
+            "ENDPOINT-INFO",
+            "registration",
+        )
         TcpPeerProtocol.writeControl(controlOutput, ControlMessage("PEER-INFO", mapOf("Action" to "List")))
         readDeviceList(controlInput)
         val targetPeerId = config.targetPeerId
@@ -507,13 +511,21 @@ class TcpPeerVpnService : VpnService() {
                                 }
 
                                 "Punch-Request" -> {
-                                    synchronized(controlOutput) {
-                                        TcpPeerProtocol.writeControl(
-                                            controlOutput,
-                                            ControlMessage(
-                                                "PUNCH-READY",
-                                                mapOf("Peer-ID" to (message.field("Peer-ID") ?: targetPeerId)),
-                                            ),
+                                    val requestedPeer = message.field("Peer-ID") ?: targetPeerId
+                                    if (!meshSockets.containsKey(requestedPeer)) {
+                                        synchronized(controlOutput) {
+                                            TcpPeerProtocol.writeControl(
+                                                controlOutput,
+                                                ControlMessage(
+                                                    "PUNCH-READY",
+                                                    mapOf("Peer-ID" to requestedPeer),
+                                                ),
+                                            )
+                                        }
+                                    } else {
+                                        Log.i(
+                                            TAG,
+                                            "Ignoring stale punch request for connected peer_id=$requestedPeer",
                                         )
                                     }
                                 }
@@ -868,6 +880,30 @@ class TcpPeerVpnService : VpnService() {
                     "AUTH-ERROR", "DISCONNECT" -> throw ProtocolException(message.field("Reason") ?: "Coordinator disconnected")
                     "ERROR" -> throw ProtocolException(message.field("Reason") ?: "Coordinator rejected the direct connection")
                 }
+            }
+        }
+    }
+
+    private fun readExpectedControl(
+        input: java.io.InputStream,
+        output: java.io.OutputStream,
+        expectedCommand: String,
+        phase: String,
+    ): ControlMessage {
+        while (true) {
+            val message = TcpPeerProtocol.readControl(input)
+            when (message.command) {
+                expectedCommand -> return message
+                "PING", "KEEPALIVE" -> {
+                    Log.d(TAG, "Answered coordinator liveness probe while waiting for $phase")
+                    TcpPeerProtocol.writeControl(output, ControlMessage("PONG"))
+                }
+                "AUTH-ERROR", "DISCONNECT", "ERROR" -> throw ProtocolException(
+                    message.field("Reason") ?: "Coordinator rejected $phase",
+                )
+                else -> throw ProtocolException(
+                    "Coordinator sent ${message.command} while waiting for $expectedCommand during $phase",
+                )
             }
         }
     }
