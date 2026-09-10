@@ -46,6 +46,7 @@ class RegisteredPeer:
     platform: str = "Unknown"
     ready_for: set[str] = field(default_factory=set)
     connected_at: float = field(default_factory=time.monotonic)
+    last_punch_peer: str | None = None
 
 
 @dataclass
@@ -78,6 +79,9 @@ class Coordinator:
         self.servers: list[asyncio.AbstractServer] = []
         self.admin_server: asyncio.AbstractServer | None = None
         self._punch_lock = asyncio.Lock()
+        self._active_direct_sessions: dict[
+            tuple[str, str, str], tuple[float, float]
+        ] = {}
 
     async def start(self) -> None:
         await self._start_admin_listener()
@@ -253,6 +257,12 @@ class Coordinator:
             known.last_seen = int(time.time())
             self._persist(known)
 
+            if peer.last_punch_peer:
+                target = self.peers.get((peer.network, peer.last_punch_peer))
+                if target is not None:
+                    pair = self._pair_key(peer, target)
+                    self._active_direct_sessions[pair] = self._pair_sessions(peer, target)
+
             LOG.info(
                 "Peer %s overlay updated: IPv4=%s IPv6=%s",
                 peer.peer_id,
@@ -408,6 +418,16 @@ class Coordinator:
         await self.send(peer.writer, "PEER-INFO", Action="List-End")
 
     async def _punch_go(self, left: RegisteredPeer, right: RegisteredPeer) -> None:
+        pair = self._pair_key(left, right)
+        sessions = self._pair_sessions(left, right)
+        if self._active_direct_sessions.get(pair) == sessions:
+            left.ready_for.discard(right.peer_id)
+            right.ready_for.discard(left.peer_id)
+            LOG.info(
+                "Ignoring duplicate punch for active direct pair %s and %s",
+                left.peer_id, right.peer_id,
+            )
+            return
         same_public_origin = left.observed_address == right.observed_address
         # A shared GUA /64 is globally unambiguous even when the two control
         # sockets reached the coordinator through different address families.
@@ -468,6 +488,8 @@ class Coordinator:
         # pair in reverse and cancel the first simultaneous-open attempt.
         left.ready_for.discard(right.peer_id)
         right.ready_for.discard(left.peer_id)
+        left.last_punch_peer = right.peer_id
+        right.last_punch_peer = left.peer_id
         start = str(int(time.time() * 1000) + 500)
         await self.send(left.writer, "PUNCH-GO", **{
             "Peer-ID": right.peer_id, "Address": str(right_address),
@@ -479,6 +501,20 @@ class Coordinator:
             "Port": str(left_port), "Family": family, "Start-Ms": start,
             "Traversal": traversal,
         })
+
+    @staticmethod
+    def _pair_key(left: RegisteredPeer, right: RegisteredPeer) -> tuple[str, str, str]:
+        first, second = sorted((left.peer_id, right.peer_id))
+        return left.network, first, second
+
+    @staticmethod
+    def _pair_sessions(left: RegisteredPeer, right: RegisteredPeer) -> tuple[float, float]:
+        sessions = {
+            left.peer_id: left.connected_at,
+            right.peer_id: right.connected_at,
+        }
+        first, second = sorted(sessions)
+        return sessions[first], sessions[second]
 
     @staticmethod
     def _same_local_network(left: str | None, right: str | None, version: int) -> bool:

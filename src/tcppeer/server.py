@@ -391,12 +391,16 @@ class Server:
                 await writer.drain()
             elif message.command == "PUNCH-GO":
                 peer_id = message.get("Peer-ID") or "unknown"
-                if peer_id in self.direct_writers:
+                current_writer = self.direct_writers.pop(peer_id, None)
+                if current_writer is not None:
+                    self._direct_owner_tokens.pop(peer_id, None)
+                    self._direct_owner_keys.pop(peer_id, None)
+                    self._direct_owner_committed.discard(peer_id)
                     LOG.info(
-                        "direct-connect ignore-stale ts=%.6f peer_id=%s reason=direct-owner-active",
-                        time.time(), peer_id,
+                        "direct-connect replace-stale ts=%.6f peer_id=%s fd=%s reason=fresh-coordinated-punch",
+                        time.time(), peer_id, self._socket_fd(current_writer),
                     )
-                    continue
+                    current_writer.close()
                 previous = self._direct_connect_tasks.get(peer_id)
                 if previous is not None and not previous.done():
                     LOG.info("direct-connect cancel-stale ts=%.6f peer_id=%s reason=new-punch-go", time.time(), peer_id)
@@ -408,14 +412,9 @@ class Server:
                 task.add_done_callback(lambda done, pid=peer_id: self._clear_direct_connect_task(pid, done))
             elif message.command == "PEER-INFO" and message.get("Action") == "Punch-Request":
                 requested_peer = message.get("Peer-ID")
-                if requested_peer and requested_peer not in self.direct_writers:
+                if requested_peer:
                     writer.write(ControlMessage("PUNCH-READY", {"Peer-ID": requested_peer}).encode())
                     await writer.drain()
-                elif requested_peer:
-                    LOG.info(
-                        "direct-connect ignore-request ts=%.6f peer_id=%s reason=direct-owner-active",
-                        time.time(), requested_peer,
-                    )
             elif message.command == "PEER-INFO" and message.get("Action") == "Device":
                 peer_id = message.get("Peer-ID") or ""
                 if peer_id:
