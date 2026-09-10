@@ -36,6 +36,8 @@ class Client(Server):
         self.dns = discover_upstream_dns({config.tun_name})
         self.tun = TunDevice(config.tun_name, config.mtu)
         self.direct_writers = {}
+        self._peer_send_queues = {}
+        self._peer_send_tasks = {}
         self._tasks = set()
         self._listeners = []
         self._direct_bind_ipv4 = config.direct_ipv4 or discover_direct_ipv4({config.tun_name})
@@ -140,8 +142,11 @@ class Client(Server):
                 candidate.close()
             for writer in self.direct_writers.values():
                 writer.close()
+            for task in self._peer_send_tasks.values():
+                task.cancel()
             await asyncio.gather(*(listener.wait_closed() for listener in self._listeners), return_exceptions=True)
             await asyncio.gather(*self._tasks, return_exceptions=True)
+            await asyncio.gather(*self._peer_send_tasks.values(), return_exceptions=True)
             self.tun.close()
             self._flush_byte_counters()
             self.store.close()

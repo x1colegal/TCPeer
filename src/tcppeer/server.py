@@ -120,6 +120,8 @@ class Server:
         )
         self.tun = TunDevice(config.tun_name, config.mtu)
         self.direct_writers: dict[str, object] = {}
+        self._peer_send_queues: dict[str, asyncio.Queue[tuple[object, bytes]]] = {}
+        self._peer_send_tasks: dict[str, asyncio.Task] = {}
         self._tasks: set[asyncio.Task] = set()
         self._listeners: list[asyncio.AbstractServer] = []
         self._direct_bind_ipv4 = config.direct_ipv4 or discover_direct_ipv4({config.tun_name})
@@ -203,6 +205,11 @@ class Server:
             self._direct_candidates.clear()
             for writer in list(self.direct_writers.values()):
                 writer.close()
+            for task in self._peer_send_tasks.values():
+                task.cancel()
+            await asyncio.gather(*self._peer_send_tasks.values(), return_exceptions=True)
+            self._peer_send_tasks.clear()
+            self._peer_send_queues.clear()
             self.direct_writers.clear()
             self._direct_owner_tokens.clear()
             self._direct_owner_keys.clear()
@@ -968,18 +975,47 @@ class Server:
             peer_id = self._peer_for_packet(packet)
             writer = self.direct_writers.get(peer_id) if peer_id else None
             if writer is not None and peer_id is not None:
+                self._queue_peer_data(peer_id, writer, packet)
+
+    def _queue_peer_data(self, peer_id: str, writer, packet: bytes) -> None:
+        """Queue TUN output without allowing one peer to block the TUN reader."""
+        queue = self._peer_send_queues.get(peer_id)
+        task = self._peer_send_tasks.get(peer_id)
+        if queue is None or task is None or task.done():
+            queue = asyncio.Queue(maxsize=2048)
+            self._peer_send_queues[peer_id] = queue
+            task = asyncio.create_task(
+                self._peer_send_loop(peer_id, queue), name=f"direct-send:{peer_id}",
+            )
+            self._peer_send_tasks[peer_id] = task
+        try:
+            queue.put_nowait((writer, packet))
+        except asyncio.QueueFull:
+            LOG.warning(
+                "direct-send queue-full peer_id=%s fd=%s reason=peer-backpressure packet-dropped",
+                peer_id, self._socket_fd(writer),
+            )
+
+    async def _peer_send_loop(
+        self, peer_id: str, queue: asyncio.Queue[tuple[object, bytes]],
+    ) -> None:
+        try:
+            while True:
+                writer, packet = await queue.get()
+                if self.direct_writers.get(peer_id) is not writer:
+                    continue
                 try:
                     await self._write_data(writer, packet)
                 except (ConnectionError, OSError) as exc:
-                    # The direct reader can observe EOF and release this owner
-                    # while a write already captured the same writer.  A
-                    # subsequent drain then raises ECONNRESET.  This is a
-                    # per-peer disconnect, not a fatal TUN/server failure.
                     await self._discard_direct_writer(
-                        peer_id, writer, f"tun-write-failed: {exc}",
+                        peer_id, writer, f"queued-write-failed: {exc}",
                     )
                     continue
                 self._add_bytes(peer_id, "tx_bytes", len(packet))
+        finally:
+            if self._peer_send_tasks.get(peer_id) is asyncio.current_task():
+                self._peer_send_tasks.pop(peer_id, None)
+                self._peer_send_queues.pop(peer_id, None)
 
     async def _discard_direct_writer(self, peer_id: str, writer, reason: str) -> bool:
         """Release *writer* without ever evicting a newer direct owner."""

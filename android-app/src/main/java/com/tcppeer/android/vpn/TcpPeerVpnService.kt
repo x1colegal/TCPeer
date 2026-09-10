@@ -42,6 +42,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.withContext
 import java.io.Closeable
 import java.io.BufferedInputStream
@@ -476,12 +477,16 @@ class TcpPeerVpnService : VpnService() {
                 familyLabel(family),
             )
             val tunOutput = FileOutputStream(descriptor.fileDescriptor)
+            val tunPackets = Channel<ByteArray>(capacity = 2048)
+            val tunWriterJob = launch(Dispatchers.IO) {
+                for (packet in tunPackets) tunOutput.write(packet)
+            }
             prepareDirectListener(config.directPort, family)
             val passiveAcceptJob = launch(Dispatchers.IO) {
                 acceptMeshConnections(
                     family,
                     config, advertisedIpv4, advertisedIpv6,
-                    addresses.second.address, peerOutputs, tunOutput,
+                    addresses.second.address, peerOutputs, tunPackets,
                 )
             }
             val coordinatorControlJob = launch(Dispatchers.IO) {
@@ -577,7 +582,7 @@ class TcpPeerVpnService : VpnService() {
                                         try {
                                             connectMeshPeer(
                                                 message, config, advertisedIpv4, advertisedIpv6,
-                                                addresses.second.address, peerOutputs, tunOutput,
+                                                addresses.second.address, peerOutputs, tunPackets,
                                             )
                                         } finally {
                                             meshPunchActive.remove(punchPeer)
@@ -625,13 +630,15 @@ class TcpPeerVpnService : VpnService() {
                     directOutput,
                     addresses.second.address,
                     peerOutputs,
-                    tunOutput,
+                    tunPackets,
                 )
             } finally {
                 closeDirectListeners()
                 meshSockets.values.forEach(::closeQuietly)
                 coordinatorControlJob.cancel()
                 passiveAcceptJob.cancel()
+                tunPackets.close()
+                tunWriterJob.cancel()
                 closeQuietly(tunOutput)
             }
         }
@@ -644,7 +651,7 @@ class TcpPeerVpnService : VpnService() {
         advertisedIpv6: String,
         overlayIpv6: Inet6Address,
         peerOutputs: ConcurrentHashMap<String, java.io.OutputStream>,
-        tunOutput: FileOutputStream,
+        tunPackets: Channel<ByteArray>,
     ) {
         val peerId = punch.field("Peer-ID") ?: return
         if (peerId == config.peerId || meshSockets.containsKey(peerId)) return
@@ -696,7 +703,7 @@ class TcpPeerVpnService : VpnService() {
             try {
                 while (true) {
                     val packet = TcpPeerProtocol.readData(input)
-                    processInboundPacket(packet, peerId, overlayIpv6, output, tunOutput)
+                    processInboundPacket(packet, peerId, overlayIpv6, output, tunPackets)
                 }
             } finally {
                 peerOutputs.remove(peerId, output)
@@ -721,7 +728,7 @@ class TcpPeerVpnService : VpnService() {
         advertisedIpv6: String,
         overlayIpv6: Inet6Address,
         peerOutputs: ConcurrentHashMap<String, java.io.OutputStream>,
-        tunOutput: FileOutputStream,
+        tunPackets: Channel<ByteArray>,
     ) = coroutineScope {
         while (currentCoroutineContext().isActive) {
             val socket = try {
@@ -744,7 +751,7 @@ class TcpPeerVpnService : VpnService() {
             launch(Dispatchers.IO) {
                 handleAcceptedMeshSocket(
                     socket, config, advertisedIpv4, advertisedIpv6,
-                    overlayIpv6, peerOutputs, tunOutput,
+                    overlayIpv6, peerOutputs, tunPackets,
                 )
             }
         }
@@ -757,7 +764,7 @@ class TcpPeerVpnService : VpnService() {
         advertisedIpv6: String,
         overlayIpv6: Inet6Address,
         peerOutputs: ConcurrentHashMap<String, java.io.OutputStream>,
-        tunOutput: FileOutputStream,
+        tunPackets: Channel<ByteArray>,
     ) {
         var peerId = "unknown"
         var output: java.io.OutputStream? = null
@@ -781,7 +788,7 @@ class TcpPeerVpnService : VpnService() {
             if (!adoptMeshSocket(peerId, socket, output, peerOutputs, initiated = false)) return
             while (true) {
                 val packet = TcpPeerProtocol.readData(input)
-                processInboundPacket(packet, peerId, overlayIpv6, output, tunOutput)
+                processInboundPacket(packet, peerId, overlayIpv6, output, tunPackets)
             }
         } catch (error: Exception) {
             Log.w(
@@ -865,7 +872,7 @@ class TcpPeerVpnService : VpnService() {
         peerId: String,
         overlayIpv6: Inet6Address,
         output: java.io.OutputStream,
-        tunOutput: FileOutputStream,
+        tunPackets: Channel<ByteArray>,
     ): Int {
         if (AddressNegotiation.isRouterAdvertisement(packet)) return 0
         val tpp = TppProtocol.parse(packet)
@@ -877,7 +884,8 @@ class TcpPeerVpnService : VpnService() {
                     Log.d(TAG, "TPP reply sent directly to peer_id=$peerId identifier=${tpp.identifier}")
                     reply.size
                 } else {
-                    synchronized(tunOutput) { tunOutput.write(packet) }
+                    if (tunPackets.trySend(packet).isFailure)
+                        Log.w(TAG, "TUN receive queue full; dropping packet from peer_id=$peerId")
                     0
                 }
             }
@@ -890,7 +898,8 @@ class TcpPeerVpnService : VpnService() {
                 0
             }
             else -> {
-                synchronized(tunOutput) { tunOutput.write(packet) }
+                if (tunPackets.trySend(packet).isFailure)
+                    Log.w(TAG, "TUN receive queue full; dropping packet from peer_id=$peerId")
                 0
             }
         }
@@ -1317,7 +1326,7 @@ class TcpPeerVpnService : VpnService() {
         directOutput: java.io.OutputStream,
         overlayIpv6: Inet6Address,
         peerOutputs: ConcurrentHashMap<String, java.io.OutputStream>,
-        tunOutput: FileOutputStream,
+        tunPackets: Channel<ByteArray>,
     ) = coroutineScope {
         val tunInput = FileInputStream(descriptor.fileDescriptor)
         pendingTppPings.clear()
@@ -1414,7 +1423,7 @@ class TcpPeerVpnService : VpnService() {
                 val packet = TcpPeerProtocol.readData(directInput)
                 pendingRxBytes.addAndGet(packet.size.toLong())
                 val replyBytes = processInboundPacket(
-                    packet, "primary", overlayIpv6, directOutput, tunOutput,
+                    packet, "primary", overlayIpv6, directOutput, tunPackets,
                 )
                 if (replyBytes > 0) pendingTxBytes.addAndGet(replyBytes.toLong())
             }
