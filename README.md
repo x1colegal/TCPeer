@@ -1315,12 +1315,15 @@ tcppeer peers
 tcppeer ping "Device name"
 tcppeer --peer-id ping PEER_ID
 tcppeer rename "My device name"
+tcppeer rename --automatic
 ```
 
 `tcppeer rename` changes only the device name shown by PeerNet clients. The
 stable Peer ID from the Linux configuration remains unchanged, so leases,
 authentication, mesh identity, and the coordinator's persisted record are
 updated in place instead of creating a second device.
+Use `tcppeer rename --automatic` to restore the Linux hostname as the visible
+device name.
 
 The `tcppeer` CLI displays and accepts device names by default. Pass
 `--peer-id` when you explicitly need stable Peer IDs, including when two

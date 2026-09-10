@@ -195,6 +195,13 @@ def _rename_device(name: str) -> None:
     print(response[3:])
 
 
+def _automatic_device_name() -> str:
+    name = socket.gethostname().strip()
+    if not name or len(name) > 64 or any(not 32 <= ord(char) <= 126 for char in name):
+        raise SystemExit("The Linux hostname cannot be used as a TCPeer device name")
+    return name
+
+
 def _resolve_peer(config: LinuxConfig, value: str, use_peer_id: bool) -> str:
     if use_peer_id:
         return value
@@ -217,7 +224,14 @@ def _resolve_peer(config: LinuxConfig, value: str, use_peer_id: bool) -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Inspect TCPeer Linux server or client state")
     parser.add_argument("--config", help="configuration file (auto-detects server.toml or client.toml by default)")
-    parser.add_argument("--peer-id", action="store_true", dest="use_peer_id", help="show and select peers by stable Peer ID instead of device name")
+    parser.add_argument(
+        "--peer-id", action="store_true", dest="use_peer_id",
+        help="Optional. Use Peer ID instead of Device Name.",
+    )
+    parser.add_argument(
+        "--automatic", action="store_true",
+        help="with rename, restore the automatic Linux hostname",
+    )
     parser.add_argument("command", choices=("status", "peers", "leases", "sessions", "addresses", "transport", "stats", "ping", "rename"))
     parser.add_argument("target", nargs="?", help="Device name, or a Peer-ID when --peer-id is used")
     return parser
@@ -233,9 +247,13 @@ def main() -> None:
                 raise SystemExit('Usage: tcppeer ping "Device name" [--peer-id]')
             _run_ping(config, _resolve_peer(config, args.target, args.use_peer_id))
         elif args.command == "rename":
-            if not args.target:
-                raise SystemExit('Usage: tcppeer rename "Device name"')
-            _rename_device(args.target)
+            if args.automatic and args.target:
+                raise SystemExit("Choose either a device name or --automatic, not both")
+            if not args.automatic and not args.target:
+                raise SystemExit(
+                    'Usage: tcppeer rename "Device name" or tcppeer rename --automatic'
+                )
+            _rename_device(_automatic_device_name() if args.automatic else args.target)
         else:
             run_command(config, args.command, args.use_peer_id)
     except (OSError, ConfigurationError, sqlite3.Error) as exc:
