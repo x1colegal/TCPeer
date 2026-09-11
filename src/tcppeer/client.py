@@ -38,6 +38,7 @@ class Client(Server):
         self.direct_writers = {}
         self._peer_send_queues = {}
         self._peer_send_tasks = {}
+        self._tun_receive_queue = asyncio.Queue(maxsize=4096)
         self._tasks = set()
         self._listeners = []
         self._direct_bind_ipv4 = config.direct_ipv4 or discover_direct_ipv4({config.tun_name})
@@ -125,6 +126,7 @@ class Client(Server):
             self._tasks.update({
                 control,
                 asyncio.create_task(self._tun_loop(), name="tun"),
+                asyncio.create_task(self._tun_receive_loop(), name="tun-receive"),
                 asyncio.create_task(self._statistics_loop(), name="statistics"),
                 asyncio.create_task(self._address_change_loop(), name="address-change"),
             })
