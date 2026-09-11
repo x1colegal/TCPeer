@@ -71,6 +71,7 @@ class TcpPeerVpnService : VpnService() {
     private val meshSockets = ConcurrentHashMap<String, Socket>()
     private val meshSocketKeys = ConcurrentHashMap<String, String>()
     private val meshEndpoints = ConcurrentHashMap<String, String>()
+    private val meshCommitted = ConcurrentHashMap.newKeySet<String>()
     private val meshAdoptionLock = Any()
     private val meshConnecting = ConcurrentHashMap.newKeySet<String>()
     private val meshPunchActive = ConcurrentHashMap.newKeySet<String>()
@@ -488,6 +489,7 @@ class TcpPeerVpnService : VpnService() {
             meshSockets[targetPeerId] = direct
             meshSocketKeys[targetPeerId] = connectionKey(direct)
             meshEndpoints[targetPeerId] = formatSocketEndpoint(direct)
+            meshCommitted.add(targetPeerId)
             updateConnectedUsing(
                 targetPeerId,
                 formatSocketEndpoint(direct),
@@ -723,6 +725,7 @@ class TcpPeerVpnService : VpnService() {
             try {
                 while (true) {
                     val packet = TcpPeerProtocol.readData(input)
+                    commitMeshSocket(peerId, socket)
                     processInboundPacket(packet, peerId, overlayIpv6, output, tunPackets)
                 }
             } finally {
@@ -730,6 +733,7 @@ class TcpPeerVpnService : VpnService() {
                 if (meshSockets.remove(peerId, socket)) {
                     meshSocketKeys.remove(peerId, connectionKey(socket))
                     meshEndpoints.remove(peerId)
+                    meshCommitted.remove(peerId)
                     updateConnectedUsing(peerId, "-", null)
                 }
             }
@@ -808,6 +812,7 @@ class TcpPeerVpnService : VpnService() {
             if (!adoptMeshSocket(peerId, socket, output, peerOutputs, initiated = false)) return
             while (true) {
                 val packet = TcpPeerProtocol.readData(input)
+                commitMeshSocket(peerId, socket)
                 processInboundPacket(packet, peerId, overlayIpv6, output, tunPackets)
             }
         } catch (error: Exception) {
@@ -823,6 +828,7 @@ class TcpPeerVpnService : VpnService() {
             if (meshSockets.remove(peerId, socket)) {
                 meshSocketKeys.remove(peerId, connectionKey(socket))
                 meshEndpoints.remove(peerId)
+                meshCommitted.remove(peerId)
                 updateConnectedUsing(peerId, "-", null)
             }
             closeQuietly(socket)
@@ -841,12 +847,15 @@ class TcpPeerVpnService : VpnService() {
         synchronized(meshAdoptionLock) {
             val current = meshSockets[peerId]
             val currentKey = meshSocketKeys[peerId]
-            if (current != null && currentKey != null && key >= currentKey) {
+            if (
+                current != null && currentKey != null &&
+                (peerId in meshCommitted || key >= currentKey)
+            ) {
                 Log.i(
                     TAG,
                     "Mesh socket rejected peer_id=$peerId family=${socketFamily(socket)} " +
                         "socket=${socketToken(socket)} initiated=$initiated local=${socket.localSocketAddress} " +
-                        "remote=${socket.remoteSocketAddress} reason=deterministic-loser " +
+                        "remote=${socket.remoteSocketAddress} reason=${if (peerId in meshCommitted) "current-owner-has-data" else "deterministic-loser"} " +
                         "winner_key=$currentKey loser_key=$key",
                 )
                 closeQuietly(socket)
@@ -874,6 +883,12 @@ class TcpPeerVpnService : VpnService() {
         )
         updateConnectedUsing(peerId, formatSocketEndpoint(socket), socketFamily(socket))
         return true
+    }
+
+    private fun commitMeshSocket(peerId: String, socket: Socket) {
+        synchronized(meshAdoptionLock) {
+            if (meshSockets[peerId] === socket) meshCommitted.add(peerId)
+        }
     }
 
     private fun updateConnectedUsing(peerId: String, endpoint: String, transport: String?) {
@@ -1537,6 +1552,7 @@ class TcpPeerVpnService : VpnService() {
         meshSockets.clear()
         meshSocketKeys.clear()
         meshEndpoints.clear()
+        meshCommitted.clear()
         meshConnecting.clear()
         meshPunchActive.clear()
         closeDirectListeners()
