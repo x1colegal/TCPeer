@@ -401,20 +401,25 @@ class Server:
                 await writer.drain()
             elif message.command == "PUNCH-GO":
                 peer_id = message.get("Peer-ID") or "unknown"
-                current_writer = self.direct_writers.pop(peer_id, None)
+                current_writer = self.direct_writers.get(peer_id)
                 if current_writer is not None:
-                    self._direct_owner_tokens.pop(peer_id, None)
-                    self._direct_owner_keys.pop(peer_id, None)
-                    self._direct_owner_committed.discard(peer_id)
                     LOG.info(
-                        "direct-connect replace-stale ts=%.6f peer_id=%s fd=%s reason=fresh-coordinated-punch",
+                        "direct-connect ignore-duplicate ts=%.6f peer_id=%s fd=%s reason=direct-owner-active",
                         time.time(), peer_id, self._socket_fd(current_writer),
                     )
-                    current_writer.close()
+                    continue
                 previous = self._direct_connect_tasks.get(peer_id)
                 if previous is not None and not previous.done():
-                    LOG.info("direct-connect cancel-stale ts=%.6f peer_id=%s reason=new-punch-go", time.time(), peer_id)
-                    previous.cancel()
+                    # Directory refreshes can produce duplicate PUNCH-READY /
+                    # PUNCH-GO messages while the original TCP simultaneous-open
+                    # is still inside its retry window. Cancelling that attempt
+                    # every few seconds guarantees that a NAT traversal needing
+                    # longer than one SYN timeout can never complete.
+                    LOG.info(
+                        "direct-connect ignore-duplicate ts=%.6f peer_id=%s reason=attempt-already-active",
+                        time.time(), peer_id,
+                    )
+                    continue
                 task = asyncio.create_task(self._connect_direct(message), name=f"direct-connect:{peer_id}")
                 self._direct_connect_tasks[peer_id] = task
                 self._tasks.add(task)
