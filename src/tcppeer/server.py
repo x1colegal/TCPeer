@@ -307,6 +307,28 @@ class Server:
             writer.close()
 
     async def _control_loop(self) -> None:
+        """Keep the control plane reconnecting without tearing down the data plane."""
+        while True:
+            existing_tasks = set(self._tasks)
+            try:
+                await self._control_session()
+                raise ConnectionError("coordinator control session ended")
+            except asyncio.CancelledError:
+                raise
+            except (OSError, ProtocolError, ConnectionError, asyncio.IncompleteReadError) as exc:
+                LOG.warning("Coordinator control session lost; reconnecting: %s", exc)
+            finally:
+                for task in set(self._tasks) - existing_tasks:
+                    if task.get_name() == "device-list-refresh":
+                        task.cancel()
+                writer = self._coordinator_writer
+                self._coordinator_writer = None
+                if writer is not None:
+                    writer.close()
+                    await asyncio.gather(writer.wait_closed(), return_exceptions=True)
+            await asyncio.sleep(1)
+
+    async def _control_session(self) -> None:
         reader, writer = await self._open_coordinator_connection()
         self._coordinator_writer = writer
         writer.write(ControlMessage("AUTH", {
