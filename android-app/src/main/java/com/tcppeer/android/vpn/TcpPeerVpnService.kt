@@ -118,12 +118,14 @@ class TcpPeerVpnService : VpnService() {
             if (!capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) return
             val addresses = linkProperties.linkAddresses.map { it.address }
             val (ipv4, ipv6) = TransportPolicy.localAddresses(addresses)
-            val signature = buildString {
-                append(network.toString()).append('|')
-                ipv4.mapNotNull { it.hostAddress }.sorted().forEach { append(it).append(',') }
-                append('|')
-                ipv6.mapNotNull { it.hostAddress?.substringBefore('%') }.sorted().forEach { append(it).append(',') }
-            }
+            // A Network handle identifies the physical underlay. LinkProperties
+            // can change on the same Wi-Fi/LTE network whenever Android rotates
+            // an IPv6 privacy address, renews DHCP, or updates DNS. Including
+            // every address in this signature made those harmless updates tear
+            // down the primary direct socket and, through its cleanup scope,
+            // every mesh socket as well. A real Wi-Fi/LTE handover produces a
+            // new Network handle (or onLost), which still triggers immediately.
+            val signature = network.toString()
             val changed = synchronized(this) {
                 val previous = underlyingNetworkSignature
                 underlyingNetwork = network
