@@ -66,7 +66,7 @@ def run_command(config: LinuxConfig, command: str, use_peer_id: bool = False) ->
     connection = sqlite3.connect(f"file:{config.state_db}?mode=ro", uri=True)
     try:
         if command in {"status", "peers", "addresses", "transport", "stats"}:
-            peers = _rows(connection, "SELECT COALESCE(NULLIF(display_name, ''), peer_id) AS name, CASE WHEN transport NOT IN ('Disconnected', 'No Direct Connection', 'None') THEN 'Online' ELSE 'Offline' END AS status, * FROM peers ORDER BY name")
+            peers = _rows(connection, "SELECT COALESCE(NULLIF(display_name, ''), peer_id) AS name, CASE WHEN online = 1 THEN 'Online' ELSE 'Offline' END AS status, * FROM peers ORDER BY name")
             identity = "peer_id" if use_peer_id else "name"
             if command == "status":
                 connected = sum(row["transport"] not in {"Disconnected", "No Direct Connection"} for row in peers)

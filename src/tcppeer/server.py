@@ -471,6 +471,7 @@ class Server:
     def _update_peer_from_directory(self, peer_id: str, message: ControlMessage) -> None:
         values: dict[str, object] = {
             "display_name": message.get("Device-Name") or peer_id,
+            "online": 1 if message.get("Online") == "yes" else 0,
             "overlay_ipv4": message.get("Overlay-IPv4") or None,
             "overlay_ipv6": message.get("Overlay-IPv6") or None,
         }
@@ -715,7 +716,7 @@ class Server:
             replaced_writer.close()
 
         label = "TCP6 Direct" if family == socket.AF_INET6 else "TCP4 Direct"
-        self.store.update_peer(peer_id, transport=label, endpoint=endpoint, connected_at=int(time.time()))
+        self.store.update_peer(peer_id, online=1, transport=label, endpoint=endpoint, connected_at=int(time.time()))
         session_id = str(uuid.uuid4())
         started_at = int(time.time())
         with self.store.connection:

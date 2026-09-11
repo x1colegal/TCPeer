@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS metadata (
 CREATE TABLE IF NOT EXISTS peers (
     peer_id TEXT PRIMARY KEY,
     display_name TEXT,
+    online INTEGER NOT NULL DEFAULT 0,
     overlay_ipv4 TEXT,
     overlay_ipv6 TEXT,
     transport TEXT NOT NULL DEFAULT 'Disconnected',
@@ -71,6 +72,8 @@ class StateStore:
         peer_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(peers)")}
         if "display_name" not in peer_columns:
             self.connection.execute("ALTER TABLE peers ADD COLUMN display_name TEXT")
+        if "online" not in peer_columns:
+            self.connection.execute("ALTER TABLE peers ADD COLUMN online INTEGER NOT NULL DEFAULT 0")
         self.connection.commit()
 
     def close(self) -> None:
@@ -181,7 +184,7 @@ class StateStore:
         return list(self.connection.execute(f"SELECT * FROM {table}"))
 
     def update_peer(self, peer_id: str, **values: object) -> None:
-        allowed = {"display_name", "overlay_ipv4", "overlay_ipv6", "transport", "endpoint", "rx_bytes", "tx_bytes", "connected_at"}
+        allowed = {"display_name", "online", "overlay_ipv4", "overlay_ipv6", "transport", "endpoint", "rx_bytes", "tx_bytes", "connected_at"}
         unknown = set(values) - allowed
         if unknown:
             raise ValueError(f"unsupported peer fields: {', '.join(sorted(unknown))}")
