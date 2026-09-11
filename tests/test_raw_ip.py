@@ -8,7 +8,9 @@ class RawIpEncodingTests(unittest.TestCase):
         packet = bytearray(80)
         packet[0] = 0x60
         packet[4:6] = (24).to_bytes(2, "big")
-        self.assertEqual(bytes(packet[:64]), encode_data(bytes(packet)))
+        frame = encode_data(bytes(packet))
+        self.assertTrue(frame.startswith(b"TPF/1 DATA\r\nLength: 64\r\n\r\n"))
+        self.assertEqual(bytes(packet[:64]), frame.split(b"\r\n\r\n", 1)[1])
 
     def test_truncated_declared_packet_is_rejected(self):
         packet = bytearray(40)

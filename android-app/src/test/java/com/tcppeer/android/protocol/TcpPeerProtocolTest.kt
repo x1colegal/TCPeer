@@ -72,7 +72,7 @@ class TcpPeerProtocolTest {
     }
 
     @Test
-    fun trailingTunBytesCannotDesynchronizeRawIpStream() {
+    fun trailingTunBytesCannotDesynchronizeTpfStream() {
         val padded = ByteArray(80).also {
             it[0] = 0x60
             it[4] = 0
@@ -80,8 +80,20 @@ class TcpPeerProtocolTest {
         }
         val output = ByteArrayOutputStream()
         TcpPeerProtocol.writeData(output, padded)
-        assertEquals(64, output.size())
+        assertTrue(output.toString(Charsets.US_ASCII.name()).startsWith("TPF/1 DATA\r\nLength: 64\r\n\r\n"))
         assertArrayEquals(padded.copyOf(64), TcpPeerProtocol.readData(ByteArrayInputStream(output.toByteArray())))
+    }
+
+    @Test
+    fun tpfKeepaliveIsAnsweredAndSkipped() {
+        val packet = ByteArray(40).also { it[0] = 0x60 }
+        val stream = ByteArrayOutputStream().also {
+            TcpPeerProtocol.writeTpfControl(it, "KEEPALIVE")
+            TcpPeerProtocol.writeData(it, packet)
+        }
+        val replies = ByteArrayOutputStream()
+        assertArrayEquals(packet, TcpPeerProtocol.readData(ByteArrayInputStream(stream.toByteArray()), replies))
+        assertTrue(replies.toString(Charsets.US_ASCII.name()).contains("TPCP/2 PONG"))
     }
 
     @Test

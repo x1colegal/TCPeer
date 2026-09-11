@@ -43,6 +43,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.withContext
 import java.io.Closeable
 import java.io.BufferedInputStream
@@ -720,17 +721,30 @@ class TcpPeerVpnService : VpnService() {
                 throw ProtocolException("Direct mesh peer handshake failed")
             }
             // The handshake timeout must not become an idle lifetime for the
-            // established raw-IP stream.  Leaving 15 seconds here caused every
+            // established TPF stream. Leaving 15 seconds here caused every
             // quiet mesh connection to be closed and punched again forever.
             socket.soTimeout = 0
             if (!adoptMeshSocket(peerId, socket, output, peerOutputs, initiated = true)) return
+            val lastRx = AtomicLong(System.nanoTime())
+            val keepalive = serviceScope.launch(Dispatchers.IO) {
+                while (true) {
+                    delay(15_000)
+                    if (System.nanoTime() - lastRx.get() >= 45_000_000_000L) {
+                        Log.w(TAG, "Mesh data-plane TPCP keepalive timeout peer_id=$peerId")
+                        closeQuietly(socket)
+                        return@launch
+                    }
+                    synchronized(output) { TcpPeerProtocol.writeTpfControl(output, "KEEPALIVE") }
+                }
+            }
             try {
                 while (true) {
-                    val packet = TcpPeerProtocol.readData(input)
+                    val packet = TcpPeerProtocol.readData(input, output) { lastRx.set(System.nanoTime()) }
                     commitMeshSocket(peerId, socket)
                     processInboundPacket(packet, peerId, overlayIpv6, output, tunPackets)
                 }
             } finally {
+                keepalive.cancel()
                 peerOutputs.remove(peerId, output)
                 if (meshSockets.remove(peerId, socket)) {
                     meshSocketKeys.remove(peerId, connectionKey(socket))
@@ -812,10 +826,26 @@ class TcpPeerVpnService : VpnService() {
             // the bounded handshake, matching the primary direct connection.
             socket.soTimeout = 0
             if (!adoptMeshSocket(peerId, socket, output, peerOutputs, initiated = false)) return
-            while (true) {
-                val packet = TcpPeerProtocol.readData(input)
-                commitMeshSocket(peerId, socket)
-                processInboundPacket(packet, peerId, overlayIpv6, output, tunPackets)
+            val lastRx = AtomicLong(System.nanoTime())
+            val keepalive = serviceScope.launch(Dispatchers.IO) {
+                while (true) {
+                    delay(15_000)
+                    if (System.nanoTime() - lastRx.get() >= 45_000_000_000L) {
+                        Log.w(TAG, "Accepted mesh data-plane TPCP keepalive timeout peer_id=$peerId")
+                        closeQuietly(socket)
+                        return@launch
+                    }
+                    synchronized(output) { TcpPeerProtocol.writeTpfControl(output, "KEEPALIVE") }
+                }
+            }
+            try {
+                while (true) {
+                    val packet = TcpPeerProtocol.readData(input, output) { lastRx.set(System.nanoTime()) }
+                    commitMeshSocket(peerId, socket)
+                    processInboundPacket(packet, peerId, overlayIpv6, output, tunPackets)
+                }
+            } finally {
+                keepalive.cancel()
             }
         } catch (error: Exception) {
             Log.w(
@@ -1246,7 +1276,7 @@ class TcpPeerVpnService : VpnService() {
         val deadlineNanos = System.nanoTime() + 15_000_000_000L
         var receivedFrames = 0
         while (System.nanoTime() < deadlineNanos) {
-            val packet = TcpPeerProtocol.readData(input)
+            val packet = TcpPeerProtocol.readData(input, output)
             receivedFrames += 1
             var packetKind = "unrecognized"
             if (offer == null) {
@@ -1378,6 +1408,7 @@ class TcpPeerVpnService : VpnService() {
         tunPackets: Channel<ByteArray>,
     ) = coroutineScope {
         val tunInput = FileInputStream(descriptor.fileDescriptor)
+        val lastDataPlaneRx = AtomicLong(System.nanoTime())
         pendingTppPings.clear()
         val pendingTxBytes = AtomicLong(0)
         val pendingRxBytes = AtomicLong(0)
@@ -1467,9 +1498,24 @@ class TcpPeerVpnService : VpnService() {
                 }
             }
         }
+        val dataPlaneKeepalive = launch(Dispatchers.IO) {
+            while (true) {
+                delay(15_000)
+                if (System.nanoTime() - lastDataPlaneRx.get() >= 45_000_000_000L) {
+                    Log.w(TAG, "Primary data-plane TPCP keepalive timeout; closing direct stream")
+                    closeQuietly(directInput)
+                    return@launch
+                }
+                synchronized(directOutput) {
+                    TcpPeerProtocol.writeTpfControl(directOutput, "KEEPALIVE")
+                }
+            }
+        }
         val peerToTun = launch(Dispatchers.IO) {
             while (true) {
-                val packet = TcpPeerProtocol.readData(directInput)
+                val packet = TcpPeerProtocol.readData(directInput, directOutput) {
+                    lastDataPlaneRx.set(System.nanoTime())
+                }
                 pendingRxBytes.addAndGet(packet.size.toLong())
                 val replyBytes = processInboundPacket(
                     packet, "primary", overlayIpv6, directOutput, tunPackets,
@@ -1478,12 +1524,19 @@ class TcpPeerVpnService : VpnService() {
             }
         }
         try {
-            tunToPeer.join()
-            peerToTun.join()
+            // Either direction ending means this direct session is no longer
+            // usable. Waiting for TUN->peer first hid receiver failures because
+            // the TUN read normally blocks forever, leaving the UI Connected
+            // after peer->TUN and TPP had already died.
+            select<Unit> {
+                tunToPeer.onJoin { }
+                peerToTun.onJoin { }
+            }
         } finally {
             tunToPeer.cancel()
             peerToTun.cancel()
             pingRequests.cancel()
+            dataPlaneKeepalive.cancel()
             statistics.cancel()
             pendingTppPings.clear()
             synchronized(directOutput) {

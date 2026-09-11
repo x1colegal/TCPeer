@@ -24,7 +24,7 @@ from tcppeer.dhcp import DhcpServer
 from tcppeer.dns import discover_upstream_dns
 from tcppeer.exit_node import ExitNodeFirewall
 from tcppeer.packet import build_dhcp_packet, extract_dhcp_payload
-from tcppeer.protocol import ControlMessage, ProtocolError, encode_data, read_control, read_data
+from tcppeer.protocol import ControlMessage, ProtocolError, encode_data, encode_tpf_control, read_control, read_data
 from tcppeer.ra import ALL_NODES, LINK_LOCAL_ROUTER, build_router_advertisement, ipv6_source, is_router_solicitation
 from tcppeer.pd import PrefixDelegationClient, discover_ipv6_upstream, router_address, slaac_subnet
 from tcppeer.state import StateStore
@@ -113,6 +113,10 @@ class Server:
     def __init__(self, config: ServerConfig):
         self.config = config
         self.store = StateStore(config.state_db)
+        if not self.store.metadata("device_name"):
+            automatic_name = socket.gethostname().strip()[:64]
+            if automatic_name and all(32 <= ord(char) <= 126 for char in automatic_name):
+                self.store.set_metadata("device_name", automatic_name)
         self.dns = config.dns or discover_upstream_dns({config.tun_name})
         self.dhcp = DhcpServer(
             self.store, config.ipv4_subnet, config.server_ipv4,
@@ -724,6 +728,23 @@ class Server:
         self.store.update_peer(peer_id, online=1, transport=label, endpoint=endpoint, connected_at=int(time.time()))
         session_id = str(uuid.uuid4())
         started_at = int(time.time())
+        last_data_plane_rx = time.monotonic()
+
+        def mark_data_plane_rx() -> None:
+            nonlocal last_data_plane_rx
+            last_data_plane_rx = time.monotonic()
+
+        async def data_plane_keepalive() -> None:
+            while True:
+                await asyncio.sleep(15)
+                if time.monotonic() - last_data_plane_rx >= 45:
+                    LOG.warning("data-plane liveness timeout peer_id=%s; closing direct stream", peer_id)
+                    writer.close()
+                    return
+                writer.write(encode_tpf_control("KEEPALIVE"))
+                await writer.drain()
+
+        keepalive_task = asyncio.create_task(data_plane_keepalive())
         with self.store.connection:
             self.store.connection.execute(
                 "INSERT INTO sessions(session_id, peer_id, family, endpoint, state, started_at) VALUES(?, ?, ?, ?, 'connected', ?)",
@@ -732,7 +753,7 @@ class Server:
         try:
             await self._before_direct_data(reader, writer, peer_id)
             while True:
-                packet = await read_data(reader)
+                packet = await read_data(reader, writer, mark_data_plane_rx)
                 packet_count += 1
                 if packet_count == 1:
                     async with self._direct_adoption_lock:
@@ -755,7 +776,7 @@ class Server:
                 self._add_bytes(peer_id, "rx_bytes", len(packet))
                 await self._handle_peer_packet(packet, writer, peer_id)
         except ProtocolError as exc:
-            if "connection closed while reading IP version" in str(exc):
+            if "connection closed while reading TPF header" in str(exc):
                 LOG.info(
                     "direct-adopt eof ts=%.6f peer_id=%s family=%s attempt=%s initiated=%s fd=%s local=%s remote=%s packets=%s reason=%s",
                     time.time(),
@@ -772,6 +793,8 @@ class Server:
                 return
             raise
         finally:
+            keepalive_task.cancel()
+            await asyncio.gather(keepalive_task, return_exceptions=True)
             released_owner = False
             if (
                 self.direct_writers.get(peer_id) is writer

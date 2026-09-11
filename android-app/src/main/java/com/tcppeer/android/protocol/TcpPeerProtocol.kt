@@ -303,21 +303,6 @@ object TcpPeerProtocol {
             length <= MAX_PACKET_SIZE
         )
 
-        /*
-         * RAW IP.
-         *
-         * ZERO TCPeer framing bytes.
-         *
-         * Do NOT prepend:
-         *   - length
-         *   - magic
-         *   - TCPD
-         *   - delimiter
-         *   - metadata
-         *
-         * The exact IP packet from TUN goes into the TCP stream.
-         */
-
         val version = (packet[offset].toInt() ushr 4) and 0x0f
 
         if (version != 4 && version != 6)
@@ -343,115 +328,68 @@ object TcpPeerProtocol {
         }
         if (wireLength > length) throw ProtocolException("Truncated IP packet")
 
-        // RAW-IP has no framing.  Write only the datagram length declared in
-        // its IP header so kernel/offload padding cannot become a fake next
-        // packet and desynchronize the TCP stream.
-        output.write(packet, offset, wireLength)
+        val header = "TPF/1 DATA\r\nLength: $wireLength\r\n\r\n".toByteArray(StandardCharsets.US_ASCII)
+        val frame = ByteArray(header.size + wireLength)
+        header.copyInto(frame)
+        packet.copyInto(frame, header.size, offset, offset + wireLength)
+        output.write(frame)
     }
 
-    fun readData(input: InputStream): ByteArray {
-        /*
-         * RAW IP receiver.
-         *
-         * TCP does not preserve write boundaries, therefore the
-         * existing IP header itself supplies the packet length.
-         *
-         * TCPeer adds ZERO bytes.
-         */
-
-        val first = input.read()
-
-        if (first < 0)
-            throw EOFException(
-                "Connection closed while reading IP version"
-            )
-
-        val version = (first ushr 4) and 0x0f
-
-        // ====================================================
-        // IPv4
-        // ====================================================
-        if (version == 4) {
-            val header = ByteArray(20)
-            header[0] = first.toByte()
-
-            val rest = input.readExactly(19)
-            rest.copyInto(header, 1)
-
-            val ihl = (header[0].toInt() and 0x0f) * 4
-
-            if (ihl < 20 || ihl > 60)
-                throw ProtocolException("Invalid IPv4 IHL")
-
-            val totalLength =
-                ((header[2].toInt() and 0xff) shl 8) or
-                (header[3].toInt() and 0xff)
-
-            if (totalLength < ihl)
-                throw ProtocolException(
-                    "Invalid IPv4 total length"
-                )
-
-            if (totalLength > MAX_PACKET_SIZE)
-                throw ProtocolException(
-                    "IPv4 packet exceeds maximum size"
-                )
-
-            val packet = ByteArray(totalLength)
-
-            header.copyInto(packet, 0)
-
-            val remaining = totalLength - 20
-
-            if (remaining > 0) {
-                input.readExactly(remaining).copyInto(
-                    packet,
-                    20
-                )
-            }
-
-            return packet
-        }
-
-        // ====================================================
-        // IPv6
-        // ====================================================
-        if (version == 6) {
-            val header = ByteArray(40)
-            header[0] = first.toByte()
-
-            val rest = input.readExactly(39)
-            rest.copyInto(header, 1)
-
-            val payloadLength =
-                ((header[4].toInt() and 0xff) shl 8) or
-                (header[5].toInt() and 0xff)
-
-            val totalLength = 40 + payloadLength
-
-            if (totalLength > MAX_PACKET_SIZE)
-                throw ProtocolException(
-                    "IPv6 packet exceeds maximum size"
-                )
-
-            val packet = ByteArray(totalLength)
-
-            header.copyInto(packet, 0)
-
-            if (payloadLength > 0) {
-                input.readExactly(payloadLength).copyInto(
-                    packet,
-                    40
-                )
-            }
-
-            return packet
-        }
-
-        throw ProtocolException(
-            "Invalid raw IP version in DATA stream: $version"
-        )
+    fun writeTpfControl(output: OutputStream, command: String) {
+        require(command == "KEEPALIVE" || command == "PONG")
+        val payload = "TPCP/2 $command\r\n\r\n".toByteArray(StandardCharsets.US_ASCII)
+        val header = "TPF/1 TPCP\r\nLength: ${payload.size}\r\n\r\n".toByteArray(StandardCharsets.US_ASCII)
+        output.write(header + payload)
+        output.flush()
     }
+
+    fun readData(input: InputStream, output: OutputStream? = null, activity: (() -> Unit)? = null): ByteArray {
+        while (true) {
+            val header = input.readAsciiHeader(256)
+            val lines = header.split("\r\n")
+            if (lines.size != 2 || lines[0] !in setOf("TPF/1 DATA", "TPF/1 TPCP"))
+                throw ProtocolException("Invalid TPF header")
+            if (!lines[1].startsWith("Length: ")) throw ProtocolException("Invalid TPF Length field")
+            val length = lines[1].removePrefix("Length: ").toIntOrNull()
+                ?: throw ProtocolException("Invalid TPF payload length")
+            if (length !in 1..MAX_PACKET_SIZE) throw ProtocolException("TPF payload length is out of range")
+            val payload = input.readExactly(length)
+            activity?.invoke()
+            if (lines[0] == "TPF/1 DATA") {
+                val version = (payload[0].toInt() ushr 4) and 0x0f
+                if (version != 4 && version != 6) throw ProtocolException("TPF DATA is neither IPv4 nor IPv6")
+                val declared = if (version == 4) {
+                    if (payload.size < 20) throw ProtocolException("Truncated IPv4 header")
+                    ((payload[2].toInt() and 0xff) shl 8) or (payload[3].toInt() and 0xff)
+                } else {
+                    if (payload.size < 40) throw ProtocolException("Truncated IPv6 header")
+                    40 + (((payload[4].toInt() and 0xff) shl 8) or (payload[5].toInt() and 0xff))
+                }
+                if (declared != payload.size) throw ProtocolException("TPF length does not match IP packet length")
+                return payload
+            }
+            when (payload.toString(StandardCharsets.US_ASCII)) {
+                "TPCP/2 KEEPALIVE\r\n\r\n" -> output?.let { synchronized(it) { writeTpfControl(it, "PONG") } }
+                "TPCP/2 PONG\r\n\r\n" -> Unit
+                else -> throw ProtocolException("Invalid TPF TPCP command")
+            }
+        }
+    }
+}
+
+private fun InputStream.readAsciiHeader(maxSize: Int): String {
+    val bytes = ArrayList<Byte>()
+    val terminator = byteArrayOf(13, 10, 13, 10)
+    var matched = 0
+    while (matched < terminator.size) {
+        val value = read()
+        if (value < 0) throw EOFException("Connection closed while reading TPF header")
+        if (value > 127) throw ProtocolException("TPF header is not ASCII")
+        bytes.add(value.toByte())
+        if (bytes.size > maxSize) throw ProtocolException("TPF header is too large")
+        matched = if (value.toByte() == terminator[matched]) matched + 1 else if (value == 13) 1 else 0
+    }
+    return bytes.toByteArray().dropLast(4).toByteArray().toString(StandardCharsets.US_ASCII)
 }
 
 private fun InputStream.readExactly(size: Int): ByteArray {

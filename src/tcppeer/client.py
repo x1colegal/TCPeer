@@ -33,6 +33,10 @@ class Client(Server):
     def __init__(self, config: ClientConfig):
         self.config = config
         self.store = StateStore(config.state_db)
+        if not self.store.metadata("device_name"):
+            automatic_name = socket.gethostname().strip()[:64]
+            if automatic_name and all(32 <= ord(char) <= 126 for char in automatic_name):
+                self.store.set_metadata("device_name", automatic_name)
         self.dns = discover_upstream_dns({config.tun_name})
         self.tun = TunDevice(config.tun_name, config.mtu)
         self.direct_writers = {}
@@ -177,7 +181,7 @@ class Client(Server):
         await self._write_data(writer, router_solicitation())
         offer = ack = slaac = None
         for _ in range(8):
-            packet = await asyncio.wait_for(read_data(reader), timeout=8)
+            packet = await asyncio.wait_for(read_data(reader, writer), timeout=8)
             if offer is None:
                 offer = parse_dhcp(packet, xid, 2)
                 if offer is not None:

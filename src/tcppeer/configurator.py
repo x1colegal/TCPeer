@@ -12,6 +12,7 @@ import grp
 import shutil
 import subprocess
 import sys
+import uuid
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -72,13 +73,35 @@ keepalive_seconds = 30
 """, state_db
 
 
+def automatic_client_peer_id() -> str:
+    """Reuse an installed Client identity or generate an Android-style random ID."""
+    existing = Path("/etc/tcppeer/client.toml")
+    try:
+        import tomllib
+        with existing.open("rb") as source:
+            peer_id = str(tomllib.load(source).get("identity", {}).get("peer_id", "")).strip()
+        if peer_id:
+            return peer_id
+    except (OSError, ValueError, TypeError):
+        pass
+    return f"linux_client-{uuid.uuid4()}"
+
+
+def automatic_server_peer_id() -> str:
+    """Use the Linux device hostname as the Exit Node/Server identity."""
+    hostname = os.uname().nodename.strip()
+    peer_id = "".join(char if 32 <= ord(char) <= 126 else "-" for char in hostname)[:64]
+    return peer_id or f"linux_server-{uuid.uuid4()}"
+
+
 def client_text() -> tuple[str, Path]:
     coordinator = ask("Coordinator DNS name or IP address")
     coordinator_port = int(ask("Coordinator TCP port", "7443"))
     network = ask("Network name", "home")
-    peer_id = ask("Client peer ID")
+    peer_id = automatic_client_peer_id()
+    print(f"Using automatic stable Client peer ID: {peer_id}")
     secret = ask("Network secret", secret=True)
-    target_peer = ask("Peer/Exit Node ID used for address assignment")
+    target_peer = ask("Peer/Exit Node Peer ID used for address assignment")
     use_exit_node = ask_yes_no("Route Internet and DNS through this Exit Node", False)
     direct_ipv4 = ask("Direct IPv4 address (empty auto-detects)", "")
     direct_ipv6 = ask("Direct IPv6 address (empty auto-detects)", "")
@@ -125,7 +148,8 @@ def server_text() -> tuple[str, Path]:
     coordinator = ask("Coordinator DNS name or IP address")
     coordinator_port = int(ask("Coordinator TCP port", "7443"))
     network = ask("Network name", "home")
-    peer_id = ask("Peer/server ID")
+    peer_id = automatic_server_peer_id()
+    print(f"Using automatic stable Exit Node/Server peer ID: {peer_id}")
     secret = ask("Network secret", secret=True)
     direct_ipv4 = ask("Direct IPv4 address (empty means none)", "")
     direct_ipv6 = ask("Direct IPv6 address (empty means none)", "")
