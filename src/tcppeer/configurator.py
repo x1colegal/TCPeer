@@ -99,7 +99,6 @@ def client_text() -> tuple[str, Path]:
     coordinator_port = int(ask("Coordinator TCP port", "7443"))
     network = ask("Network name", "home")
     peer_id = automatic_client_peer_id()
-    print(f"Using automatic stable Client peer ID: {peer_id}")
     secret = ask("Network secret", secret=True)
     target_peer = ask("Peer/Exit Node Peer ID used for address assignment")
     use_exit_node = ask_yes_no("Route Internet and DNS through this Exit Node", False)
@@ -149,7 +148,6 @@ def server_text() -> tuple[str, Path]:
     coordinator_port = int(ask("Coordinator TCP port", "7443"))
     network = ask("Network name", "home")
     peer_id = automatic_server_peer_id()
-    print(f"Using automatic stable Exit Node/Server peer ID: {peer_id}")
     secret = ask("Network secret", secret=True)
     direct_ipv4 = ask("Direct IPv4 address (empty means none)", "")
     direct_ipv6 = ask("Direct IPv6 address (empty means none)", "")
@@ -288,6 +286,11 @@ def install(component: str, content: str, state_db: Path | None, user: str, grou
     print(f"Installed {config_path} and {unit_target}.")
     if ask_yes_no(f"Enable and start {unit_name} now"):
         subprocess.run(("systemctl", "enable", "--now", unit_name), check=True)
+    if component in {"server", "client"}:
+        import tomllib
+        peer_id = str(tomllib.loads(content)["identity"]["peer_id"])
+        role = "Exit Node / Server" if component == "server" else "Linux Client"
+        print(f"{role} Peer ID: {peer_id}")
 
 
 def main() -> None:
