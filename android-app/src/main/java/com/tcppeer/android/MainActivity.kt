@@ -44,6 +44,8 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Devices
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.PlayArrow
@@ -84,6 +86,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.core.content.ContextCompat
@@ -1036,7 +1039,10 @@ private fun DeviceCard(
     ) {
         Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                Row(
+                    modifier = Modifier.weight(1f),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
                     Surface(shape = CircleShape, color = MaterialTheme.colorScheme.surfaceContainerHighest) {
                         Box(Modifier.size(46.dp), contentAlignment = Alignment.Center) {
                             Text(device.platform.take(1).uppercase(), fontWeight = FontWeight.Bold)
@@ -1049,8 +1055,14 @@ private fun DeviceCard(
                         }
                     }
                     Spacer(Modifier.size(13.dp))
-                    Column {
-                        Text(device.displayName, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            device.displayName,
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
                         Text(
                             "${device.role} • ${if (device.online) "Online" else "Offline"}",
                             style = MaterialTheme.typography.bodySmall,
@@ -1058,10 +1070,11 @@ private fun DeviceCard(
                         )
                     }
                 }
-                Text(
-                    if (expanded) "Hide" else "Details",
-                    color = MaterialTheme.colorScheme.primary,
-                    fontWeight = FontWeight.SemiBold,
+                Icon(
+                    imageVector = if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                    contentDescription = if (expanded) "Collapse peer" else "Expand peer",
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.padding(start = 8.dp),
                 )
             }
             Text(

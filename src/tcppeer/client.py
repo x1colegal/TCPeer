@@ -303,7 +303,7 @@ class Client(Server):
             if reply is not None:
                 await self._write_data(writer, reply)
             return
-        self.tun.write(packet)
+        self._queue_tun_packet(peer_id, packet)
 
 
 def main() -> None:

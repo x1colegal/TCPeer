@@ -122,6 +122,7 @@ class Server:
         self.direct_writers: dict[str, object] = {}
         self._peer_send_queues: dict[str, asyncio.Queue[tuple[object, bytes]]] = {}
         self._peer_send_tasks: dict[str, asyncio.Task] = {}
+        self._tun_receive_queue: asyncio.Queue[tuple[str, bytes]] = asyncio.Queue(maxsize=4096)
         self._tasks: set[asyncio.Task] = set()
         self._listeners: list[asyncio.AbstractServer] = []
         self._direct_bind_ipv4 = config.direct_ipv4 or discover_direct_ipv4({config.tun_name})
@@ -186,6 +187,7 @@ class Server:
             self._tasks = {
                 control_task,
                 asyncio.create_task(self._tun_loop(), name="tun"),
+                asyncio.create_task(self._tun_receive_loop(), name="tun-receive"),
                 asyncio.create_task(self._ra_loop(), name="router-advertisement"),
                 asyncio.create_task(self._statistics_loop(), name="statistics"),
                 asyncio.create_task(self._pd_loop(), name="prefix-delegation"),
@@ -1122,7 +1124,43 @@ class Server:
                 destination_peer,
             )
             return
-        self.tun.write(packet)
+        self._queue_tun_packet(peer_id, packet)
+
+    def _queue_tun_packet(self, peer_id: str, packet: bytes) -> None:
+        """Keep a temporarily full TUN from killing an otherwise healthy peer."""
+        try:
+            self._tun_receive_queue.put_nowait((peer_id, packet))
+        except asyncio.QueueFull:
+            LOG.warning(
+                "tun-receive queue-full peer_id=%s reason=kernel-backpressure packet-dropped",
+                peer_id,
+            )
+
+    async def _tun_receive_loop(self) -> None:
+        while True:
+            peer_id, packet = await self._tun_receive_queue.get()
+            await self._write_tun(packet, peer_id)
+
+    async def _write_tun(self, packet: bytes, peer_id: str) -> None:
+        if self.tun.fd is None:
+            raise RuntimeError("TUN interface is closed")
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                os.write(self.tun.fd, packet)
+                return
+            except BlockingIOError:
+                ready = loop.create_future()
+
+                def mark_ready() -> None:
+                    if not ready.done():
+                        ready.set_result(None)
+
+                loop.add_writer(self.tun.fd, mark_ready)
+                try:
+                    await ready
+                finally:
+                    loop.remove_writer(self.tun.fd)
 
     def _peer_for_packet(self, packet: bytes) -> str | None:
         """Return the directly connected peer owning the packet destination."""

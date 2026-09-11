@@ -530,7 +530,8 @@ class TcpPeerVpnService : VpnService() {
                                     peerId = message.field("Peer-ID") ?: "unknown",
                                     displayName = message.field("Device-Name")
                                         ?: message.field("Peer-ID") ?: "Unknown device",
-                                    online = message.field("Online") == "yes",
+                                    online = message.field("Online") == "yes" ||
+                                        message.field("Peer-ID")?.let(meshSockets::containsKey) == true,
                                     role = message.field("Role") ?: "Client",
                                     platform = message.field("Platform") ?: "Unknown",
                                     transport = message.field("Peer-ID")?.let(meshSockets::get)
@@ -991,7 +992,8 @@ class TcpPeerVpnService : VpnService() {
                     peerId = message.field("Peer-ID") ?: "unknown",
                     displayName = message.field("Device-Name")
                         ?: message.field("Peer-ID") ?: "Unknown device",
-                    online = message.field("Online") == "yes",
+                    online = message.field("Online") == "yes" ||
+                        message.field("Peer-ID")?.let(meshSockets::containsKey) == true,
                     role = message.field("Role") ?: "Client",
                     platform = message.field("Platform") ?: "Unknown",
                     transport = message.field("Transport") ?: "None",
