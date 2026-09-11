@@ -1373,9 +1373,9 @@ TPF adds a short variable-length ASCII header to each tunneled packet. The confi
 
 # Performance
 
-The TPF data path avoids TCPeer-specific per-packet framing work.
-
-For each normal tunneled packet, TCPeer does not need to:
+TPF deliberately performs only small, bounded framing work. For each tunneled
+packet, TCPeer creates or parses one ASCII header containing the frame type and
+decimal payload length. It does not need to:
 
 ```text
 serialize TCPD
@@ -1386,8 +1386,8 @@ reconstruct inner TCP headers
 reconstruct inner UDP headers
 reconstruct inner SCTP headers
 reconstruct inner DCCP headers
-add a TCPeer packet-length field
-add a TCPeer DATA magic
+convert the binary IP payload to text
+recalculate inner transport checksums
 ```
 
 The intended hot path is essentially:
@@ -1396,13 +1396,19 @@ The intended hot path is essentially:
 TUN
  |
  v
-raw packet
+binary IP packet
+ |
+ v
+TPF DATA encoder
  |
  v
 TCP stream
  |
  v
-raw packet
+TPF DATA decoder
+ |
+ v
+binary IP packet
  |
  v
 TUN
