@@ -85,14 +85,15 @@ class TcpPeerProtocolTest {
     }
 
     @Test
-    fun tpfKeepaliveIsAnsweredAndSkipped() {
+    fun topLevelTpcpKeepaliveIsAnsweredAndSkipped() {
         val packet = ByteArray(40).also { it[0] = 0x60 }
         val stream = ByteArrayOutputStream().also {
-            TcpPeerProtocol.writeTpfControl(it, "KEEPALIVE")
+            TcpPeerProtocol.writeDataPlaneControl(it, "KEEPALIVE")
             TcpPeerProtocol.writeData(it, packet)
         }
         val replies = ByteArrayOutputStream()
         assertArrayEquals(packet, TcpPeerProtocol.readData(ByteArrayInputStream(stream.toByteArray()), replies))
+        assertTrue(stream.toString(Charsets.US_ASCII.name()).startsWith("TPCP/2 KEEPALIVE\r\n\r\nTPF/1 DATA"))
         assertTrue(replies.toString(Charsets.US_ASCII.name()).contains("TPCP/2 PONG"))
     }
 

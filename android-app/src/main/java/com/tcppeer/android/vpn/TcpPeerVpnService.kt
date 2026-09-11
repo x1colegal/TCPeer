@@ -734,7 +734,7 @@ class TcpPeerVpnService : VpnService() {
                         closeQuietly(socket)
                         return@launch
                     }
-                    synchronized(output) { TcpPeerProtocol.writeTpfControl(output, "KEEPALIVE") }
+                    synchronized(output) { TcpPeerProtocol.writeDataPlaneControl(output, "KEEPALIVE") }
                 }
             }
             try {
@@ -835,7 +835,7 @@ class TcpPeerVpnService : VpnService() {
                         closeQuietly(socket)
                         return@launch
                     }
-                    synchronized(output) { TcpPeerProtocol.writeTpfControl(output, "KEEPALIVE") }
+                    synchronized(output) { TcpPeerProtocol.writeDataPlaneControl(output, "KEEPALIVE") }
                 }
             }
             try {
@@ -1507,7 +1507,7 @@ class TcpPeerVpnService : VpnService() {
                     return@launch
                 }
                 synchronized(directOutput) {
-                    TcpPeerProtocol.writeTpfControl(directOutput, "KEEPALIVE")
+                    TcpPeerProtocol.writeDataPlaneControl(directOutput, "KEEPALIVE")
                 }
             }
         }

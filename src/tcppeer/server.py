@@ -24,7 +24,7 @@ from tcppeer.dhcp import DhcpServer
 from tcppeer.dns import discover_upstream_dns
 from tcppeer.exit_node import ExitNodeFirewall
 from tcppeer.packet import build_dhcp_packet, extract_dhcp_payload
-from tcppeer.protocol import ControlMessage, ProtocolError, encode_data, encode_tpf_control, read_control, read_data
+from tcppeer.protocol import ControlMessage, ProtocolError, encode_data, encode_data_plane_control, read_control, read_data
 from tcppeer.ra import ALL_NODES, LINK_LOCAL_ROUTER, build_router_advertisement, ipv6_source, is_router_solicitation
 from tcppeer.pd import PrefixDelegationClient, discover_ipv6_upstream, router_address, slaac_subnet
 from tcppeer.state import StateStore
@@ -741,7 +741,7 @@ class Server:
                     LOG.warning("data-plane liveness timeout peer_id=%s; closing direct stream", peer_id)
                     writer.close()
                     return
-                writer.write(encode_tpf_control("KEEPALIVE"))
+                writer.write(encode_data_plane_control("KEEPALIVE"))
                 await writer.drain()
 
         keepalive_task = asyncio.create_task(data_plane_keepalive())

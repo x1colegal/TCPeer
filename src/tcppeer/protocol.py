@@ -389,12 +389,11 @@ def encode_data(packet: bytes) -> bytes:
     return f"TPF/1 DATA\r\nLength: {len(payload)}\r\n\r\n".encode("ascii") + payload
 
 
-def encode_tpf_control(command: str) -> bytes:
-    """Encode an in-band TPCP liveness command in a TPF frame."""
+def encode_data_plane_control(command: str) -> bytes:
+    """Encode a top-level TPCP liveness command for the direct stream."""
     if command not in {"KEEPALIVE", "PONG"}:
         raise ProtocolError("invalid TPF TPCP command")
-    payload = f"TPCP/2 {command}\r\n\r\n".encode("ascii")
-    return f"TPF/1 TPCP\r\nLength: {len(payload)}\r\n\r\n".encode("ascii") + payload
+    return f"TPCP/2 {command}\r\n\r\n".encode("ascii")
 
 
 def _parse_tcpd_header(header: bytes) -> dict[str, str]:
@@ -682,8 +681,19 @@ async def read_data(reader, writer=None, activity=None) -> bytes:
             lines = header[:-4].decode("ascii").split("\r\n")
         except UnicodeDecodeError as exc:
             raise ProtocolError("TPF header is not ASCII") from exc
-        if len(lines) != 2 or lines[0] not in {"TPF/1 DATA", "TPF/1 TPCP"}:
-            raise ProtocolError("invalid TPF header")
+        if lines == ["TPCP/2 KEEPALIVE"]:
+            if writer is not None:
+                writer.write(encode_data_plane_control("PONG"))
+                await writer.drain()
+            if activity is not None:
+                activity()
+            continue
+        if lines == ["TPCP/2 PONG"]:
+            if activity is not None:
+                activity()
+            continue
+        if len(lines) != 2 or lines[0] != "TPF/1 DATA":
+            raise ProtocolError("invalid direct-stream message")
         if not lines[1].startswith("Length: "):
             raise ProtocolError("invalid TPF Length field")
         try:
@@ -698,17 +708,4 @@ async def read_data(reader, writer=None, activity=None) -> bytes:
             raise ProtocolError("connection closed inside TPF payload") from exc
         if activity is not None:
             activity()
-        if lines[0] == "TPF/1 DATA":
-            return decode_data(payload)
-        try:
-            command = payload.decode("ascii")
-        except UnicodeDecodeError as exc:
-            raise ProtocolError("TPF TPCP payload is not ASCII") from exc
-        if command == "TPCP/2 KEEPALIVE\r\n\r\n":
-            if writer is not None:
-                writer.write(encode_tpf_control("PONG"))
-                await writer.drain()
-            continue
-        if command == "TPCP/2 PONG\r\n\r\n":
-            continue
-        raise ProtocolError("invalid TPF TPCP command")
+        return decode_data(payload)

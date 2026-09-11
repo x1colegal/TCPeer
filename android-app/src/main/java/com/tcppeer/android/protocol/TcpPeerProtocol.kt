@@ -335,11 +335,9 @@ object TcpPeerProtocol {
         output.write(frame)
     }
 
-    fun writeTpfControl(output: OutputStream, command: String) {
+    fun writeDataPlaneControl(output: OutputStream, command: String) {
         require(command == "KEEPALIVE" || command == "PONG")
-        val payload = "TPCP/2 $command\r\n\r\n".toByteArray(StandardCharsets.US_ASCII)
-        val header = "TPF/1 TPCP\r\nLength: ${payload.size}\r\n\r\n".toByteArray(StandardCharsets.US_ASCII)
-        output.write(header + payload)
+        output.write("TPCP/2 $command\r\n\r\n".toByteArray(StandardCharsets.US_ASCII))
         output.flush()
     }
 
@@ -347,32 +345,36 @@ object TcpPeerProtocol {
         while (true) {
             val header = input.readAsciiHeader(256)
             val lines = header.split("\r\n")
-            if (lines.size != 2 || lines[0] !in setOf("TPF/1 DATA", "TPF/1 TPCP"))
-                throw ProtocolException("Invalid TPF header")
+            when (lines) {
+                listOf("TPCP/2 KEEPALIVE") -> {
+                    output?.let { synchronized(it) { writeDataPlaneControl(it, "PONG") } }
+                    activity?.invoke()
+                    continue
+                }
+                listOf("TPCP/2 PONG") -> {
+                    activity?.invoke()
+                    continue
+                }
+            }
+            if (lines.size != 2 || lines[0] != "TPF/1 DATA")
+                throw ProtocolException("Invalid direct-stream message")
             if (!lines[1].startsWith("Length: ")) throw ProtocolException("Invalid TPF Length field")
             val length = lines[1].removePrefix("Length: ").toIntOrNull()
                 ?: throw ProtocolException("Invalid TPF payload length")
             if (length !in 1..MAX_PACKET_SIZE) throw ProtocolException("TPF payload length is out of range")
             val payload = input.readExactly(length)
             activity?.invoke()
-            if (lines[0] == "TPF/1 DATA") {
-                val version = (payload[0].toInt() ushr 4) and 0x0f
-                if (version != 4 && version != 6) throw ProtocolException("TPF DATA is neither IPv4 nor IPv6")
-                val declared = if (version == 4) {
-                    if (payload.size < 20) throw ProtocolException("Truncated IPv4 header")
-                    ((payload[2].toInt() and 0xff) shl 8) or (payload[3].toInt() and 0xff)
-                } else {
-                    if (payload.size < 40) throw ProtocolException("Truncated IPv6 header")
-                    40 + (((payload[4].toInt() and 0xff) shl 8) or (payload[5].toInt() and 0xff))
-                }
-                if (declared != payload.size) throw ProtocolException("TPF length does not match IP packet length")
-                return payload
+            val version = (payload[0].toInt() ushr 4) and 0x0f
+            if (version != 4 && version != 6) throw ProtocolException("TPF DATA is neither IPv4 nor IPv6")
+            val declared = if (version == 4) {
+                if (payload.size < 20) throw ProtocolException("Truncated IPv4 header")
+                ((payload[2].toInt() and 0xff) shl 8) or (payload[3].toInt() and 0xff)
+            } else {
+                if (payload.size < 40) throw ProtocolException("Truncated IPv6 header")
+                40 + (((payload[4].toInt() and 0xff) shl 8) or (payload[5].toInt() and 0xff))
             }
-            when (payload.toString(StandardCharsets.US_ASCII)) {
-                "TPCP/2 KEEPALIVE\r\n\r\n" -> output?.let { synchronized(it) { writeTpfControl(it, "PONG") } }
-                "TPCP/2 PONG\r\n\r\n" -> Unit
-                else -> throw ProtocolException("Invalid TPF TPCP command")
-            }
+            if (declared != payload.size) throw ProtocolException("TPF length does not match IP packet length")
+            return payload
         }
     }
 }

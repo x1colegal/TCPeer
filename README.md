@@ -144,7 +144,7 @@ IPv6
 
 # TCPeer Framing
 
-**TPF** means **TCPeer Framing**. It gives the direct TCP byte stream explicit packet boundaries and allows small TPCP liveness messages to share that stream without being confused with tunneled IP traffic.
+**TPF** means **TCPeer Framing**. It gives binary IP packets explicit boundaries in the direct TCP byte stream. TPF is used exclusively for `DATA`.
 
 Every frame begins with a cleartext ASCII header:
 
@@ -157,17 +157,14 @@ Length: 1280\r\n
 
 `Length` is decimal ASCII and specifies the exact payload size. A DATA payload remains the original binary IP packet; TPF does not reconstruct transport headers or alter application bytes. Invalid types, non-ASCII headers, invalid lengths, truncated payloads, and non-IP DATA payloads terminate the connection instead of leaving the TCP stream silently desynchronized.
 
-The data plane also carries TPCP liveness messages:
+TPCP liveness messages share the direct TCP stream as independent top-level messages; they are not inside TPF:
 
 ```text
-TPF/1 TPCP\r\n
-Length: 20\r\n
-\r\n
 TPCP/2 KEEPALIVE\r\n
 \r\n
 ```
 
-The receiver answers with `TPCP PONG`. This traffic keeps stateful NAT mappings active and makes a dead direct path observable even when no tunneled packets are being exchanged. TPF is not TCPD: it contains only a frame type and payload length and does not translate IP or transport headers.
+The receiver answers with a top-level `TPCP/2 PONG` message. This traffic keeps stateful NAT mappings active and makes a dead direct path observable even when no tunneled packets are being exchanged. The stream parser distinguishes the ASCII `TPCP/2` first line from the ASCII `TPF/1 DATA` first line. TPF is not TCPD: it contains only a DATA payload length and does not translate IP or transport headers.
 
 ---
 
@@ -1363,7 +1360,7 @@ Typical direct port:
 
 The sender validates the IP packet length, creates an ASCII `TPF/1 DATA` header with a decimal `Length`, and writes the header and unchanged binary packet payload as one frame. The receiver reads the header terminator, validates its ASCII fields and bounded length, then reads exactly that payload. TCP segmentation and coalescing therefore cannot change TPF frame boundaries.
 
-`TPF/1 TPCP` frames carry only data-plane liveness commands. A peer sends `KEEPALIVE` every 15 seconds and the receiver returns `PONG`. Both are consumed by the TPF layer and are never written to the TUN. Unknown commands or malformed frames close the direct connection.
+Top-level `TPCP/2 KEEPALIVE` messages are sent every 15 seconds and receive a top-level `TPCP/2 PONG`. They are consumed by the direct-stream protocol parser and are never written to the TUN. Only binary IP packets are encapsulated in TPF DATA frames. Unknown commands or malformed messages close the direct connection.
 
 The inner IPv4 or IPv6 packet remains intact, including transport headers, checksums, and application bytes. TPF does not perform the header conversion or reconstruction previously associated with TCPD.
 
@@ -1783,11 +1780,11 @@ end-to-end encrypted application protocols
 
 # Protocol summary
 
-The Coordinator control stream uses TPCP for authentication, discovery, endpoint registration, and simultaneous-open coordination. Direct TCP4/TCP6 streams use TPF. `DATA` frames contain binary IPv4/IPv6 packets; `TPCP` frames contain the `KEEPALIVE` and `PONG` liveness subset. TPP remains an IPv6 Next Header 99 protocol inside a TPF DATA payload.
+The Coordinator control stream uses TPCP for authentication, discovery, endpoint registration, and simultaneous-open coordination. Direct TCP4/TCP6 streams contain TPF DATA frames and top-level TPCP `KEEPALIVE`/`PONG` messages. Only binary IPv4/IPv6 packets are placed inside TPF. TPP remains an IPv6 Next Header 99 protocol inside a TPF DATA payload.
 
 ```text
 Coordinator <-- TPCP control --> Peer
-Peer <== direct TCP + TPF DATA/TPCP ==> Peer
+Peer <== direct TCP + (TPF DATA or TPCP liveness) ==> Peer
 ```
 
 The Coordinator never relays these data-plane frames. TCPD is not used.
