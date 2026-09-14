@@ -622,6 +622,8 @@ class Server:
             await asyncio.sleep(delay)
         peer_id = message.get("Peer-ID") or "unknown"
         attempt = self._next_direct_attempt()
+        writer = None
+        handed_off = False
         try:
             candidate = self._direct_candidates.pop(family, None)
             LOG.info(
@@ -639,6 +641,29 @@ class Server:
             reader, writer = await DirectConnector().connect(
                 local, remote, family, prebound_socket=candidate, peer_id=peer_id, attempt=attempt,
             )
+            writer.write(ControlMessage("PEER-INFO", {
+                "Network": self.config.network, "Peer-ID": self.config.peer_id,
+                "IPv4": self._registered_ipv4 or "", "IPv6": self._registered_ipv6 or "",
+            }).encode())
+            await writer.drain()
+            peer_info = await read_control(reader)
+            if peer_info.command != "PEER-INFO" or peer_info.get("Network") != self.config.network:
+                raise ProtocolError("invalid direct peer handshake")
+            required_family = choose_family(
+                [self._registered_ipv6 or ""], [peer_info.get("IPv6") or ""],
+            )
+            if required_family != family:
+                raise ProtocolError("coordinator selected a family that violates IPv6-first policy")
+            handed_off = True
+            await self._adopt_direct(
+                reader,
+                writer,
+                peer_id,
+                family,
+                f"{remote.address}:{remote.port}",
+                initiated=True,
+                attempt=attempt,
+            )
         except asyncio.CancelledError:
             LOG.info(
                 "direct-connect cancelled ts=%.6f peer_id=%s family=%s attempt=%s initiated=yes",
@@ -651,30 +676,14 @@ class Server:
         except DirectConnectionError:
             self.store.update_peer(peer_id, transport="No Direct Connection")
             raise
-        writer.write(ControlMessage("PEER-INFO", {
-            "Network": self.config.network, "Peer-ID": self.config.peer_id,
-            "IPv4": self._registered_ipv4 or "", "IPv6": self._registered_ipv6 or "",
-        }).encode())
-        await writer.drain()
-        peer_info = await read_control(reader)
-        if peer_info.command != "PEER-INFO" or peer_info.get("Network") != self.config.network:
-            writer.close()
-            raise ProtocolError("invalid direct peer handshake")
-        required_family = choose_family(
-            [self._registered_ipv6 or ""], [peer_info.get("IPv6") or ""],
-        )
-        if required_family != family:
-            writer.close()
-            raise ProtocolError("coordinator selected a family that violates IPv6-first policy")
-        await self._adopt_direct(
-            reader,
-            writer,
-            peer_id,
-            family,
-            f"{remote.address}:{remote.port}",
-            initiated=True,
-            attempt=attempt,
-        )
+        finally:
+            # A connector can be cancelled after connect() succeeds but before
+            # the stream is handed to _adopt_direct().  In that window the raw
+            # socket is owned by StreamWriter, so DirectConnector cannot close
+            # it for us.
+            if writer is not None and not handed_off:
+                writer.close()
+                await asyncio.gather(writer.wait_closed(), return_exceptions=True)
 
     def _prepare_remote_route(self, address: str, family: socket.AddressFamily) -> None:
         """Hook used by full-tunnel clients to keep outer TCP off their TUN."""
@@ -704,6 +713,7 @@ class Server:
         replaced_writer = None
         replaced_peer_id = None
         packet_count = 0
+        losing_connect_task = None
 
         async with self._direct_adoption_lock:
             current_writer = self.direct_writers.get(peer_id)
@@ -734,6 +744,20 @@ class Server:
             self._direct_owner_tokens[peer_id] = token
             self._direct_owner_keys[peer_id] = connection_key
             self._direct_owner_committed.discard(peer_id)
+            losing_connect_task = self._competing_direct_connect_task(
+                peer_id, asyncio.current_task(),
+            )
+
+        if losing_connect_task is not None:
+            LOG.info(
+                "direct-connect cancel-loser ts=%.6f peer_id=%s family=%s attempt=%s initiated=%s reason=direct-stream-adopted",
+                time.time(),
+                peer_id,
+                "tcp6" if family == socket.AF_INET6 else "tcp4",
+                attempt,
+                "yes" if initiated else "no",
+            )
+            losing_connect_task.cancel()
 
         if replaced_writer is not None and replaced_writer is not writer:
             LOG.info(
@@ -884,6 +908,26 @@ class Server:
     def _clear_direct_connect_task(self, peer_id: str, task: asyncio.Task) -> None:
         if self._direct_connect_tasks.get(peer_id) is task:
             self._direct_connect_tasks.pop(peer_id, None)
+        if task.cancelled():
+            return
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            return
+        if error is not None:
+            LOG.warning(
+                "direct-connect task ended ts=%.6f peer_id=%s reason=%s",
+                time.time(), peer_id, error,
+            )
+
+    def _competing_direct_connect_task(
+        self, peer_id: str, current_task: asyncio.Task | None,
+    ) -> asyncio.Task | None:
+        """Return only a live connector that did not adopt this stream."""
+        task = self._direct_connect_tasks.get(peer_id)
+        if task is None or task is current_task or task.done():
+            return None
+        return task
 
     @staticmethod
     def _socket_fd(writer) -> int | None:

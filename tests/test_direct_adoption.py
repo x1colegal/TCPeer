@@ -79,3 +79,52 @@ def test_auto_discovered_ipv4_gets_a_passive_listener(monkeypatch) -> None:
         ("2001:db8::10", 7444, socket.AF_INET6, True),
         ("192.0.2.10", 7444, socket.AF_INET, True),
     ]
+
+
+def test_passive_adoption_selects_only_same_peer_active_attempt_for_cancel() -> None:
+    async def scenario() -> None:
+        server = Server.__new__(Server)
+        phone_attempt = asyncio.create_task(asyncio.Event().wait())
+        laptop_attempt = asyncio.create_task(asyncio.Event().wait())
+        server._direct_connect_tasks = {
+            "phone": phone_attempt,
+            "laptop": laptop_attempt,
+        }
+
+        assert server._competing_direct_connect_task("phone", asyncio.current_task()) is phone_attempt
+        assert server._competing_direct_connect_task("missing", asyncio.current_task()) is None
+
+        phone_attempt.cancel()
+        laptop_attempt.cancel()
+        await asyncio.gather(phone_attempt, laptop_attempt, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_initiated_adoption_does_not_cancel_its_own_attempt() -> None:
+    async def scenario() -> None:
+        server = Server.__new__(Server)
+        current = asyncio.current_task()
+        server._direct_connect_tasks = {"phone": current}
+
+        assert server._competing_direct_connect_task("phone", current) is None
+
+    asyncio.run(scenario())
+
+
+def test_direct_connect_done_callback_retrieves_failure() -> None:
+    async def scenario() -> None:
+        server = Server.__new__(Server)
+
+        async def fail() -> None:
+            raise RuntimeError("expected failure")
+
+        task = asyncio.create_task(fail())
+        server._direct_connect_tasks = {"phone": task}
+        await asyncio.wait({task})
+        server._clear_direct_connect_task("phone", task)
+
+        assert "phone" not in server._direct_connect_tasks
+        assert task.exception() is not None
+
+    asyncio.run(scenario())
