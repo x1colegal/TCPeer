@@ -322,7 +322,9 @@ class TcpPeerVpnService : VpnService() {
             "Endpoint discovery network=$physicalNetwork IPv4=${localIpv4.joinToString { it.hostAddress.orEmpty() }} " +
                 "IPv6=${localIpv6.joinToString { it.hostAddress?.substringBefore('%').orEmpty() }}",
         )
-        val coordinator = openCoordinator(config, localIpv6.isNotEmpty()).also { coordinatorSocket = it }
+        val coordinator = openCoordinator(
+            config, localIpv6.isNotEmpty(), physicalNetwork,
+        ).also { coordinatorSocket = it }
         val controlInput = coordinator.getInputStream()
         val controlOutput = coordinator.getOutputStream()
 
@@ -345,8 +347,12 @@ class TcpPeerVpnService : VpnService() {
         val observed = TcpPeerProtocol.readControl(controlInput)
         if (observed.command != "ENDPOINT-INFO") throw ProtocolException("Coordinator did not report the TCP mapping")
 
-        val endpointIpv4 = if (localIpv4.isNotEmpty()) queryPublicEndpoint(config, DirectFamily.IPV4) else null
-        val endpointIpv6 = if (localIpv6.isNotEmpty()) queryPublicEndpoint(config, DirectFamily.IPV6) else null
+        val endpointIpv4 = if (localIpv4.isNotEmpty()) {
+            queryPublicEndpoint(config, DirectFamily.IPV4, physicalNetwork)
+        } else null
+        val endpointIpv6 = if (localIpv6.isNotEmpty()) {
+            queryPublicEndpoint(config, DirectFamily.IPV6, physicalNetwork)
+        } else null
         val directPublicIpv4 = localIpv4.firstOrNull(TransportPolicy::isPublicIpv4)?.hostAddress
         val directPublicIpv6 = localIpv6.firstOrNull(TransportPolicy::isPublicIpv6)?.hostAddress?.substringBefore('%')
         val advertisedIpv4 = endpointIpv4?.address ?: directPublicIpv4.orEmpty()
@@ -1076,8 +1082,28 @@ class TcpPeerVpnService : VpnService() {
         TcpPeerRuntime.update { it.copy(status = ConnectionStatus.CONNECTING, detail = detail) }
     }
 
-    private fun openCoordinator(config: VpnConfiguration, preferIpv6: Boolean): Socket {
-        val addresses = TransportPolicy.resolveTcpAddresses(config.coordinatorAddress).sortedBy {
+    private fun resolveCoordinatorAddresses(
+        host: String,
+        physicalNetwork: Network?,
+    ): List<InetAddress> {
+        val normalized = host.trim().removeSurrounding("[", "]")
+        require(normalized.isNotEmpty()) { "Coordinator DNS name or IP address is required" }
+        return try {
+            physicalNetwork?.getAllByName(normalized)?.toList()
+                ?: TransportPolicy.resolveTcpAddresses(normalized)
+        } catch (error: java.net.UnknownHostException) {
+            throw IllegalArgumentException("Cannot resolve coordinator DNS name: $host", error)
+        }
+    }
+
+    private fun openCoordinator(
+        config: VpnConfiguration,
+        preferIpv6: Boolean,
+        physicalNetwork: Network?,
+    ): Socket {
+        val addresses = resolveCoordinatorAddresses(
+            config.coordinatorAddress, physicalNetwork,
+        ).sortedBy {
             if (preferIpv6) if (it is Inet6Address) 0 else 1 else if (it is Inet4Address) 0 else 1
         }
         var lastError: Exception? = null
@@ -1086,6 +1112,7 @@ class TcpPeerVpnService : VpnService() {
             val socket = Socket()
             try {
                 socket.reuseAddress = true
+                physicalNetwork?.bindSocket(socket)
                 val wildcard = if (address is Inet6Address) InetAddress.getByName("::") else InetAddress.getByName("0.0.0.0")
                 // The coordinator is control-plane traffic. Binding it to the direct
                 // port conflicts with the passive TCP listener on Android kernels.
@@ -1105,8 +1132,14 @@ class TcpPeerVpnService : VpnService() {
         throw IllegalStateException("Cannot connect to the coordinator", lastError)
     }
 
-    private fun queryPublicEndpoint(config: VpnConfiguration, family: DirectFamily): PublicEndpoint? {
-        val addresses = TransportPolicy.resolveTcpAddresses(config.coordinatorAddress).filter {
+    private fun queryPublicEndpoint(
+        config: VpnConfiguration,
+        family: DirectFamily,
+        physicalNetwork: Network?,
+    ): PublicEndpoint? {
+        val addresses = resolveCoordinatorAddresses(
+            config.coordinatorAddress, physicalNetwork,
+        ).filter {
             (family == DirectFamily.IPV6 && it is Inet6Address) ||
                 (family == DirectFamily.IPV4 && it is Inet4Address)
         }
@@ -1114,6 +1147,7 @@ class TcpPeerVpnService : VpnService() {
             val socket = Socket()
             try {
                 socket.reuseAddress = true
+                physicalNetwork?.bindSocket(socket)
                 val wildcard = if (family == DirectFamily.IPV6) InetAddress.getByName("::") else InetAddress.getByName("0.0.0.0")
                 socket.bind(InetSocketAddress(wildcard, config.directPort))
                 if (!protect(socket)) throw IllegalStateException("Cannot protect the endpoint query socket")
@@ -1128,8 +1162,13 @@ class TcpPeerVpnService : VpnService() {
                         return PublicEndpoint(endpointAddress, endpointPort)
                     }
                 }
-            } catch (_: Exception) {
-                // The other IP family is optional.
+            } catch (error: Exception) {
+                Log.w(
+                    TAG,
+                    "${familyLabel(family)} endpoint discovery failed " +
+                        "network=$physicalNetwork coordinator=${address.hostAddress}",
+                    error,
+                )
             } finally {
                 socket.close()
             }
