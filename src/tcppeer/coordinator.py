@@ -48,6 +48,7 @@ class RegisteredPeer:
     ready_for: set[str] = field(default_factory=set)
     connected_at: float = field(default_factory=time.monotonic)
     last_punch_peer: str | None = None
+    registered: bool = False
 
 
 @dataclass
@@ -161,7 +162,11 @@ class Coordinator:
             peer = RegisteredPeer(network, peer_id, writer, observed_address, observed_port)
             self.peers[key] = peer
             known = self.known_peers.get(key) or KnownPeer(network=network, peer_id=peer_id)
-            known.online = True
+            # Authentication alone does not make a peer reachable. Android
+            # still has to discover its mapped endpoints and send REGISTER;
+            # advertising it before then lets another peer inject a
+            # Punch-Request into that registration exchange.
+            known.online = False
             known.endpoint = f"[{observed_address}]:{observed_port}" if ":" in observed_address else f"{observed_address}:{observed_port}"
             known.transport = "TCP6" if ipaddress.ip_address(observed_address).version == 6 else "TCP4"
             known.last_seen = int(time.time())
@@ -250,6 +255,7 @@ class Coordinator:
             known.ipv6 = peer.declared_ipv6 or ""
             known.overlay_ipv4 = message.get("Overlay-IPv4") or known.overlay_ipv4
             known.overlay_ipv6 = message.get("Overlay-IPv6") or known.overlay_ipv6
+            peer.registered = True
             known.online = True
             known.last_seen = int(time.time())
             self._persist(known)
@@ -296,7 +302,7 @@ class Coordinator:
             async with self._punch_lock:
                 peer.ready_for.add(target_id)
                 target = self.peers.get((peer.network, target_id))
-                if target is None:
+                if not peer.registered or target is None or not target.registered:
                     await self.send(peer.writer, "ERROR", Reason="requested peer is unavailable")
                     return
                 if peer.peer_id not in target.ready_for:
