@@ -67,7 +67,12 @@ def test_offline_device_list_hides_physical_addresses_and_transport(tmp_path: Pa
     assert b"Transport: -\r\n" in message
     assert b"IPv4: \r\n" in message
     assert b"IPv6: \r\n" in message
+    assert b"Overlay-IPv4: \r\n" in message
+    assert b"Overlay-IPv6: \r\n" in message
     assert b"198.51.100.2" not in message
     assert b"2001:db8::2" not in message
+    assert b"10.50.0.10" not in message
+    assert b"fd00::10" not in message
     assert coordinator.known_peers[("home", "phone")].ipv6 == "2001:db8::2"
+    assert coordinator.known_peers[("home", "phone")].overlay_ipv6 == "fd00::10"
     coordinator.store.close()

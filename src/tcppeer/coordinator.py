@@ -439,8 +439,8 @@ class Coordinator:
                 "Transport": known.transport if online else "-",
                 "IPv4": known.ipv4 if online else "",
                 "IPv6": known.ipv6 if online else "",
-                "Overlay-IPv4": known.overlay_ipv4,
-                "Overlay-IPv6": known.overlay_ipv6,
+                "Overlay-IPv4": known.overlay_ipv4 if online else "",
+                "Overlay-IPv6": known.overlay_ipv6 if online else "",
                 "Endpoint": known.endpoint,
                 "Last-Seen": str(known.last_seen),
             })
