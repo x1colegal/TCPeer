@@ -175,11 +175,9 @@ class TcpPeerVpnService : VpnService() {
         serviceScope.launch {
             runCatching {
                 coordinatorSocket?.takeUnless { it.isClosed }?.getOutputStream()?.let { output ->
-                    synchronized(output) {
-                        TcpPeerProtocol.writeControl(output, ControlMessage("PEER-INFO", linkedMapOf(
-                            "Action" to "Rename", "Device-Name" to displayName,
-                        )))
-                    }
+                    writeCoordinatorControl(output, ControlMessage("PEER-INFO", linkedMapOf(
+                        "Action" to "Rename", "Device-Name" to displayName,
+                    )))
                 }
             }.onFailure { Log.w(TAG, "Could not rename this device while connected", it) }
         }
@@ -294,7 +292,7 @@ class TcpPeerVpnService : VpnService() {
             .take(300)
         runCatching {
             coordinatorSocket?.takeUnless { it.isClosed }?.getOutputStream()?.let { output ->
-                TcpPeerProtocol.writeControl(output, ControlMessage("PEER-INFO", linkedMapOf(
+                writeCoordinatorControl(output, ControlMessage("PEER-INFO", linkedMapOf(
                     "Action" to "Client-Error",
                     "Detail" to detail,
                 )))
@@ -329,7 +327,7 @@ class TcpPeerVpnService : VpnService() {
         val controlOutput = coordinator.getOutputStream()
 
         updateConnecting("Authenticating with the coordinator over cleartext TCP.")
-        TcpPeerProtocol.writeControl(controlOutput, ControlMessage("AUTH", linkedMapOf(
+        writeCoordinatorControl(controlOutput, ControlMessage("AUTH", linkedMapOf(
             "Network" to config.network,
             "Peer-ID" to config.peerId,
         )))
@@ -337,7 +335,7 @@ class TcpPeerVpnService : VpnService() {
         if (challenge.command != "AUTH-CHALLENGE") {
             throw ProtocolException(challenge.field("Reason") ?: "Coordinator did not issue an authentication challenge")
         }
-        TcpPeerProtocol.writeControl(controlOutput, ControlMessage("AUTH-PROOF", linkedMapOf(
+        writeCoordinatorControl(controlOutput, ControlMessage("AUTH-PROOF", linkedMapOf(
             "Proof" to AuthProof.create(config.secret, config.network, config.peerId, challenge.field("Nonce").orEmpty()),
         )))
         val authentication = TcpPeerProtocol.readControl(controlInput)
@@ -360,7 +358,7 @@ class TcpPeerVpnService : VpnService() {
         val mappedIpv4Port = endpointIpv4?.port ?: if (directPublicIpv4 != null) config.directPort else null
         val mappedIpv6Port = endpointIpv6?.port ?: if (directPublicIpv6 != null) config.directPort else null
 
-        TcpPeerProtocol.writeControl(controlOutput, ControlMessage("REGISTER", linkedMapOf(
+        writeCoordinatorControl(controlOutput, ControlMessage("REGISTER", linkedMapOf(
             "Peer-ID" to config.peerId,
             "Device-Name" to config.deviceName,
             "IPv4" to advertisedIpv4,
@@ -379,7 +377,7 @@ class TcpPeerVpnService : VpnService() {
             "ENDPOINT-INFO",
             "registration",
         )
-        TcpPeerProtocol.writeControl(controlOutput, ControlMessage("PEER-INFO", mapOf("Action" to "List")))
+        writeCoordinatorControl(controlOutput, ControlMessage("PEER-INFO", mapOf("Action" to "List")))
         readDeviceList(controlInput)
         val targetPeerId = config.targetPeerId
         var family: DirectFamily
@@ -389,7 +387,7 @@ class TcpPeerVpnService : VpnService() {
 
         while (true) {
             updateConnecting("Waiting for $targetPeerId to become ready.")
-            TcpPeerProtocol.writeControl(controlOutput, ControlMessage("PUNCH-READY", mapOf(
+            writeCoordinatorControl(controlOutput, ControlMessage("PUNCH-READY", mapOf(
                 "Peer-ID" to targetPeerId,
             )))
 
@@ -489,7 +487,7 @@ class TcpPeerVpnService : VpnService() {
 
         Log.i(TAG, "Sending Overlay-Update to coordinator")
 
-        TcpPeerProtocol.writeControl(controlOutput, ControlMessage("PEER-INFO", linkedMapOf(
+        writeCoordinatorControl(controlOutput, ControlMessage("PEER-INFO", linkedMapOf(
             "Action" to "Overlay-Update",
             "Overlay-IPv4" to (addresses.first.address.hostAddress ?: ""),
             "Overlay-IPv6" to (addresses.second.address.hostAddress ?: ""),
@@ -553,7 +551,7 @@ class TcpPeerVpnService : VpnService() {
                     if (!listInProgress) {
                         devices.clear()
                         listInProgress = true
-                        TcpPeerProtocol.writeControl(
+                        writeCoordinatorControl(
                             controlOutput,
                             ControlMessage("PEER-INFO", mapOf("Action" to "List")),
                         )
@@ -590,12 +588,10 @@ class TcpPeerVpnService : VpnService() {
                                         !meshSockets.containsKey(device.peerId) &&
                                         meshConnecting.add(device.peerId)
                                     ) {
-                                        synchronized(controlOutput) {
-                                            TcpPeerProtocol.writeControl(
-                                                controlOutput,
-                                                ControlMessage("PUNCH-READY", mapOf("Peer-ID" to device.peerId)),
-                                            )
-                                        }
+                                        writeCoordinatorControl(
+                                            controlOutput,
+                                            ControlMessage("PUNCH-READY", mapOf("Peer-ID" to device.peerId)),
+                                        )
                                     }
                                 }
 
@@ -615,15 +611,13 @@ class TcpPeerVpnService : VpnService() {
                                 "Punch-Request" -> {
                                     val requestedPeer = message.field("Peer-ID") ?: targetPeerId
                                     if (!meshSockets.containsKey(requestedPeer)) {
-                                        synchronized(controlOutput) {
-                                            TcpPeerProtocol.writeControl(
-                                                controlOutput,
-                                                ControlMessage(
-                                                    "PUNCH-READY",
-                                                    mapOf("Peer-ID" to requestedPeer),
-                                                ),
-                                            )
-                                        }
+                                        writeCoordinatorControl(
+                                            controlOutput,
+                                            ControlMessage(
+                                                "PUNCH-READY",
+                                                mapOf("Peer-ID" to requestedPeer),
+                                            ),
+                                        )
                                     } else {
                                         Log.i(
                                             TAG,
@@ -651,7 +645,7 @@ class TcpPeerVpnService : VpnService() {
                             }
 
                             "PING", "KEEPALIVE" -> {
-                                TcpPeerProtocol.writeControl(
+                                writeCoordinatorControl(
                                     controlOutput,
                                     ControlMessage("PONG"),
                                 )
@@ -1029,7 +1023,7 @@ class TcpPeerVpnService : VpnService() {
                     "PEER-INFO" -> if (message.field("Action") == "Punch-Request") {
                         val requestedPeer = message.field("Peer-ID")
                         if (requestedPeer == targetPeerId) {
-                            TcpPeerProtocol.writeControl(output, ControlMessage("PUNCH-READY", mapOf(
+                            writeCoordinatorControl(output, ControlMessage("PUNCH-READY", mapOf(
                                 "Peer-ID" to targetPeerId,
                             )))
                         } else {
@@ -1039,7 +1033,7 @@ class TcpPeerVpnService : VpnService() {
                             )
                         }
                     }
-                    "PING", "KEEPALIVE" -> TcpPeerProtocol.writeControl(output, ControlMessage("PONG"))
+                    "PING", "KEEPALIVE" -> writeCoordinatorControl(output, ControlMessage("PONG"))
                     "AUTH-ERROR", "DISCONNECT" -> throw ProtocolException(message.field("Reason") ?: "Coordinator disconnected")
                     "ERROR" -> throw ProtocolException(message.field("Reason") ?: "Coordinator rejected the direct connection")
                 }
@@ -1059,7 +1053,7 @@ class TcpPeerVpnService : VpnService() {
                 expectedCommand -> return message
                 "PING", "KEEPALIVE" -> {
                     Log.d(TAG, "Answered coordinator liveness probe while waiting for $phase")
-                    TcpPeerProtocol.writeControl(output, ControlMessage("PONG"))
+                    writeCoordinatorControl(output, ControlMessage("PONG"))
                 }
                 "AUTH-ERROR", "DISCONNECT", "ERROR" -> throw ProtocolException(
                     message.field("Reason") ?: "Coordinator rejected $phase",
@@ -1105,6 +1099,15 @@ class TcpPeerVpnService : VpnService() {
 
     private fun updateConnecting(detail: String) {
         TcpPeerRuntime.update { it.copy(status = ConnectionStatus.CONNECTING, detail = detail) }
+    }
+
+    private fun writeCoordinatorControl(
+        output: java.io.OutputStream,
+        message: ControlMessage,
+    ) {
+        synchronized(output) {
+            TcpPeerProtocol.writeControl(output, message)
+        }
     }
 
     private fun resolveCoordinatorAddresses(
