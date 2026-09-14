@@ -527,6 +527,16 @@ class TcpPeerVpnService : VpnService() {
             val tunWriterJob = launch(Dispatchers.IO) {
                 for (packet in tunPackets) tunOutput.write(packet)
             }
+            tunWriterJob.invokeOnCompletion { error ->
+                if (error != null && error !is CancellationException) {
+                    Log.e(
+                        TAG,
+                        "TUN writer stopped unexpectedly; closing the primary direct socket to reconnect",
+                        error,
+                    )
+                    closeQuietly(direct)
+                }
+            }
             prepareDirectListener(config.directPort, family)
             val passiveAcceptJob = launch(Dispatchers.IO) {
                 acceptMeshConnections(
@@ -669,6 +679,21 @@ class TcpPeerVpnService : VpnService() {
                         // Keep waiting for the current list. Do not start
                         // another List request until List-End arrives.
                     }
+                }
+            }
+            coordinatorControlJob.invokeOnCompletion { error ->
+                if (error != null && error !is CancellationException) {
+                    // java.io blocking reads do not observe coroutine
+                    // cancellation. Without closing this socket, peerToTun can
+                    // remain inside readData(), continue answering TPCP
+                    // keepalives, and keep the service looking connected after
+                    // the control plane and TUN writer have already died.
+                    Log.e(
+                        TAG,
+                        "Coordinator control worker stopped; closing the primary direct socket to reconnect",
+                        error,
+                    )
+                    closeQuietly(direct)
                 }
             }
 
