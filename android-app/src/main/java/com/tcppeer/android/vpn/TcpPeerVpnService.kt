@@ -77,6 +77,7 @@ class TcpPeerVpnService : VpnService() {
     private val meshConnecting = ConcurrentHashMap.newKeySet<String>()
     private val meshPunchActive = ConcurrentHashMap.newKeySet<String>()
     private val nextTppPingId = AtomicLong(System.nanoTime())
+    private val connectionGeneration = AtomicLong(0)
     private val pendingTppPings = ConcurrentHashMap<Long, Pair<String, Long>>()
     private val directListeners = mutableMapOf<DirectFamily, ServerSocket>()
     private var tunnel: ParcelFileDescriptor? = null
@@ -157,7 +158,14 @@ class TcpPeerVpnService : VpnService() {
         when (intent?.action) {
             ACTION_DISCONNECT -> disconnect()
             ACTION_RENAME_DEVICE -> renameDevice(intent.getStringExtra(EXTRA_DEVICE_NAME).orEmpty())
-            else -> if (connectionJob?.isActive != true) connect()
+            else -> {
+                // API 28 commonly delivers a new CONNECT to the service
+                // instance that handled DISCONNECT before onDestroy() runs.
+                // onCreate() is therefore not a reliable indication that a
+                // newly requested VPN session is active.
+                TcpPeerRuntime.setServiceActive(true)
+                if (connectionJob?.isActive != true) connect()
+            }
         }
         return Service.START_NOT_STICKY
     }
@@ -184,6 +192,7 @@ class TcpPeerVpnService : VpnService() {
 
     override fun onDestroy() {
         runCatching { connectivityManager.unregisterNetworkCallback(networkCallback) }
+        connectionGeneration.incrementAndGet()
         closeResources()
         TcpPeerRuntime.setServiceActive(false)
         serviceScope.cancel()
@@ -191,7 +200,9 @@ class TcpPeerVpnService : VpnService() {
     }
 
     private fun connect() {
+        val generation = connectionGeneration.incrementAndGet()
         disconnectRequested.set(false)
+        TcpPeerRuntime.setServiceActive(true)
         showForeground(ConnectionStatus.CONNECTING)
         TcpPeerRuntime.replace(VpnRuntimeState(
             status = ConnectionStatus.CONNECTING,
@@ -217,6 +228,13 @@ class TcpPeerVpnService : VpnService() {
                     updateNotification(ConnectionStatus.NO_DIRECT_CONNECTION)
                 }
             } finally {
+                // A cancelled API 28 service session may finish after a new
+                // ACTION_CONNECT has already started. Its cleanup must never
+                // close sockets or overwrite UI state owned by that new run.
+                if (connectionGeneration.get() != generation) {
+                    Log.i(TAG, "Ignoring cleanup from superseded connection generation=$generation")
+                    return@launch
+                }
                 closeResources()
 
                 val networkRestart = restartRequested.getAndSet(false)
@@ -1588,7 +1606,10 @@ class TcpPeerVpnService : VpnService() {
 
     private fun disconnect() {
         disconnectRequested.set(true)
-        connectionJob?.cancel()
+        connectionGeneration.incrementAndGet()
+        val stoppedJob = connectionJob
+        connectionJob = null
+        stoppedJob?.cancel()
         closeResources()
         TcpPeerRuntime.replace(VpnRuntimeState())
         TcpPeerRuntime.setServiceActive(false)
