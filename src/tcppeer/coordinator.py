@@ -426,16 +426,19 @@ class Coordinator:
             key=lambda known: (not known.online, (known.display_name or known.peer_id).casefold(), known.peer_id),
         )
         for known in devices:
+            online = known.online
             await self.send(peer.writer, "PEER-INFO", **{
                 "Action": "Device",
                 "Peer-ID": known.peer_id,
                 "Device-Name": known.display_name or known.peer_id,
-                "Online": "yes" if known.online else "no",
+                "Online": "yes" if online else "no",
                 "Role": known.role,
                 "Platform": known.platform,
-                "Transport": known.transport,
-                "IPv4": known.ipv4,
-                "IPv6": known.ipv6,
+                # Keep the last endpoint data persisted, but do not advertise
+                # stale physical addresses as usable while a peer is offline.
+                "Transport": known.transport if online else "-",
+                "IPv4": known.ipv4 if online else "",
+                "IPv6": known.ipv6 if online else "",
                 "Overlay-IPv4": known.overlay_ipv4,
                 "Overlay-IPv6": known.overlay_ipv6,
                 "Endpoint": known.endpoint,
