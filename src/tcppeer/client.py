@@ -27,6 +27,20 @@ from tcppeer.tun import TunDevice
 LOG = logging.getLogger("tcppeer.client")
 
 
+def _can_bind_local_address(address: str | None, family: socket.AddressFamily) -> bool:
+    """Return whether an address still belongs to this host."""
+    if not address:
+        return False
+    probe = socket.socket(family, socket.SOCK_STREAM, socket.IPPROTO_TCP)
+    try:
+        probe.bind((address, 0))
+        return True
+    except OSError:
+        return False
+    finally:
+        probe.close()
+
+
 class Client(Server):
     """A non-routing Linux peer; coordinator stays control-only and peers stay direct."""
 
@@ -165,6 +179,18 @@ class Client(Server):
             await asyncio.sleep(5)
             current_ipv4 = self.config.direct_ipv4 or discover_direct_ipv4({self.config.tun_name})
             current_ipv6 = self.config.direct_ipv6 or discover_direct_ipv6({self.config.tun_name})
+            # With an Exit Node active, the kernel's IPv4 route probe correctly
+            # selects tcppeer0. That is the VPN overlay, not a physical-address
+            # change. Keep tracking the original underlay source while it is
+            # still locally bindable; a vanished address still triggers the
+            # normal reconnect path below.
+            if (
+                self.config.use_exit_node
+                and self._configured.is_set()
+                and current_ipv4 == str(self._overlay_ipv4 or "")
+                and _can_bind_local_address(initial_ipv4, socket.AF_INET)
+            ):
+                current_ipv4 = initial_ipv4
             if current_ipv4 != initial_ipv4 or current_ipv6 != initial_ipv6:
                 LOG.warning(
                     "Physical addresses changed IPv4=%s->%s IPv6=%s->%s; reconnecting to re-register endpoints",
@@ -259,7 +285,10 @@ class Client(Server):
             ):
                 if family in self._upstream_routes:
                     self._prepare_remote_route(str(endpoint[0]), family)
-            routes += [("ip", "route", "replace", "default", "via", str(ipv4_router), "dev", self.tun.name), ("ip", "-6", "route", "replace", "default", "dev", self.tun.name)]
+            routes += [
+                ("ip", "route", "replace", "default", "via", str(ipv4_router), "dev", self.tun.name, "metric", "1"),
+                ("ip", "-6", "route", "replace", "default", "dev", self.tun.name, "metric", "1"),
+            ]
         for command in routes:
             subprocess.run(command, check=True, capture_output=True, text=True)
         if self.config.use_exit_node and dns:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import json
+import ipaddress
 import re
 import subprocess
 
@@ -44,7 +45,10 @@ class ExitNodeFirewall:
         upstream = self._upstream_interfaces() if (
             self.config.exit_node_enabled and self.config.software_flow_offload
         ) else ()
-        rules = self._ruleset(upstream)
+        nat44_route = self._selected_ipv4_route() if (
+            self.config.exit_node_enabled and self.config.nat44
+        ) else None
+        rules = self._ruleset(upstream, nat44_route)
         try:
             subprocess.run(
                 ("nft", "-f", "-"), input=rules, text=True,
@@ -59,7 +63,7 @@ class ExitNodeFirewall:
             self._delete_tables()
             try:
                 subprocess.run(
-                    ("nft", "-f", "-"), input=self._ruleset(()), text=True,
+                    ("nft", "-f", "-"), input=self._ruleset((), nat44_route), text=True,
                     check=True, capture_output=True,
                 )
             except subprocess.CalledProcessError as fallback_exc:
@@ -74,7 +78,11 @@ class ExitNodeFirewall:
     def close(self) -> None:
         self._delete_tables()
 
-    def _ruleset(self, upstream: tuple[str, ...] = ()) -> str:
+    def _ruleset(
+        self,
+        upstream: tuple[str, ...] = (),
+        nat44_route: tuple[str, str] | None = None,
+    ) -> str:
         tun = self.interface
         flowtable = ""
         flow_rules = ""
@@ -106,10 +114,14 @@ class ExitNodeFirewall:
   }}
 }}''')
         if self.config.nat44:
+            nat44_rule = f'iifname "{tun}" oifname != "{tun}" masquerade'
+            if nat44_route is not None:
+                device, source = nat44_route
+                nat44_rule = f'iifname "{tun}" oifname "{device}" snat to {source}'
             sections.append(f'''table ip tcppeer_nat44 {{
   chain postrouting {{
     type nat hook postrouting priority srcnat; policy accept;
-    iifname "{tun}" oifname != "{tun}" masquerade
+    {nat44_rule}
   }}
 }}''')
         if self.nat66_enabled:
@@ -120,6 +132,35 @@ class ExitNodeFirewall:
   }}
 }}''')
         return "\n\n".join(sections) + "\n"
+
+    def _selected_ipv4_route(self) -> tuple[str, str] | None:
+        """Return the default-route interface and source selected by Linux.
+
+        This matters for CLAT interfaces with more than one IPv4 address:
+        nftables masquerade may choose the interface's primary address even
+        though the kernel route has an explicit, different preferred source.
+        """
+        try:
+            result = subprocess.run(
+                ("ip", "-j", "-4", "route", "get", "192.0.2.1"),
+                check=True, capture_output=True, text=True,
+            )
+            routes = json.loads(result.stdout)
+            route = routes[0]
+            device = str(route["dev"])
+            source = str(route.get("prefsrc") or route["src"])
+            ipaddress.IPv4Address(source)
+        except (
+            FileNotFoundError, subprocess.CalledProcessError, json.JSONDecodeError,
+            IndexError, KeyError, TypeError, ValueError,
+        ) as exc:
+            LOG.warning("Could not discover the kernel-selected NAT44 source; using masquerade: %s", exc)
+            return None
+        if not _INTERFACE.fullmatch(device) or device == self.interface:
+            LOG.warning("Ignoring unusable NAT44 route interface %s", device)
+            return None
+        LOG.info("Using kernel-selected NAT44 source %s on %s", source, device)
+        return device, source
 
     def _upstream_interfaces(self) -> tuple[str, ...]:
         devices: set[str] = set()
