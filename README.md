@@ -1206,7 +1206,6 @@ Coordinator Address
 Coordinator Port
 Network
 Secret Key
-Peer ID
 Target Peer ID
 Direct Port
 MTU
@@ -1214,13 +1213,114 @@ MTU
 
 The network name and Secret Key must match the coordinator configuration.
 
-Each Peer ID should uniquely identify its peer.
-
 The target peer identifies the Linux server / exit node used by the Android client.
 
 This remains necessary even when `Use Exit Node` is disabled, because the
 Android client still needs that peer to negotiate and receive its VPN IPv4 and
 IPv6 addresses.
+
+---
+
+# Peer ID and Device Name
+
+TCPeer keeps two different names for every device:
+
+- **Peer ID** is the stable protocol identity. The coordinator keys its
+  persistent record by `Network + Peer ID`. Authentication, address leases,
+  direct-connection arbitration, mesh sessions, TPP targets, and the target
+  Exit Node all use this value.
+- **Device Name** is the human-readable label shown in the Android Peers screen
+  and by the `tcppeer` CLI. It may be changed without changing protocol
+  identity.
+
+Renaming a Device Name updates the existing coordinator record. It does not
+create another peer, change its leases, or change its Peer ID. Conversely,
+changing or losing a Peer ID makes the coordinator see a new device; the old
+Peer ID remains as an offline persisted device until an administrator removes
+it with `tcppeer-devices`.
+
+## Linux Client identity
+
+The configurator does not ask for a Client Peer ID. On the first Client
+configuration it generates:
+
+```text
+linux_client-<UUID>
+```
+
+The UUID is random and the complete generated value is written to:
+
+```text
+/etc/tcppeer/client.toml
+```
+
+Running `configure.py` again reuses the Peer ID already stored in that file.
+This prevents reconfiguration from creating a duplicate device. Removing the
+configuration before running the configurator causes a new random Peer ID to
+be generated.
+
+The Linux Client's initial Device Name is the hostname. A renamed Device Name
+is stored in the Client state database and survives service restarts and
+reconfiguration. Use the following command to restore the current hostname as
+the visible name:
+
+```bash
+tcppeer rename --automatic
+```
+
+## Linux Server / Exit Node identity
+
+The configurator does not ask for a Server Peer ID. It derives the Peer ID from
+the Linux hostname, limited to 64 printable ASCII characters:
+
+```text
+<hostname>
+```
+
+If no usable hostname exists, the fallback is:
+
+```text
+linux_server-<UUID>
+```
+
+The resulting identity is written to `/etc/tcppeer/server.toml` and printed at
+the end of configuration. Because normal Server identity is hostname-based,
+changing the hostname and regenerating the configuration may create a new Peer
+ID. The Server Device Name also defaults to the hostname and can be renamed
+independently with `tcppeer rename`.
+
+## Android identity
+
+Android does not expose an editable Peer ID field. On the first application
+configuration TCPeer generates:
+
+```text
+android-<first 12 characters of a random UUID>
+```
+
+The value is committed to the app's private preferences and reused across VPN
+disconnects, application restarts, device reboots, configuration changes, and
+ordinary APK upgrades. Clearing TCPeer's application data or uninstalling it
+removes that stored identity, so the next launch generates a new Peer ID and
+the coordinator treats it as a new device.
+
+The automatic Android Device Name is selected in this order:
+
+1. Android's configured device name
+2. Bluetooth device name
+3. Hardware model name
+4. `Android device` as a final fallback
+
+The Peers screen can replace the visible name with a custom Device Name or
+restore the automatic value. Neither operation changes the stored Android Peer
+ID.
+
+## Selecting an Exit Node
+
+Fields that select a peer, including the Android `Target Peer ID` and the Linux
+Client's configured target, require the stable Peer ID rather than the Device
+Name. Device Names are allowed to change and do not have to be unique; Peer IDs
+must remain unique inside a PeerNet.
 
 ---
 
