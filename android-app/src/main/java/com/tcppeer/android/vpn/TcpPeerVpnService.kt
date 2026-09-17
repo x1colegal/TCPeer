@@ -313,7 +313,8 @@ class TcpPeerVpnService : VpnService() {
                 } == true
             }
         val activeLinkProperties = physicalNetwork?.let(connectivityManager::getLinkProperties)
-        val activeAddresses = activeLinkProperties?.linkAddresses?.map { it.address }
+        val activeAddresses = activeLinkProperties?.linkAddresses?.map { it.address }.orEmpty() +
+            TransportPolicy.clatIpv4Addresses()
         val (localIpv4, localIpv6) = TransportPolicy.localAddresses(activeAddresses)
         Log.i(
             TAG,

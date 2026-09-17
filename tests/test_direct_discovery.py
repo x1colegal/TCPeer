@@ -1,7 +1,32 @@
 from pathlib import Path
 from unittest.mock import patch
 
-from tcppeer.server import discover_direct_ipv6
+from tcppeer.server import discover_direct_ipv4, discover_direct_ipv6
+
+
+class RouteProbe:
+    def __init__(self, selected: str) -> None:
+        self.selected = selected
+        self.destination = None
+        self.closed = False
+
+    def connect(self, destination) -> None:
+        self.destination = destination
+
+    def getsockname(self):
+        return self.selected, 49152
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_discover_direct_ipv4_uses_kernel_selected_clat_source() -> None:
+    probe = RouteProbe("192.0.0.4")
+    with patch("socket.socket", return_value=probe):
+        assert discover_direct_ipv4({"tcppeer0"}) == "192.0.0.4"
+
+    assert probe.destination == ("192.0.2.1", 9)
+    assert probe.closed
 
 
 def test_discover_direct_ipv6_ignores_tentative_and_overlay_interfaces() -> None:

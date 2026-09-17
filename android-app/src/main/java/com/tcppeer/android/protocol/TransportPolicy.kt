@@ -8,6 +8,17 @@ import java.net.NetworkInterface
 enum class DirectFamily { IPV4, IPV6 }
 
 object TransportPolicy {
+    fun clatIpv4Addresses(): List<Inet4Address> =
+        NetworkInterface.getNetworkInterfaces()?.toList().orEmpty()
+            .filter { networkInterface ->
+                networkInterface.isUp && networkInterface.name.lowercase().let { name ->
+                    name.startsWith("v4-") || name.startsWith("clat")
+                }
+            }
+            .flatMap { it.inetAddresses.toList() }
+            .filterIsInstance<Inet4Address>()
+            .filterNot { it.isAnyLocalAddress || it.isLoopbackAddress || it.isLinkLocalAddress }
+
     fun resolveTcpAddresses(host: String): List<InetAddress> {
         val normalized = host.trim().removeSurrounding("[", "]")
         require(normalized.isNotEmpty()) { "Coordinator DNS name or IP address is required" }

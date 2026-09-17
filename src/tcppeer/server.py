@@ -56,8 +56,24 @@ def public_address(address: str | None) -> str | None:
 
 
 def discover_direct_ipv4(excluded_interfaces: set[str] | None = None) -> str | None:
-    """Find an active non-loopback IPv4 address using TCP socket ioctls."""
+    """Find the IPv4 source selected by the kernel's default route."""
     excluded = excluded_interfaces or set()
+    # A CLAT interface commonly owns both its point-to-point address and a
+    # dedicated 192.0.0.0/29 source. SIOCGIFADDR only returns the first one,
+    # while route selection correctly chooses the dedicated CLAT source.
+    route_probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        route_probe.connect(("192.0.2.1", 9))
+        selected = str(route_probe.getsockname()[0])
+        parsed = ipaddress.ip_address(selected)
+        if not parsed.is_loopback and not parsed.is_link_local and not parsed.is_unspecified:
+            return selected
+    except OSError:
+        pass
+    finally:
+        route_probe.close()
+
+    # Retain interface enumeration for systems without an IPv4 default route.
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         for _index, name in socket.if_nameindex():
