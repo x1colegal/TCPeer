@@ -58,11 +58,50 @@ import java.net.Socket
 import java.net.ServerSocket
 import java.net.SocketTimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.locks.ReentrantLock
 
 private data class PublicEndpoint(val address: String, val port: Int)
 private data class RoutePrefix(val address: ByteArray, val prefixLength: Int)
+
+private class TunPacketSink(private val output: FileOutputStream) {
+    private val packets = Channel<ByteArray>(capacity = 2048)
+    private val queued = AtomicInteger(0)
+    private val writeLock = ReentrantLock()
+
+    fun offer(packet: ByteArray): Boolean {
+        if (writeLock.tryLock()) {
+            try {
+                if (queued.get() == 0) {
+                    output.write(packet)
+                    return true
+                }
+            } finally {
+                writeLock.unlock()
+            }
+        }
+        queued.incrementAndGet()
+        if (packets.trySend(packet).isSuccess) return true
+        queued.decrementAndGet()
+        return false
+    }
+
+    suspend fun consume() {
+        for (packet in packets) {
+            writeLock.lock()
+            try {
+                output.write(packet)
+            } finally {
+                queued.decrementAndGet()
+                writeLock.unlock()
+            }
+        }
+    }
+
+    fun close() = packets.close()
+}
 
 class TcpPeerVpnService : VpnService() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -522,9 +561,9 @@ class TcpPeerVpnService : VpnService() {
                 familyLabel(family),
             )
             val tunOutput = FileOutputStream(descriptor.fileDescriptor)
-            val tunPackets = Channel<ByteArray>(capacity = 2048)
+            val tunPackets = TunPacketSink(tunOutput)
             val tunWriterJob = launch(Dispatchers.IO) {
-                for (packet in tunPackets) tunOutput.write(packet)
+                tunPackets.consume()
             }
             tunWriterJob.invokeOnCompletion { error ->
                 if (error != null && error !is CancellationException) {
@@ -720,7 +759,7 @@ class TcpPeerVpnService : VpnService() {
         advertisedIpv6: String,
         overlayIpv6: Inet6Address,
         peerOutputs: ConcurrentHashMap<String, java.io.OutputStream>,
-        tunPackets: Channel<ByteArray>,
+        tunPackets: TunPacketSink,
     ) {
         val peerId = punch.field("Peer-ID") ?: return
         if (peerId == config.peerId || meshSockets.containsKey(peerId)) return
@@ -812,7 +851,7 @@ class TcpPeerVpnService : VpnService() {
         advertisedIpv6: String,
         overlayIpv6: Inet6Address,
         peerOutputs: ConcurrentHashMap<String, java.io.OutputStream>,
-        tunPackets: Channel<ByteArray>,
+        tunPackets: TunPacketSink,
     ) = coroutineScope {
         while (currentCoroutineContext().isActive) {
             val socket = try {
@@ -848,7 +887,7 @@ class TcpPeerVpnService : VpnService() {
         advertisedIpv6: String,
         overlayIpv6: Inet6Address,
         peerOutputs: ConcurrentHashMap<String, java.io.OutputStream>,
-        tunPackets: Channel<ByteArray>,
+        tunPackets: TunPacketSink,
     ) {
         var peerId = "unknown"
         var output: java.io.OutputStream? = null
@@ -983,7 +1022,7 @@ class TcpPeerVpnService : VpnService() {
         peerId: String,
         overlayIpv6: Inet6Address,
         output: java.io.OutputStream,
-        tunPackets: Channel<ByteArray>,
+        tunPackets: TunPacketSink,
     ): Int {
         if (AddressNegotiation.isRouterAdvertisement(packet)) return 0
         val tpp = TppProtocol.parse(packet)
@@ -995,7 +1034,7 @@ class TcpPeerVpnService : VpnService() {
                     Log.d(TAG, "TPP reply sent directly to peer_id=$peerId identifier=${tpp.identifier}")
                     reply.size
                 } else {
-                    if (tunPackets.trySend(packet).isFailure)
+                    if (!tunPackets.offer(packet))
                         Log.w(TAG, "TUN receive queue full; dropping packet from peer_id=$peerId")
                     0
                 }
@@ -1009,7 +1048,7 @@ class TcpPeerVpnService : VpnService() {
                 0
             }
             else -> {
-                if (tunPackets.trySend(packet).isFailure)
+                if (!tunPackets.offer(packet))
                     Log.w(TAG, "TUN receive queue full; dropping packet from peer_id=$peerId")
                 0
             }
@@ -1260,6 +1299,8 @@ class TcpPeerVpnService : VpnService() {
                     "remote=${formatEndpoint(address, port)}",
             )
             if (!protect(socket)) throw IllegalStateException("Cannot protect the direct socket from the VPN")
+            socket.sendBufferSize = DIRECT_SOCKET_BUFFER_BYTES
+            socket.receiveBufferSize = DIRECT_SOCKET_BUFFER_BYTES
             socket.connect(InetSocketAddress(address, port), 12_000)
             socket.tcpNoDelay = true
             socket.soTimeout = 15_000
@@ -1293,6 +1334,8 @@ class TcpPeerVpnService : VpnService() {
                 it.close()
                 throw IllegalStateException("Cannot protect the accepted direct socket from the VPN")
             }
+            it.sendBufferSize = DIRECT_SOCKET_BUFFER_BYTES
+            it.receiveBufferSize = DIRECT_SOCKET_BUFFER_BYTES
             it.tcpNoDelay = true
             it.soTimeout = 15_000
             Log.i(
@@ -1491,7 +1534,7 @@ class TcpPeerVpnService : VpnService() {
         directOutput: java.io.OutputStream,
         overlayIpv6: Inet6Address,
         peerOutputs: ConcurrentHashMap<String, java.io.OutputStream>,
-        tunPackets: Channel<ByteArray>,
+        tunPackets: TunPacketSink,
     ) = coroutineScope {
         val tunInput = FileInputStream(descriptor.fileDescriptor)
         val lastDataPlaneRx = AtomicLong(System.nanoTime())

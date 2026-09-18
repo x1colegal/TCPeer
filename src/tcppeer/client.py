@@ -54,6 +54,8 @@ class Client(Server):
         self.dns = discover_upstream_dns({config.tun_name})
         self.tun = TunDevice(config.tun_name, config.mtu)
         self.direct_writers = {}
+        self._overlay_peer_index = {}
+        self._load_overlay_peer_index()
         self._peer_send_queues = {}
         self._peer_send_tasks = {}
         self._tun_receive_queue = asyncio.Queue(maxsize=4096)

@@ -140,6 +140,8 @@ class Server:
         )
         self.tun = TunDevice(config.tun_name, config.mtu)
         self.direct_writers: dict[str, object] = {}
+        self._overlay_peer_index: dict[bytes, str] = {}
+        self._load_overlay_peer_index()
         self._peer_send_queues: dict[str, asyncio.Queue[tuple[object, bytes]]] = {}
         self._peer_send_tasks: dict[str, asyncio.Task] = {}
         self._tun_receive_queue: asyncio.Queue[tuple[str, bytes]] = asyncio.Queue(maxsize=4096)
@@ -516,11 +518,13 @@ class Server:
                     "coordinator control connection did not answer keepalive"
                 ) from exc
     def _update_peer_from_directory(self, peer_id: str, message: ControlMessage) -> None:
+        overlay_ipv4 = message.get("Overlay-IPv4") or None
+        overlay_ipv6 = message.get("Overlay-IPv6") or None
         values: dict[str, object] = {
             "display_name": message.get("Device-Name") or peer_id,
             "online": 1 if message.get("Online") == "yes" else 0,
-            "overlay_ipv4": message.get("Overlay-IPv4") or None,
-            "overlay_ipv6": message.get("Overlay-IPv6") or None,
+            "overlay_ipv4": overlay_ipv4,
+            "overlay_ipv6": overlay_ipv6,
         }
         # The coordinator directory reports the peer's observed control-plane
         # endpoint. Once a direct socket exists, _adopt_direct() has a more
@@ -530,6 +534,28 @@ class Server:
             values["transport"] = message.get("Transport") or "Disconnected"
             values["endpoint"] = message.get("Endpoint") or None
         self.store.update_peer(peer_id, **values)
+        self._index_peer_overlays(peer_id, overlay_ipv4, overlay_ipv6)
+
+    def _load_overlay_peer_index(self) -> None:
+        for row in self.store.connection.execute(
+            "SELECT peer_id, overlay_ipv4, overlay_ipv6 FROM peers",
+        ):
+            self._index_peer_overlays(str(row[0]), row[1], row[2])
+
+    def _index_peer_overlays(
+        self, peer_id: str, overlay_ipv4: str | None, overlay_ipv6: str | None,
+    ) -> None:
+        self._overlay_peer_index = {
+            address: owner for address, owner in getattr(self, "_overlay_peer_index", {}).items()
+            if owner != peer_id
+        }
+        for value in (overlay_ipv4, overlay_ipv6):
+            if not value or value == "-":
+                continue
+            try:
+                self._overlay_peer_index[ipaddress.ip_address(value.split("%", 1)[0]).packed] = peer_id
+            except ValueError:
+                LOG.warning("Ignoring invalid overlay address peer_id=%s address=%s", peer_id, value)
 
     async def _query_observed_endpoint(self, family: socket.AddressFamily) -> tuple[str, int] | None:
         local_address = self._direct_bind_ipv6 if family == socket.AF_INET6 else self._direct_bind_ipv4
@@ -1115,11 +1141,30 @@ class Server:
         """Queue TUN output without allowing one peer to block the TUN reader."""
         queue = self._peer_send_queues.get(peer_id)
         task = self._peer_send_tasks.get(peer_id)
+        if queue is None and (task is None or task.done()):
+            # StreamWriter.write() is non-blocking. In the normal case, feed
+            # the socket directly from the TUN callback instead of paying one
+            # Queue allocation and event-loop task switch per packet. Switch
+            # to the isolated per-peer queue only when asyncio reports actual
+            # socket backpressure.
+            writer.write(encode_data(packet))
+            self._add_bytes(peer_id, "tx_bytes", len(packet))
+            transport = writer.transport
+            if transport is None or transport.get_write_buffer_size() < 256 * 1024:
+                return
+            queue = asyncio.Queue(maxsize=2048)
+            self._peer_send_queues[peer_id] = queue
+            task = asyncio.create_task(
+                self._peer_send_loop(peer_id, writer, queue, drain_first=True),
+                name=f"direct-send:{peer_id}",
+            )
+            self._peer_send_tasks[peer_id] = task
+            return
         if queue is None or task is None or task.done():
             queue = asyncio.Queue(maxsize=2048)
             self._peer_send_queues[peer_id] = queue
             task = asyncio.create_task(
-                self._peer_send_loop(peer_id, queue), name=f"direct-send:{peer_id}",
+                self._peer_send_loop(peer_id, writer, queue), name=f"direct-send:{peer_id}",
             )
             self._peer_send_tasks[peer_id] = task
         try:
@@ -1131,11 +1176,19 @@ class Server:
             )
 
     async def _peer_send_loop(
-        self, peer_id: str, queue: asyncio.Queue[tuple[object, bytes]],
+        self, peer_id: str, owner_writer,
+        queue: asyncio.Queue[tuple[object, bytes]], *, drain_first: bool = False,
     ) -> None:
         try:
+            if drain_first:
+                await owner_writer.drain()
             while True:
-                writer, packet = await queue.get()
+                try:
+                    writer, packet = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    # No backpressure and no queued packet: retire this worker
+                    # so the next TUN packet returns to the direct fast path.
+                    return
                 if self.direct_writers.get(peer_id) is not writer:
                     continue
                 try:
@@ -1239,6 +1292,21 @@ class Server:
 
     def _queue_tun_packet(self, peer_id: str, packet: bytes) -> None:
         """Keep a temporarily full TUN from killing an otherwise healthy peer."""
+        # The normal case is a writable TUN. Avoid one Queue allocation and a
+        # second event-loop task switch for every packet; at high packet rates
+        # that serialization materially limits Android -> Exit Node upload.
+        # Once backpressure exists, preserve ordering by keeping all following
+        # packets on the existing queue until it drains.
+        if self.tun.fd is None:
+            raise RuntimeError("TUN interface is closed")
+        if self._tun_receive_queue.empty():
+            try:
+                written = os.write(self.tun.fd, packet)
+                if written != len(packet):
+                    raise OSError(f"partial TUN write: {written}/{len(packet)}")
+                return
+            except BlockingIOError:
+                pass
         try:
             self._tun_receive_queue.put_nowait((peer_id, packet))
         except asyncio.QueueFull:
@@ -1278,23 +1346,15 @@ class Server:
         if not packet:
             return None
         version = packet[0] >> 4
-        try:
-            if version == 4 and len(packet) >= 20:
-                destination = str(ipaddress.IPv4Address(packet[16:20]))
-                column = "overlay_ipv4"
-            elif version == 6 and len(packet) >= 40:
-                destination = str(ipaddress.IPv6Address(packet[24:40]))
-                column = "overlay_ipv6"
-            else:
-                return None
-        except ipaddress.AddressValueError:
+        if version == 4 and len(packet) >= 20:
+            destination = packet[16:20]
+        elif version == 6 and len(packet) >= 40:
+            destination = packet[24:40]
+        else:
             return None
-        row = self.store.connection.execute(
-            f"SELECT peer_id FROM peers WHERE {column} = ?",
-            (destination,),
-        ).fetchone()
-        if row is not None and row[0] in self.direct_writers:
-            return str(row[0])
+        indexed_peer = self._overlay_peer_index.get(destination)
+        if indexed_peer in self.direct_writers:
+            return indexed_peer
         if self.config.target_peer in self.direct_writers:
             return self.config.target_peer
         return None
