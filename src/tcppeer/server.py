@@ -43,6 +43,23 @@ LOG = logging.getLogger("tcppeer.server")
 
 CONTROL_IDLE_SECONDS = 30
 CONTROL_REPLY_TIMEOUT_SECONDS = 15
+TCP_SOCKET_BUFFER_LIMIT = 8 * 1024 * 1024
+
+
+def configure_tcp_socket_buffer_limits(
+    sysctl_root: Path = Path("/proc/sys/net/core"),
+    minimum: int = TCP_SOCKET_BUFFER_LIMIT,
+) -> None:
+    """Raise kernel socket-buffer ceilings used by direct TCP streams."""
+    for name in ("rmem_max", "wmem_max"):
+        path = sysctl_root / name
+        try:
+            current = int(path.read_text(encoding="ascii").strip())
+            if current < minimum:
+                path.write_text(f"{minimum}\n", encoding="ascii")
+                LOG.info("Raised net.core.%s from %s to %s", name, current, minimum)
+        except (OSError, ValueError) as exc:
+            LOG.warning("Could not configure net.core.%s: %s", name, exc)
 
 
 def public_address(address: str | None) -> str | None:
@@ -177,6 +194,7 @@ class Server:
         return str(self.config.server_ipv4), str(self._active_server_ipv6)
 
     async def run(self) -> None:
+        configure_tcp_socket_buffer_limits()
         self.tun.open()
 
         await self._configure_initial_ipv6()
@@ -863,6 +881,12 @@ class Server:
                             )
                 self._add_bytes(peer_id, "rx_bytes", len(packet))
                 await self._handle_peer_packet(packet, writer, peer_id)
+                # StreamReader and the writable TUN can both complete without
+                # suspending while a large burst is buffered. Yield at the
+                # same cadence as the TUN->socket path so reverse traffic,
+                # keepalives, and other peers are not processed in long gaps.
+                if packet_count % 32 == 0:
+                    await asyncio.sleep(0)
         except ProtocolError as exc:
             if "connection closed while reading TPF header" in str(exc):
                 LOG.info(

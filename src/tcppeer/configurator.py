@@ -282,6 +282,16 @@ def install(component: str, content: str, state_db: Path | None, user: str, grou
     unit_text = unit_text.replace(f"/usr/local/bin/{command_name}", executable)
     unit_target.write_text(unit_text, encoding="ascii")
     shutil.chown(config_path, group=group)
+    if component in {"server", "client"}:
+        sysctl_path = Path("/etc/sysctl.d/90-tcppeer.conf")
+        sysctl_path.write_text(
+            "# TCPeer direct TCP socket buffers\n"
+            "net.core.rmem_max = 8388608\n"
+            "net.core.wmem_max = 8388608\n",
+            encoding="ascii",
+        )
+        sysctl_path.chmod(0o644)
+        subprocess.run(("sysctl", "-q", "-p", str(sysctl_path)), check=True)
     subprocess.run(("systemctl", "daemon-reload"), check=True)
     print(f"Installed {config_path} and {unit_target}.")
     if ask_yes_no(f"Enable and start {unit_name} now"):

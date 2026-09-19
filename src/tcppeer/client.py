@@ -19,7 +19,13 @@ from tcppeer.address_negotiation import dhcp_discover, dhcp_request, parse_dhcp,
 from tcppeer.config import ClientConfig, ConfigurationError
 from tcppeer.dns import discover_upstream_dns
 from tcppeer.protocol import ControlMessage, ProtocolError, read_data
-from tcppeer.server import Server, discover_direct_ipv4, discover_direct_ipv6, public_address
+from tcppeer.server import (
+    Server,
+    configure_tcp_socket_buffer_limits,
+    discover_direct_ipv4,
+    discover_direct_ipv6,
+    public_address,
+)
 from tcppeer.state import StateStore
 from tcppeer.tpp import ECHO_REPLY, ECHO_REQUEST, build_reply as build_tpp_reply, parse_tpp
 from tcppeer.tun import TunDevice
@@ -130,6 +136,7 @@ class Client(Server):
                 self._direct_candidates[family] = candidate
 
     async def run(self) -> None:
+        configure_tcp_socket_buffer_limits()
         self.tun.open()
         try:
             self._prepare_direct_candidates()

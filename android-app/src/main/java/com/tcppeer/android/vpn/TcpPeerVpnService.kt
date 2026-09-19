@@ -538,6 +538,14 @@ class TcpPeerVpnService : VpnService() {
             ?: throw IllegalStateException("Android refused to establish the VPN interface")
         tunnel = descriptor
         direct.soTimeout = 0
+        // Keep TCP_NODELAY for the latency-sensitive punch and handshake, but
+        // disable it for bulk TPF traffic.  A 1400-byte IP packet plus its TPF
+        // header is slightly larger than the common 1420-byte outer MSS.  With
+        // NODELAY enabled Android emitted a tiny trailing segment for nearly
+        // every VPN packet, causing heavy segment reordering and severely
+        // asymmetric upload throughput.  Nagle can join that tail to the next
+        // frame without changing TPF framing or the VPN MTU.
+        direct.tcpNoDelay = false
         val status = if (family == DirectFamily.IPV6) ConnectionStatus.TCP6_DIRECT else ConnectionStatus.TCP4_DIRECT
         TcpPeerRuntime.update { it.copy(
             status = status, endpoint = formatEndpoint(address, peerPort),
@@ -807,6 +815,7 @@ class TcpPeerVpnService : VpnService() {
             // established TPF stream. Leaving 15 seconds here caused every
             // quiet mesh connection to be closed and punched again forever.
             socket.soTimeout = 0
+            socket.tcpNoDelay = false
             if (!adoptMeshSocket(peerId, socket, output, peerOutputs, initiated = true)) return
             val lastRx = AtomicLong(System.nanoTime())
             val keepalive = serviceScope.launch(Dispatchers.IO) {
@@ -908,6 +917,7 @@ class TcpPeerVpnService : VpnService() {
             // Keep the established mesh stream blocking indefinitely after
             // the bounded handshake, matching the primary direct connection.
             socket.soTimeout = 0
+            socket.tcpNoDelay = false
             if (!adoptMeshSocket(peerId, socket, output, peerOutputs, initiated = false)) return
             val lastRx = AtomicLong(System.nanoTime())
             val keepalive = serviceScope.launch(Dispatchers.IO) {
