@@ -1130,12 +1130,22 @@ class Server:
             await writer.wait_closed()
 
     async def _tun_loop(self) -> None:
+        immediate_packets = 0
         while True:
             packet = await self._read_tun()
             peer_id = self._peer_for_packet(packet)
             writer = self.direct_writers.get(peer_id) if peer_id else None
             if writer is not None and peer_id is not None:
                 self._queue_peer_data(peer_id, writer, packet)
+            # _read_tun() returns without awaiting while the non-blocking TUN
+            # remains readable. During a sustained download that can starve
+            # direct-stream RX and its liveness callbacks until an otherwise
+            # healthy connection is closed for a false timeout. Keep short
+            # write bursts, then cooperatively run ACK/PONG and other peers.
+            immediate_packets += 1
+            if immediate_packets >= 32:
+                immediate_packets = 0
+                await asyncio.sleep(0)
 
     def _queue_peer_data(self, peer_id: str, writer, packet: bytes) -> None:
         """Queue TUN output without allowing one peer to block the TUN reader."""
