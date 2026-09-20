@@ -65,6 +65,10 @@ import java.util.concurrent.locks.ReentrantLock
 
 private data class PublicEndpoint(val address: String, val port: Int)
 private data class RoutePrefix(val address: ByteArray, val prefixLength: Int)
+private data class TunStreams(
+    val input: FileInputStream,
+    val output: FileOutputStream,
+)
 
 private class TunPacketSink(private val output: FileOutputStream) {
     private val packets = Channel<ByteArray>(capacity = 2048)
@@ -120,6 +124,8 @@ class TcpPeerVpnService : VpnService() {
     private val pendingTppPings = ConcurrentHashMap<Long, Pair<String, Long>>()
     private val directListeners = mutableMapOf<DirectFamily, ServerSocket>()
     private var tunnel: ParcelFileDescriptor? = null
+    private var tunnelInput: FileInputStream? = null
+    private var tunnelOutput: FileOutputStream? = null
     private val disconnectRequested = AtomicBoolean(false)
     private val restartRequested = AtomicBoolean(false)
     private lateinit var connectivityManager: ConnectivityManager
@@ -555,7 +561,7 @@ class TcpPeerVpnService : VpnService() {
         Log.i(TAG, "Overlay-Update sent to coordinator")
         val descriptor = establishTunnel(config, addresses.first, addresses.second)
             ?: throw IllegalStateException("Android refused to establish the VPN interface")
-        publishTunnel(generation, descriptor)
+        val tunStreams = publishTunnel(generation, descriptor)
         direct.soTimeout = 0
         val status = if (family == DirectFamily.IPV6) ConnectionStatus.TCP6_DIRECT else ConnectionStatus.TCP4_DIRECT
         TcpPeerRuntime.update { it.copy(
@@ -586,8 +592,7 @@ class TcpPeerVpnService : VpnService() {
                 formatSocketEndpoint(direct),
                 familyLabel(family),
             )
-            val tunOutput = FileOutputStream(descriptor.fileDescriptor)
-            val tunPackets = TunPacketSink(tunOutput)
+            val tunPackets = TunPacketSink(tunStreams.output)
             val tunWriterJob = launch(Dispatchers.IO) {
                 tunPackets.consume()
             }
@@ -759,7 +764,7 @@ class TcpPeerVpnService : VpnService() {
 
             try {
                 exchangePackets(
-                    descriptor,
+                    tunStreams.input,
                     BufferedInputStream(directInput, DIRECT_STREAM_BUFFER_BYTES),
                     primaryDataOutput,
                     addresses.second.address,
@@ -773,7 +778,8 @@ class TcpPeerVpnService : VpnService() {
                 passiveAcceptJob.cancel()
                 tunPackets.close()
                 tunWriterJob.cancel()
-                closeQuietly(tunOutput)
+                closeQuietly(tunStreams.input)
+                closeQuietly(tunStreams.output)
             }
         }
     }
@@ -1556,14 +1562,13 @@ class TcpPeerVpnService : VpnService() {
     }
 
     private suspend fun exchangePackets(
-        descriptor: ParcelFileDescriptor,
+        tunInput: FileInputStream,
         directInput: java.io.InputStream,
         directOutput: java.io.OutputStream,
         overlayIpv6: Inet6Address,
         peerOutputs: ConcurrentHashMap<String, java.io.OutputStream>,
         tunPackets: TunPacketSink,
     ) = coroutineScope {
-        val tunInput = FileInputStream(descriptor.fileDescriptor)
         val lastDataPlaneRx = AtomicLong(System.nanoTime())
         pendingTppPings.clear()
         val pendingTxBytes = AtomicLong(0)
@@ -1847,17 +1852,36 @@ class TcpPeerVpnService : VpnService() {
     }
 
     @Synchronized
-    private fun publishTunnel(generation: Long, descriptor: ParcelFileDescriptor) {
+    private fun publishTunnel(generation: Long, descriptor: ParcelFileDescriptor): TunStreams {
         if (disconnectRequested.get() || connectionGeneration.get() != generation) {
             closeQuietly(descriptor)
             throw CancellationException("VPN interface belongs to a cancelled connection")
         }
+        val input = FileInputStream(descriptor.fileDescriptor)
+        val output = try {
+            FileOutputStream(descriptor.fileDescriptor)
+        } catch (error: Exception) {
+            closeQuietly(input)
+            closeQuietly(descriptor)
+            throw error
+        }
         tunnel = descriptor
+        tunnelInput = input
+        tunnelOutput = output
+        return TunStreams(input, output)
     }
 
     @Synchronized
     private fun closeResources() {
         TcpPeerRuntime.stopContinuousPing()
+        // API 28 keeps the VPN file descriptor referenced by streams created
+        // from ParcelFileDescriptor.fileDescriptor. Close those owners first;
+        // closing only the ParcelFileDescriptor can leave Samsung's VPN icon
+        // and interface alive after TCPeer reports Disconnected.
+        closeQuietly(tunnelInput)
+        tunnelInput = null
+        closeQuietly(tunnelOutput)
+        tunnelOutput = null
         closeQuietly(tunnel)
         tunnel = null
         closeQuietly(directSocket)
