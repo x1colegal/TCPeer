@@ -343,31 +343,31 @@ object TcpPeerProtocol {
             if (first < 0) throw EOFException("Connection closed while reading IP version or TPCP")
             when ((first ushr 4) and 0x0f) {
                 4 -> {
-                    val packet = ByteArray(20)
-                    packet[0] = first.toByte()
-                    input.readIntoExactly(packet, 1, 19)
-                    val ihl = (packet[0].toInt() and 0x0f) * 4
-                    val totalLength = ((packet[2].toInt() and 0xff) shl 8) or
-                        (packet[3].toInt() and 0xff)
+                    val header = ipHeaderBuffer.get()!!
+                    header[0] = first.toByte()
+                    input.readIntoExactly(header, 1, 19)
+                    val ihl = (header[0].toInt() and 0x0f) * 4
+                    val totalLength = ((header[2].toInt() and 0xff) shl 8) or
+                        (header[3].toInt() and 0xff)
                     if (ihl !in 20..60 || totalLength < ihl || totalLength > MAX_PACKET_SIZE)
                         throw ProtocolException("Invalid IPv4 packet length")
-                    val complete = packet.copyOf(totalLength)
+                    val complete = ByteArray(totalLength)
+                    header.copyInto(complete, endIndex = 20)
                     input.readIntoExactly(complete, 20, totalLength - 20)
-                    activity?.invoke()
                     return complete
                 }
                 6 -> {
-                    val packet = ByteArray(40)
-                    packet[0] = first.toByte()
-                    input.readIntoExactly(packet, 1, 39)
-                    val payloadLength = ((packet[4].toInt() and 0xff) shl 8) or
-                        (packet[5].toInt() and 0xff)
+                    val header = ipHeaderBuffer.get()!!
+                    header[0] = first.toByte()
+                    input.readIntoExactly(header, 1, 39)
+                    val payloadLength = ((header[4].toInt() and 0xff) shl 8) or
+                        (header[5].toInt() and 0xff)
                     val totalLength = 40 + payloadLength
                     if (totalLength > MAX_PACKET_SIZE)
                         throw ProtocolException("IPv6 packet exceeds maximum size")
-                    val complete = packet.copyOf(totalLength)
+                    val complete = ByteArray(totalLength)
+                    header.copyInto(complete, endIndex = 40)
                     input.readIntoExactly(complete, 40, payloadLength)
-                    activity?.invoke()
                     return complete
                 }
                 else -> {
@@ -390,6 +390,57 @@ object TcpPeerProtocol {
             }
         }
     }
+
+    /** Read one raw IP packet into a reusable buffer, consuming TPCP in-band. */
+    fun readDataInto(
+        input: InputStream,
+        destination: ByteArray,
+        output: OutputStream? = null,
+        activity: (() -> Unit)? = null,
+    ): Int {
+        require(destination.size >= MAX_PACKET_SIZE)
+        while (true) {
+            val first = input.read()
+            if (first < 0) throw EOFException("Connection closed while reading IP version or TPCP")
+            when ((first ushr 4) and 0x0f) {
+                4 -> {
+                    destination[0] = first.toByte()
+                    input.readIntoExactly(destination, 1, 19)
+                    val ihl = (destination[0].toInt() and 0x0f) * 4
+                    val totalLength = ((destination[2].toInt() and 0xff) shl 8) or
+                        (destination[3].toInt() and 0xff)
+                    if (ihl !in 20..60 || totalLength < ihl || totalLength > MAX_PACKET_SIZE)
+                        throw ProtocolException("Invalid IPv4 packet length")
+                    input.readIntoExactly(destination, 20, totalLength - 20)
+                    return totalLength
+                }
+                6 -> {
+                    destination[0] = first.toByte()
+                    input.readIntoExactly(destination, 1, 39)
+                    val payloadLength = ((destination[4].toInt() and 0xff) shl 8) or
+                        (destination[5].toInt() and 0xff)
+                    val totalLength = 40 + payloadLength
+                    if (totalLength > MAX_PACKET_SIZE)
+                        throw ProtocolException("IPv6 packet exceeds maximum size")
+                    input.readIntoExactly(destination, 40, payloadLength)
+                    return totalLength
+                }
+                else -> {
+                    if (first != 'T'.code) throw ProtocolException(
+                        "Invalid raw IP/TPCP stream prefix: 0x${first.toString(16).padStart(2, '0')}"
+                    )
+                    when (input.readDataPlaneTpcp(first)) {
+                        DIRECT_KEEPALIVE -> {
+                            output?.let { synchronized(it) { writeDataPlaneControl(it, "PONG") } }
+                            activity?.invoke()
+                        }
+                        DIRECT_PONG -> activity?.invoke()
+                        else -> throw ProtocolException("Invalid data-plane TPCP message")
+                    }
+                }
+            }
+        }
+    }
 }
 
 private const val DIRECT_KEEPALIVE = -1
@@ -398,6 +449,9 @@ private val TPCP_KEEPALIVE_HEADER = "TPCP/2 KEEPALIVE\r\n\r\n".toByteArray(Stand
 private val TPCP_PONG_HEADER = "TPCP/2 PONG\r\n\r\n".toByteArray(StandardCharsets.US_ASCII)
 private val directHeaderBuffer = object : ThreadLocal<ByteArray>() {
     override fun initialValue() = ByteArray(256)
+}
+private val ipHeaderBuffer = object : ThreadLocal<ByteArray>() {
+    override fun initialValue() = ByteArray(60)
 }
 
 /** Parse a TPCP message after the leading ASCII 'T' has already been read. */

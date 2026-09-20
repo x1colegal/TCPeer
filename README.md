@@ -1474,6 +1474,11 @@ convert the binary IP payload to text
 recalculate inner transport checksums
 ```
 
+On Android, the primary direct-stream reader reuses one maximum-size packet
+buffer and writes only the valid IP packet range to the TUN. A copy is made
+only when TUN backpressure requires queueing. This avoids per-packet allocation
+and garbage-collection pressure on high-throughput connections.
+
 The intended hot path is essentially:
 
 ```text

@@ -37,14 +37,14 @@ object TppProtocol {
             request.timestampNanos,
         )
 
-    fun parse(packet: ByteArray): TppMessage? {
+    fun parse(packet: ByteArray, length: Int = packet.size): TppMessage? {
         if (
-            packet.size < 40 + PAYLOAD_SIZE || (packet[0].toInt() ushr 4) != 6 ||
+            length < 40 + PAYLOAD_SIZE || (packet[0].toInt() ushr 4) != 6 ||
             (packet[6].toInt() and 0xFF) != NEXT_HEADER
         ) return null
         val buffer = ByteBuffer.wrap(packet).order(ByteOrder.BIG_ENDIAN)
         val payloadLength = buffer.getShort(4).toInt() and 0xFFFF
-        if (payloadLength != PAYLOAD_SIZE || packet.size < 40 + payloadLength) return null
+        if (payloadLength != PAYLOAD_SIZE || length < 40 + payloadLength) return null
         val source = InetAddress.getByAddress(packet.copyOfRange(8, 24)) as Inet6Address
         val destination = InetAddress.getByAddress(packet.copyOfRange(24, 40)) as Inet6Address
         if (!packet.copyOfRange(40, 44).contentEquals(magic)) return null

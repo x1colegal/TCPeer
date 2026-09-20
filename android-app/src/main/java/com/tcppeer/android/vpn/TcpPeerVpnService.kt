@@ -70,11 +70,11 @@ private class TunPacketSink(private val output: FileOutputStream) {
     private val queued = AtomicInteger(0)
     private val writeLock = ReentrantLock()
 
-    fun offer(packet: ByteArray): Boolean {
+    fun offer(packet: ByteArray, length: Int = packet.size): Boolean {
         if (writeLock.tryLock()) {
             try {
                 if (queued.get() == 0) {
-                    output.write(packet)
+                    output.write(packet, 0, length)
                     return true
                 }
             } finally {
@@ -82,7 +82,7 @@ private class TunPacketSink(private val output: FileOutputStream) {
             }
         }
         queued.incrementAndGet()
-        if (packets.trySend(packet).isSuccess) return true
+        if (packets.trySend(packet.copyOf(length)).isSuccess) return true
         queued.decrementAndGet()
         return false
     }
@@ -1022,9 +1022,10 @@ class TcpPeerVpnService : VpnService() {
         overlayIpv6: Inet6Address,
         output: java.io.OutputStream,
         tunPackets: TunPacketSink,
+        length: Int = packet.size,
     ): Int {
         if (AddressNegotiation.isRouterAdvertisement(packet)) return 0
-        val tpp = TppProtocol.parse(packet)
+        val tpp = TppProtocol.parse(packet, length)
         return when (tpp?.type) {
             TppProtocol.ECHO_REQUEST -> {
                 if (tpp.destination == overlayIpv6) {
@@ -1033,7 +1034,7 @@ class TcpPeerVpnService : VpnService() {
                     Log.d(TAG, "TPP reply sent directly to peer_id=$peerId identifier=${tpp.identifier}")
                     reply.size
                 } else {
-                    if (!tunPackets.offer(packet))
+                    if (!tunPackets.offer(packet, length))
                         Log.w(TAG, "TUN receive queue full; dropping packet from peer_id=$peerId")
                     0
                 }
@@ -1047,7 +1048,7 @@ class TcpPeerVpnService : VpnService() {
                 0
             }
             else -> {
-                if (!tunPackets.offer(packet))
+                if (!tunPackets.offer(packet, length))
                     Log.w(TAG, "TUN receive queue full; dropping packet from peer_id=$peerId")
                 0
             }
@@ -1563,6 +1564,8 @@ class TcpPeerVpnService : VpnService() {
          */
         val tunToPeer = launch(Dispatchers.IO) {
             val buffer = ByteArray(65_535)
+            var byteBatch = 0L
+            var packetBatch = 0
 
             while (true) {
                 val count = tunInput.read(buffer)
@@ -1589,7 +1592,13 @@ class TcpPeerVpnService : VpnService() {
                     TcpPeerProtocol.writeData(output, buffer, 0, count)
                 }
 
-                pendingTxBytes.addAndGet(count.toLong())
+                byteBatch += count
+                packetBatch++
+                if (packetBatch >= DATA_PLANE_ACCOUNTING_BATCH) {
+                    pendingTxBytes.addAndGet(byteBatch)
+                    byteBatch = 0
+                    packetBatch = 0
+                }
             }
         }
         val pingRequests = launch(Dispatchers.IO) {
@@ -1640,13 +1649,23 @@ class TcpPeerVpnService : VpnService() {
             }
         }
         val peerToTun = launch(Dispatchers.IO) {
+            val packet = ByteArray(65_535)
+            var byteBatch = 0L
+            var packetBatch = 0
             while (true) {
-                val packet = TcpPeerProtocol.readData(directInput, directOutput) {
+                val packetLength = TcpPeerProtocol.readDataInto(directInput, packet, directOutput) {
                     lastDataPlaneRx.set(System.nanoTime())
                 }
-                pendingRxBytes.addAndGet(packet.size.toLong())
+                byteBatch += packetLength
+                packetBatch++
+                if (packetBatch >= DATA_PLANE_ACCOUNTING_BATCH) {
+                    pendingRxBytes.addAndGet(byteBatch)
+                    lastDataPlaneRx.lazySet(System.nanoTime())
+                    byteBatch = 0
+                    packetBatch = 0
+                }
                 val replyBytes = processInboundPacket(
-                    packet, "primary", overlayIpv6, directOutput, tunPackets,
+                    packet, "primary", overlayIpv6, directOutput, tunPackets, packetLength,
                 )
                 if (replyBytes > 0) pendingTxBytes.addAndGet(replyBytes.toLong())
             }
@@ -1808,6 +1827,7 @@ class TcpPeerVpnService : VpnService() {
         private const val COORDINATOR_TIMEOUT_MS = 35_000
         private const val DIRECT_SOCKET_BUFFER_BYTES = 8 * 1024 * 1024
         private const val DIRECT_STREAM_BUFFER_BYTES = 1024 * 1024
+        private const val DATA_PLANE_ACCOUNTING_BATCH = 64
         private const val DEVICE_REFRESH_INTERVAL_MS = 5_000L
         private const val TAG = "TCPeerVpnService"
     }
