@@ -263,12 +263,19 @@ class Server:
             self._flush_byte_counters()
             self.store.close()
 
-    def _prepare_direct_candidates(self) -> None:
+    def _prepare_direct_candidates(
+        self, only_family: socket.AddressFamily | None = None,
+    ) -> None:
         """Pre-bind ICE-TCP simultaneous-open candidates before listen()."""
         for family, address in (
             (socket.AF_INET6, self._direct_bind_ipv6 or "::"),
             (socket.AF_INET, self._direct_bind_ipv4 or "0.0.0.0"),
         ):
+            if only_family is not None and family != only_family:
+                continue
+            current = self._direct_candidates.get(family)
+            if current is not None and current.fileno() >= 0:
+                continue
             candidate = socket.socket(family, socket.SOCK_STREAM, socket.IPPROTO_TCP)
             candidate.setblocking(False)
             candidate.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -687,6 +694,10 @@ class Server:
         handed_off = False
         try:
             candidate = self._direct_candidates.pop(family, None)
+            # Keep the next simultaneous-open attempt pre-bound. Previously
+            # the one startup candidate was consumed permanently, so only a
+            # process restart restored the original socket state.
+            self._prepare_direct_candidates(family)
             LOG.info(
                 "direct-connect attempt ts=%.6f peer_id=%s family=%s attempt=%s initiated=yes local=%s:%s remote=%s:%s candidate_fd=%s",
                 time.time(),
@@ -736,6 +747,17 @@ class Server:
             raise
         except DirectConnectionError:
             self.store.update_peer(peer_id, transport="No Direct Connection")
+            # A full retry window can leave the coordinator advertising a
+            # stale NAPT mapping. Reconnect only the control plane so endpoint
+            # discovery and REGISTER run again without restarting the TUN or
+            # established direct sessions.
+            coordinator = self._coordinator_writer
+            if coordinator is not None and not coordinator.is_closing():
+                LOG.warning(
+                    "direct-connect exhausted peer_id=%s; refreshing coordinator endpoint registration",
+                    peer_id,
+                )
+                coordinator.close()
             raise
         finally:
             # A connector can be cancelled after connect() succeeds but before

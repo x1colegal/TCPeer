@@ -98,6 +98,10 @@ Actual VPN packets travel directly between peers.
 
 There is no coordinator traffic relay.
 
+Mapped endpoints are refreshed after a failed punch, and Linux replenishes the
+pre-bound candidate consumed by every attempt. A stale NAPT mapping therefore
+causes a new coordinated attempt instead of requiring a service restart.
+
 ---
 
 # Direct transport

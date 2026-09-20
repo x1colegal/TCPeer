@@ -385,38 +385,39 @@ class TcpPeerVpnService : VpnService() {
         val observed = TcpPeerProtocol.readControl(controlInput)
         if (observed.command != "ENDPOINT-INFO") throw ProtocolException("Coordinator did not report the TCP mapping")
 
-        val endpointIpv4 = if (localIpv4.isNotEmpty()) {
+        var endpointIpv4 = if (localIpv4.isNotEmpty()) {
             queryPublicEndpoint(config, DirectFamily.IPV4, physicalNetwork)
         } else null
-        val endpointIpv6 = if (localIpv6.isNotEmpty()) {
+        var endpointIpv6 = if (localIpv6.isNotEmpty()) {
             queryPublicEndpoint(config, DirectFamily.IPV6, physicalNetwork)
         } else null
         val directPublicIpv4 = localIpv4.firstOrNull(TransportPolicy::isPublicIpv4)?.hostAddress
         val directPublicIpv6 = localIpv6.firstOrNull(TransportPolicy::isPublicIpv6)?.hostAddress?.substringBefore('%')
-        val advertisedIpv4 = endpointIpv4?.address ?: directPublicIpv4.orEmpty()
-        val advertisedIpv6 = endpointIpv6?.address ?: directPublicIpv6.orEmpty()
-        val mappedIpv4Port = endpointIpv4?.port ?: if (directPublicIpv4 != null) config.directPort else null
-        val mappedIpv6Port = endpointIpv6?.port ?: if (directPublicIpv6 != null) config.directPort else null
+        var advertisedIpv4 = ""
+        var advertisedIpv6 = ""
 
-        writeCoordinatorControl(controlOutput, ControlMessage("REGISTER", linkedMapOf(
-            "Peer-ID" to config.peerId,
-            "Device-Name" to config.deviceName,
-            "IPv4" to advertisedIpv4,
-            "IPv6" to advertisedIpv6,
-            "Mapped-IPv4-Port" to (mappedIpv4Port?.toString() ?: ""),
-            "Mapped-IPv6-Port" to (mappedIpv6Port?.toString() ?: ""),
-            "Local-IPv4" to (localIpv4.firstOrNull()?.hostAddress ?: ""),
-            "Local-IPv6" to (localIpv6.firstOrNull()?.hostAddress?.substringBefore('%') ?: ""),
-            "Port" to config.directPort.toString(),
-            "Role" to "Client",
-            "Platform" to "Android",
-        )))
-        val registration = readExpectedControl(
-            controlInput,
-            controlOutput,
-            "ENDPOINT-INFO",
-            "registration",
-        )
+        fun registerCurrentEndpoints() {
+            advertisedIpv4 = endpointIpv4?.address ?: directPublicIpv4.orEmpty()
+            advertisedIpv6 = endpointIpv6?.address ?: directPublicIpv6.orEmpty()
+            val mappedIpv4Port = endpointIpv4?.port ?: if (directPublicIpv4 != null) config.directPort else null
+            val mappedIpv6Port = endpointIpv6?.port ?: if (directPublicIpv6 != null) config.directPort else null
+            writeCoordinatorControl(controlOutput, ControlMessage("REGISTER", linkedMapOf(
+                "Peer-ID" to config.peerId,
+                "Device-Name" to config.deviceName,
+                "IPv4" to advertisedIpv4,
+                "IPv6" to advertisedIpv6,
+                "Mapped-IPv4-Port" to (mappedIpv4Port?.toString() ?: ""),
+                "Mapped-IPv6-Port" to (mappedIpv6Port?.toString() ?: ""),
+                "Local-IPv4" to (localIpv4.firstOrNull()?.hostAddress ?: ""),
+                "Local-IPv6" to (localIpv6.firstOrNull()?.hostAddress?.substringBefore('%') ?: ""),
+                "Port" to config.directPort.toString(),
+                "Role" to "Client",
+                "Platform" to "Android",
+            )))
+            readExpectedControl(controlInput, controlOutput, "ENDPOINT-INFO", "registration")
+        }
+
+        registerCurrentEndpoints()
         writeCoordinatorControl(controlOutput, ControlMessage("PEER-INFO", mapOf("Action" to "List")))
         readDeviceList(controlInput)
         val targetPeerId = config.targetPeerId
@@ -497,6 +498,22 @@ class TcpPeerVpnService : VpnService() {
                     error,
                 )
 
+                // The failed active socket may have replaced the NAPT mapping
+                // that was discovered before REGISTER. Refresh both mapped
+                // endpoints before requesting another coordinated punch.
+                endpointIpv4 = if (localIpv4.isNotEmpty()) {
+                    queryPublicEndpoint(config, DirectFamily.IPV4, physicalNetwork)
+                } else null
+                endpointIpv6 = if (localIpv6.isNotEmpty()) {
+                    queryPublicEndpoint(config, DirectFamily.IPV6, physicalNetwork)
+                } else null
+                registerCurrentEndpoints()
+                Log.i(
+                    TAG,
+                    "Refreshed direct endpoint registration after failed punch " +
+                        "IPv4=${endpointIpv4?.address}:${endpointIpv4?.port} " +
+                        "IPv6=${endpointIpv6?.address}:${endpointIpv6?.port}",
+                )
                 kotlinx.coroutines.delay(1_000)
             }
         }
