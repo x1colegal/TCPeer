@@ -201,7 +201,7 @@ class TcpPeerVpnService : VpnService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_DISCONNECT -> disconnect(startId)
+            ACTION_DISCONNECT -> disconnect()
             ACTION_RENAME_DEVICE -> renameDevice(intent.getStringExtra(EXTRA_DEVICE_NAME).orEmpty())
             else -> {
                 // API 28 commonly delivers a new CONNECT to the service
@@ -1812,7 +1812,7 @@ class TcpPeerVpnService : VpnService() {
         return InetAddress.getByAddress(bytes)
     }
 
-    private fun disconnect(startId: Int? = null) {
+    private fun disconnect() {
         disconnectRequested.set(true)
         connectionGeneration.incrementAndGet()
         val stoppedJob = connectionJob
@@ -1822,7 +1822,11 @@ class TcpPeerVpnService : VpnService() {
         TcpPeerRuntime.replace(VpnRuntimeState())
         TcpPeerRuntime.setServiceActive(false)
         stopForeground(STOP_FOREGROUND_REMOVE)
-        if (startId == null) stopSelf() else stopSelfResult(startId)
+        // Disconnect is authoritative. stopSelfResult(startId) can refuse to
+        // stop on API 28 when Samsung has delivered a newer start request,
+        // leaving Android's VPN network and routes registered even though all
+        // TCPeer sockets are already closed and the UI says Disconnected.
+        stopSelf()
     }
 
     /**
