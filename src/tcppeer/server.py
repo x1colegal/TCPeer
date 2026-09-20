@@ -44,6 +44,7 @@ LOG = logging.getLogger("tcppeer.server")
 CONTROL_IDLE_SECONDS = 30
 CONTROL_REPLY_TIMEOUT_SECONDS = 15
 TCP_SOCKET_BUFFER_LIMIT = 8 * 1024 * 1024
+DIRECT_BATCH_BYTES = 256 * 1024
 
 
 def configure_tcp_socket_buffer_limits(
@@ -1172,33 +1173,14 @@ class Server:
                 await asyncio.sleep(0)
 
     def _queue_peer_data(self, peer_id: str, writer, packet: bytes) -> None:
-        """Queue TUN output without allowing one peer to block the TUN reader."""
+        """Batch TUN output without allowing one peer to block the reader."""
         queue = self._peer_send_queues.get(peer_id)
         task = self._peer_send_tasks.get(peer_id)
-        if queue is None and (task is None or task.done()):
-            # StreamWriter.write() is non-blocking. In the normal case, feed
-            # the socket directly from the TUN callback instead of paying one
-            # Queue allocation and event-loop task switch per packet. Switch
-            # to the isolated per-peer queue only when asyncio reports actual
-            # socket backpressure.
-            writer.write(encode_data(packet))
-            self._add_bytes(peer_id, "tx_bytes", len(packet))
-            transport = writer.transport
-            if transport is None or transport.get_write_buffer_size() < 256 * 1024:
-                return
-            queue = asyncio.Queue(maxsize=2048)
-            self._peer_send_queues[peer_id] = queue
-            task = asyncio.create_task(
-                self._peer_send_loop(peer_id, writer, queue, drain_first=True),
-                name=f"direct-send:{peer_id}",
-            )
-            self._peer_send_tasks[peer_id] = task
-            return
         if queue is None or task is None or task.done():
             queue = asyncio.Queue(maxsize=2048)
             self._peer_send_queues[peer_id] = queue
             task = asyncio.create_task(
-                self._peer_send_loop(peer_id, writer, queue), name=f"direct-send:{peer_id}",
+                self._peer_send_loop(peer_id, queue), name=f"direct-send:{peer_id}",
             )
             self._peer_send_tasks[peer_id] = task
         try:
@@ -1210,29 +1192,40 @@ class Server:
             )
 
     async def _peer_send_loop(
-        self, peer_id: str, owner_writer,
-        queue: asyncio.Queue[tuple[object, bytes]], *, drain_first: bool = False,
+        self, peer_id: str, queue: asyncio.Queue[tuple[object, bytes]],
     ) -> None:
         try:
-            if drain_first:
-                await owner_writer.drain()
             while True:
-                try:
-                    writer, packet = queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    # No backpressure and no queued packet: retire this worker
-                    # so the next TUN packet returns to the direct fast path.
-                    return
+                writer, packet = await queue.get()
+                if self.direct_writers.get(peer_id) is not writer:
+                    continue
+                packets = [packet]
+                batch_bytes = len(packet)
+                # A short bounded delay lets adjacent raw IP packets share a
+                # TCP write/TSO batch. Their own headers still delimit them.
+                await asyncio.sleep(0)
+                while batch_bytes < DIRECT_BATCH_BYTES:
+                    try:
+                        queued_writer, queued_packet = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if queued_writer is not writer:
+                        continue
+                    packets.append(queued_packet)
+                    batch_bytes += len(queued_packet)
                 if self.direct_writers.get(peer_id) is not writer:
                     continue
                 try:
-                    await self._write_data(writer, packet)
+                    writer.write(b"".join(encode_data(item) for item in packets))
+                    transport = writer.transport
+                    if transport is not None and transport.get_write_buffer_size() >= 256 * 1024:
+                        await writer.drain()
                 except (ConnectionError, OSError) as exc:
                     await self._discard_direct_writer(
                         peer_id, writer, f"queued-write-failed: {exc}",
                     )
                     continue
-                self._add_bytes(peer_id, "tx_bytes", len(packet))
+                self._add_bytes(peer_id, "tx_bytes", batch_bytes)
         finally:
             if self._peer_send_tasks.get(peer_id) is asyncio.current_task():
                 self._peer_send_tasks.pop(peer_id, None)

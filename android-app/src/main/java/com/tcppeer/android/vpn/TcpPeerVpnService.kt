@@ -47,6 +47,7 @@ import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.withContext
 import java.io.Closeable
 import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.Inet4Address
@@ -548,8 +549,15 @@ class TcpPeerVpnService : VpnService() {
         updateNotification(status)
 
         coroutineScope {
+            // Coalesce adjacent raw IP packets before handing them to TCP.
+            // Packet boundaries remain self-described by the IP headers; the
+            // short periodic flush only changes syscall/segment batching.
+            val primaryDataOutput = BufferedOutputStream(
+                directOutput,
+                DIRECT_STREAM_BUFFER_BYTES,
+            )
             val peerOutputs = ConcurrentHashMap<String, java.io.OutputStream>()
-            peerOutputs[targetPeerId] = directOutput
+            peerOutputs[targetPeerId] = primaryDataOutput
             meshSockets[targetPeerId] = direct
             meshSocketKeys[targetPeerId] = connectionKey(direct)
             meshEndpoints[targetPeerId] = formatSocketEndpoint(direct)
@@ -734,7 +742,7 @@ class TcpPeerVpnService : VpnService() {
                 exchangePackets(
                     descriptor,
                     BufferedInputStream(directInput, DIRECT_STREAM_BUFFER_BYTES),
-                    directOutput,
+                    primaryDataOutput,
                     addresses.second.address,
                     peerOutputs,
                     tunPackets,
@@ -1541,6 +1549,15 @@ class TcpPeerVpnService : VpnService() {
         pendingTppPings.clear()
         val pendingTxBytes = AtomicLong(0)
         val pendingRxBytes = AtomicLong(0)
+        val outputPending = AtomicBoolean(false)
+        val outputFlusher = launch(Dispatchers.IO) {
+            while (true) {
+                delay(DIRECT_FLUSH_INTERVAL_MS)
+                if (outputPending.getAndSet(false)) {
+                    synchronized(directOutput) { directOutput.flush() }
+                }
+            }
+        }
         val statistics = launch {
             while (true) {
                 delay(250)
@@ -1556,11 +1573,12 @@ class TcpPeerVpnService : VpnService() {
          *
          * Deliberately mirrors the Python implementation:
          *
-         *   TUN read -> TCP write -> next TUN read
+         *   TUN read -> buffered TCP write -> next TUN read
          *
-         * No Channel, no batching and no per-packet ByteArray copy.
-         * Packet boundaries remain encoded by the IPv4/IPv6 headers.
-         * TCPeer framing overhead remains ZERO bytes.
+         * Adjacent packets are coalesced for at most two milliseconds so the
+         * kernel can use larger TCP segments/TSO rather than receiving one
+         * small write per VPN packet. No per-packet ByteArray copy or TCPeer
+         * framing is introduced; IPv4/IPv6 headers still carry boundaries.
          */
         val tunToPeer = launch(Dispatchers.IO) {
             val buffer = ByteArray(65_535)
@@ -1583,6 +1601,7 @@ class TcpPeerVpnService : VpnService() {
                     continue
                 }
                 val output = selectedOutput ?: directOutput
+                val flushImmediately = output === directOutput && isTcpControlPacket(buffer, count)
                 synchronized(output) {
                     // Raw IP uses the packet's own IPv4/IPv6 length as its
                     // boundary in the TCP byte stream.  A TUN read may carry
@@ -1590,6 +1609,12 @@ class TcpPeerVpnService : VpnService() {
                     // directly can desynchronise every subsequent packet and
                     // leave the receiver blocked while TCP stays ESTABLISHED.
                     TcpPeerProtocol.writeData(output, buffer, 0, count)
+                    if (flushImmediately) {
+                        output.flush()
+                    }
+                }
+                if (output === directOutput && !flushImmediately) {
+                    outputPending.set(true)
                 }
 
                 byteBatch += count
@@ -1624,6 +1649,7 @@ class TcpPeerVpnService : VpnService() {
                     synchronized(output) {
                         TcpPeerProtocol.writeData(output, packet)
                     }
+                    if (output === directOutput) outputPending.set(true)
                     pendingTxBytes.addAndGet(packet.size.toLong())
                     launch {
                         delay(3_000)
@@ -1667,7 +1693,10 @@ class TcpPeerVpnService : VpnService() {
                 val replyBytes = processInboundPacket(
                     packet, "primary", overlayIpv6, directOutput, tunPackets, packetLength,
                 )
-                if (replyBytes > 0) pendingTxBytes.addAndGet(replyBytes.toLong())
+                if (replyBytes > 0) {
+                    outputPending.set(true)
+                    pendingTxBytes.addAndGet(replyBytes.toLong())
+                }
             }
         }
         try {
@@ -1685,6 +1714,7 @@ class TcpPeerVpnService : VpnService() {
             pingRequests.cancel()
             dataPlaneKeepalive.cancel()
             statistics.cancel()
+            outputFlusher.cancel()
             pendingTppPings.clear()
             synchronized(directOutput) {
                 runCatching { directOutput.flush() }
@@ -1702,6 +1732,31 @@ class TcpPeerVpnService : VpnService() {
                 else -> null
             }
         }.getOrNull()
+    }
+
+    private fun isTcpControlPacket(packet: ByteArray, length: Int): Boolean {
+        if (length < 1) return false
+        val tcpOffset: Int
+        val packetLength: Int
+        when (packet[0].toInt().ushr(4)) {
+            4 -> {
+                if (length < 40 || packet[9].toInt() and 0xff != 6) return false
+                tcpOffset = (packet[0].toInt() and 0x0f) * 4
+                packetLength = ((packet[2].toInt() and 0xff) shl 8) or
+                    (packet[3].toInt() and 0xff)
+            }
+            6 -> {
+                if (length < 60 || packet[6].toInt() and 0xff != 6) return false
+                tcpOffset = 40
+                packetLength = 40 + (((packet[4].toInt() and 0xff) shl 8) or
+                    (packet[5].toInt() and 0xff))
+            }
+            else -> return false
+        }
+        if (tcpOffset + 20 > length || packetLength > length) return false
+        val tcpHeaderLength = (packet[tcpOffset + 12].toInt().ushr(4) and 0x0f) * 4
+        if (tcpHeaderLength < 20 || tcpOffset + tcpHeaderLength > packetLength) return false
+        return tcpOffset + tcpHeaderLength == packetLength
     }
 
     private fun connectionKey(socket: Socket): String = listOf(
@@ -1827,6 +1882,7 @@ class TcpPeerVpnService : VpnService() {
         private const val COORDINATOR_TIMEOUT_MS = 35_000
         private const val DIRECT_SOCKET_BUFFER_BYTES = 8 * 1024 * 1024
         private const val DIRECT_STREAM_BUFFER_BYTES = 1024 * 1024
+        private const val DIRECT_FLUSH_INTERVAL_MS = 2L
         private const val DATA_PLANE_ACCOUNTING_BATCH = 64
         private const val DEVICE_REFRESH_INTERVAL_MS = 5_000L
         private const val TAG = "TCPeerVpnService"

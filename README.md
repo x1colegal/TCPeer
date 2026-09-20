@@ -146,6 +146,13 @@ IPv6
 
 TCPeer adds no DATA frame, magic, length prefix, or per-packet metadata. Each validated IPv4 or IPv6 packet read from TUN is written byte-for-byte to the direct TCP stream. Packet boundaries come from the IP headers already present in the stream: IPv4 uses `Total Length`, while IPv6 uses its fixed 40-byte header plus `Payload Length`.
 
+Adjacent packets may be coalesced into one operating-system TCP write so the
+kernel can use larger segments and transport offloads efficiently. This is
+write batching, not protocol framing: every inner packet remains unchanged and
+the receiver still separates packets exclusively from their IP length fields.
+Android bounds batching to a short interval and flushes payload-free TCP control
+packets immediately so inner ACK, SYN, and FIN feedback is not delayed.
+
 TPCP liveness messages share the direct TCP stream as independent top-level ASCII messages:
 
 ```text
