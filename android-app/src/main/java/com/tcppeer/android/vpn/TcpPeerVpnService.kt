@@ -195,7 +195,7 @@ class TcpPeerVpnService : VpnService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_DISCONNECT -> disconnect()
+            ACTION_DISCONNECT -> disconnect(startId)
             ACTION_RENAME_DEVICE -> renameDevice(intent.getStringExtra(EXTRA_DEVICE_NAME).orEmpty())
             else -> {
                 // API 28 commonly delivers a new CONNECT to the service
@@ -248,7 +248,7 @@ class TcpPeerVpnService : VpnService() {
         connectionJob = serviceScope.launch {
             try {
                 val config = ConfigurationStore(this@TcpPeerVpnService).load().also { it.validate() }
-                runConnection(config)
+                runConnection(config, generation)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
@@ -339,7 +339,10 @@ class TcpPeerVpnService : VpnService() {
         }
     }
 
-    private suspend fun runConnection(config: VpnConfiguration) = withContext(Dispatchers.IO) {
+    private suspend fun runConnection(
+        config: VpnConfiguration,
+        generation: Long,
+    ) = withContext(Dispatchers.IO) {
         updateConnecting("Resolving the coordinator DNS name.")
         val defaultNetwork = connectivityManager.activeNetwork
         val physicalNetwork = (
@@ -360,9 +363,10 @@ class TcpPeerVpnService : VpnService() {
             "Endpoint discovery network=$physicalNetwork IPv4=${localIpv4.joinToString { it.hostAddress.orEmpty() }} " +
                 "IPv6=${localIpv6.joinToString { it.hostAddress?.substringBefore('%').orEmpty() }}",
         )
-        val coordinator = openCoordinator(
-            config, localIpv6.isNotEmpty(), physicalNetwork,
-        ).also { coordinatorSocket = it }
+        val coordinator = publishCoordinatorSocket(
+            generation,
+            openCoordinator(config, localIpv6.isNotEmpty(), physicalNetwork),
+        )
         val controlInput = coordinator.getInputStream()
         val controlOutput = coordinator.getOutputStream()
 
@@ -477,17 +481,15 @@ class TcpPeerVpnService : VpnService() {
             )
 
             try {
-                direct = openDirect(
-                    address,
-                    peerPort,
-                    config.directPort,
-                    family,
-                ).also { directSocket = it }
+                direct = publishDirectSocket(
+                    generation,
+                    openDirect(address, peerPort, config.directPort, family),
+                )
 
                 break
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (error: Exception) {
-                directSocket = null
-
                 updateConnecting(
                     "Attempt to direct connection timed out; retrying"
                 )
@@ -553,7 +555,7 @@ class TcpPeerVpnService : VpnService() {
         Log.i(TAG, "Overlay-Update sent to coordinator")
         val descriptor = establishTunnel(config, addresses.first, addresses.second)
             ?: throw IllegalStateException("Android refused to establish the VPN interface")
-        tunnel = descriptor
+        publishTunnel(generation, descriptor)
         direct.soTimeout = 0
         val status = if (family == DirectFamily.IPV6) ConnectionStatus.TCP6_DIRECT else ConnectionStatus.TCP4_DIRECT
         TcpPeerRuntime.update { it.copy(
@@ -1805,7 +1807,7 @@ class TcpPeerVpnService : VpnService() {
         return InetAddress.getByAddress(bytes)
     }
 
-    private fun disconnect() {
+    private fun disconnect(startId: Int? = null) {
         disconnectRequested.set(true)
         connectionGeneration.incrementAndGet()
         val stoppedJob = connectionJob
@@ -1815,7 +1817,42 @@ class TcpPeerVpnService : VpnService() {
         TcpPeerRuntime.replace(VpnRuntimeState())
         TcpPeerRuntime.setServiceActive(false)
         stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
+        if (startId == null) stopSelf() else stopSelfResult(startId)
+    }
+
+    /**
+     * Blocking socket and VPN setup calls do not observe coroutine cancellation
+     * until they return. Publish each newly created resource atomically with a
+     * generation check so a cancelled API 28 attempt cannot resurrect the VPN
+     * after ACTION_DISCONNECT has already closed the previous resources.
+     */
+    @Synchronized
+    private fun publishCoordinatorSocket(generation: Long, socket: Socket): Socket {
+        if (disconnectRequested.get() || connectionGeneration.get() != generation) {
+            closeQuietly(socket)
+            throw CancellationException("Coordinator socket belongs to a cancelled connection")
+        }
+        coordinatorSocket = socket
+        return socket
+    }
+
+    @Synchronized
+    private fun publishDirectSocket(generation: Long, socket: Socket): Socket {
+        if (disconnectRequested.get() || connectionGeneration.get() != generation) {
+            closeQuietly(socket)
+            throw CancellationException("Direct socket belongs to a cancelled connection")
+        }
+        directSocket = socket
+        return socket
+    }
+
+    @Synchronized
+    private fun publishTunnel(generation: Long, descriptor: ParcelFileDescriptor) {
+        if (disconnectRequested.get() || connectionGeneration.get() != generation) {
+            closeQuietly(descriptor)
+            throw CancellationException("VPN interface belongs to a cancelled connection")
+        }
+        tunnel = descriptor
     }
 
     @Synchronized
