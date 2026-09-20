@@ -14,8 +14,12 @@ import android.net.IpPrefix
 import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.system.Os
+import android.system.OsConstants
+import android.system.StructPollfd
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
@@ -128,6 +132,7 @@ class TcpPeerVpnService : VpnService() {
     private var tunnelOutput: FileOutputStream? = null
     private val disconnectRequested = AtomicBoolean(false)
     private val restartRequested = AtomicBoolean(false)
+    private val stopRefreshStarted = AtomicBoolean(false)
     private lateinit var connectivityManager: ConnectivityManager
     @Volatile private var underlyingNetworkSignature: String? = null
     @Volatile private var underlyingNetwork: Network? = null
@@ -245,6 +250,7 @@ class TcpPeerVpnService : VpnService() {
     private fun connect() {
         val generation = connectionGeneration.incrementAndGet()
         disconnectRequested.set(false)
+        stopRefreshStarted.set(false)
         TcpPeerRuntime.setServiceActive(true)
         showForeground(ConnectionStatus.CONNECTING)
         TcpPeerRuntime.replace(VpnRuntimeState(
@@ -275,7 +281,22 @@ class TcpPeerVpnService : VpnService() {
                 // ACTION_CONNECT has already started. Its cleanup must never
                 // close sockets or overwrite UI state owned by that new run.
                 if (connectionGeneration.get() != generation) {
-                    Log.i(TAG, "Ignoring cleanup from superseded connection generation=$generation")
+                    // A user-requested disconnect also changes the generation.
+                    // If no newer connect reset this flag, the old worker has
+                    // only now actually left its blocking I/O. Repeat the
+                    // service/foreground teardown at this point;
+                    // otherwise its system VPN notification remains until
+                    // unrelated traffic wakes the process again.
+                    if (disconnectRequested.get()) {
+                        Log.i(TAG, "Completing deferred disconnect for generation=$generation")
+                        closeResources()
+                        TcpPeerRuntime.replace(VpnRuntimeState())
+                        TcpPeerRuntime.setServiceActive(false)
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                        stopAfterConnectivityRefresh()
+                    } else {
+                        Log.i(TAG, "Ignoring cleanup from superseded connection generation=$generation")
+                    }
                     return@launch
                 }
                 closeResources()
@@ -286,7 +307,7 @@ class TcpPeerVpnService : VpnService() {
                     connectionJob = null
                     TcpPeerRuntime.replace(VpnRuntimeState())
                     stopForeground(STOP_FOREGROUND_REMOVE)
-                    stopSelf()
+                    stopAfterConnectivityRefresh()
                 } else {
                     connectionJob = null
 
@@ -1476,10 +1497,7 @@ class TcpPeerVpnService : VpnService() {
         val builder = Builder()
             .setSession("TCPeer")
             .setMtu(config.mtu)
-            // Samsung API 28 may keep a blocked TUN read alive after close(),
-            // and SystemUI keeps showing the VPN until unrelated traffic wakes
-            // that reader. A non-blocking TUN makes teardown deterministic.
-            .setBlocking(Build.VERSION.SDK_INT > Build.VERSION_CODES.P)
+            .setBlocking(true)
             .addAddress(ipv4.address, ipv4.prefixLength)
             .addAddress(ipv6.address, ipv6.prefixLength)
         if (!config.useExitNode) {
@@ -1611,15 +1629,22 @@ class TcpPeerVpnService : VpnService() {
             val buffer = ByteArray(65_535)
             var byteBatch = 0L
             var packetBatch = 0
+            val tunPoll = StructPollfd().apply {
+                fd = tunInput.fd
+                events = OsConstants.POLLIN.toShort()
+            }
 
-            while (true) {
+            while (currentCoroutineContext().isActive) {
+                tunPoll.revents = 0
+                if (Os.poll(arrayOf(tunPoll), TUN_POLL_MS) == 0) continue
+                if (!currentCoroutineContext().isActive) break
+                val terminalEvents = OsConstants.POLLERR or OsConstants.POLLHUP or OsConstants.POLLNVAL
+                if ((tunPoll.revents.toInt() and terminalEvents) != 0) break
+                if ((tunPoll.revents.toInt() and OsConstants.POLLIN) == 0) continue
                 val count = tunInput.read(buffer)
 
                 if (count < 0) break
-                if (count == 0) {
-                    if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) delay(1)
-                    continue
-                }
+                if (count == 0) continue
 
                 val destination = packetDestination(buffer, count)
                 val directPeer = TcpPeerRuntime.state.value.devices.firstOrNull { device ->
@@ -1829,10 +1854,45 @@ class TcpPeerVpnService : VpnService() {
         TcpPeerRuntime.setServiceActive(false)
         stopForeground(STOP_FOREGROUND_REMOVE)
         // Disconnect is authoritative. stopSelfResult(startId) can refuse to
-        // stop on API 28 when Samsung has delivered a newer start request,
+        // stop when Android has delivered a newer start request,
         // leaving Android's VPN network and routes registered even though all
         // TCPeer sockets are already closed and the UI says Disconnected.
-        stopSelf()
+        stopAfterConnectivityRefresh()
+    }
+
+    private fun stopAfterConnectivityRefresh() {
+        if (stopRefreshStarted.compareAndSet(false, true)) {
+            refreshConnectivityThenStop()
+        }
+    }
+
+    /**
+     * ConnectivityService can retain its system VPN notification after the
+     * TUN and routes are already gone. It refreshes as soon as another
+     * network-aware app registers an Internet request. Issue that same non-VPN
+     * request before stopping the service on every supported Android version.
+     */
+    private fun refreshConnectivityThenStop() {
+        val finished = AtomicBoolean(false)
+        lateinit var callback: ConnectivityManager.NetworkCallback
+
+        fun finish() {
+            if (!finished.compareAndSet(false, true)) return
+            runCatching { connectivityManager.unregisterNetworkCallback(callback) }
+            stopSelf()
+        }
+
+        callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) = finish()
+            override fun onUnavailable() = finish()
+        }
+        val request = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+            .build()
+        runCatching {
+            connectivityManager.requestNetwork(request, callback, NETWORK_REFRESH_TIMEOUT_MS)
+        }.onFailure { finish() }
     }
 
     /**
@@ -1977,6 +2037,8 @@ class TcpPeerVpnService : VpnService() {
         private const val DIRECT_SOCKET_BUFFER_BYTES = 8 * 1024 * 1024
         private const val DIRECT_STREAM_BUFFER_BYTES = 1024 * 1024
         private const val DIRECT_FLUSH_INTERVAL_MS = 2L
+        private const val TUN_POLL_MS = 250
+        private const val NETWORK_REFRESH_TIMEOUT_MS = 1_000
         private const val DATA_PLANE_ACCOUNTING_BATCH = 64
         private const val DEVICE_REFRESH_INTERVAL_MS = 5_000L
         private const val TAG = "TCPeerVpnService"
