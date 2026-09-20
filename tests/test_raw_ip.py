@@ -4,14 +4,13 @@ import unittest
 from tcppeer.protocol import ProtocolError, encode_data, encode_data_plane_control, read_data
 
 
-class TpfEncodingTests(unittest.TestCase):
+class RawIpEncodingTests(unittest.TestCase):
     def test_ipv6_trailing_tun_bytes_are_not_put_on_stream(self):
         packet = bytearray(80)
         packet[0] = 0x60
         packet[4:6] = (24).to_bytes(2, "big")
-        frame = encode_data(bytes(packet))
-        self.assertTrue(frame.startswith(b"TPF/1 DATA\r\nLength: 64\r\n\r\n"))
-        self.assertEqual(bytes(packet[:64]), frame.split(b"\r\n\r\n", 1)[1])
+        wire = encode_data(bytes(packet))
+        self.assertEqual(bytes(packet[:64]), wire)
 
     def test_truncated_declared_packet_is_rejected(self):
         packet = bytearray(40)
@@ -20,11 +19,13 @@ class TpfEncodingTests(unittest.TestCase):
         with self.assertRaisesRegex(ProtocolError, "truncated IP packet"):
             encode_data(bytes(packet))
 
-    def test_top_level_tpcp_is_not_inside_tpf(self):
+    def test_top_level_tpcp_and_raw_ip_share_the_stream(self):
         packet = bytearray(40)
         packet[0] = 0x60
         wire = encode_data_plane_control("PONG") + encode_data(bytes(packet))
-        self.assertTrue(wire.startswith(b"TPCP/2 PONG\r\n\r\nTPF/1 DATA\r\n"))
+        control = b"TPCP/2 PONG\r\n\r\n"
+        self.assertEqual(control, wire[:len(control)])
+        self.assertEqual(0x60, wire[len(control)])
 
         async def parse():
             reader = asyncio.StreamReader()

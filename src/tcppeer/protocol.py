@@ -1,4 +1,4 @@
-"""TCPeer cleartext control protocol and TCPD ASCII DATA framing."""
+"""TCPeer cleartext control protocol and raw-IP data stream."""
 
 from __future__ import annotations
 
@@ -357,7 +357,7 @@ def _parse_packet(packet: bytes):
 
 
 def encode_data(packet: bytes) -> bytes:
-    """Encode one binary IP packet in an ASCII TPF frame."""
+    """Return exactly one validated raw IPv4 or IPv6 packet."""
     if not packet or len(packet) > MAX_PACKET_SIZE:
         raise ProtocolError("invalid IP packet length")
 
@@ -385,14 +385,13 @@ def encode_data(packet: bytes) -> bytes:
 
     if wire_length > len(packet):
         raise ProtocolError("truncated IP packet")
-    payload = packet[:wire_length]
-    return f"TPF/1 DATA\r\nLength: {len(payload)}\r\n\r\n".encode("ascii") + payload
+    return packet[:wire_length]
 
 
 def encode_data_plane_control(command: str) -> bytes:
     """Encode a top-level TPCP liveness command for the direct stream."""
     if command not in {"KEEPALIVE", "PONG"}:
-        raise ProtocolError("invalid TPF TPCP command")
+        raise ProtocolError("invalid data-plane TPCP command")
     return f"TPCP/2 {command}\r\n\r\n".encode("ascii")
 
 
@@ -646,7 +645,7 @@ def _rebuild_packet(fields: dict[str, str], payload: bytes) -> bytes:
 
 
 def decode_data(frame: bytes) -> bytes:
-    """Validate and return the binary IP payload of a TPF DATA frame."""
+    """Validate and return one raw binary IP packet."""
     if not frame or len(frame) > MAX_PACKET_SIZE:
         raise ProtocolError("invalid IP packet length")
 
@@ -660,52 +659,77 @@ def decode_data(frame: bytes) -> bytes:
         declared = int.from_bytes(frame[2:4], "big")
         ihl = (frame[0] & 0x0f) * 4
         if ihl < 20 or declared < ihl or declared != len(frame):
-            raise ProtocolError("TPF length does not match IPv4 packet length")
+            raise ProtocolError("raw IPv4 length does not match packet length")
     else:
         if len(frame) < 40 or 40 + int.from_bytes(frame[4:6], "big") != len(frame):
-            raise ProtocolError("TPF length does not match IPv6 packet length")
+            raise ProtocolError("raw IPv6 length does not match packet length")
 
     return frame
 
 
 async def read_data(reader, writer=None, activity=None) -> bytes:
-    """Read TPF frames, answer TPCP liveness, and return the next DATA payload."""
+    """Read raw IP packets and top-level TPCP liveness from one TCP stream."""
     while True:
         try:
-            header = await reader.readuntil(b"\r\n\r\n")
+            first = await reader.readexactly(1)
         except Exception as exc:
-            raise ProtocolError("connection closed while reading TPF header") from exc
-        if len(header) > 256:
-            raise ProtocolError("TPF header is too large")
-        try:
-            lines = header[:-4].decode("ascii").split("\r\n")
-        except UnicodeDecodeError as exc:
-            raise ProtocolError("TPF header is not ASCII") from exc
-        if lines == ["TPCP/2 KEEPALIVE"]:
-            if writer is not None:
-                writer.write(encode_data_plane_control("PONG"))
-                await writer.drain()
+            raise ProtocolError("connection closed while reading IP version or TPCP") from exc
+
+        version = first[0] >> 4
+        if version == 4:
+            try:
+                base = first + await reader.readexactly(19)
+            except Exception as exc:
+                raise ProtocolError("connection closed inside IPv4 header") from exc
+            ihl = (base[0] & 0x0f) * 4
+            total_length = int.from_bytes(base[2:4], "big")
+            if ihl < 20 or ihl > 60 or total_length < ihl:
+                raise ProtocolError("invalid IPv4 packet length")
+            if total_length > MAX_PACKET_SIZE:
+                raise ProtocolError("IPv4 packet exceeds maximum size")
+            try:
+                packet = base + await reader.readexactly(total_length - 20)
+            except Exception as exc:
+                raise ProtocolError("connection closed inside IPv4 packet") from exc
             if activity is not None:
                 activity()
-            continue
-        if lines == ["TPCP/2 PONG"]:
+            return packet
+
+        if version == 6:
+            try:
+                header = first + await reader.readexactly(39)
+            except Exception as exc:
+                raise ProtocolError("connection closed inside IPv6 header") from exc
+            payload_length = int.from_bytes(header[4:6], "big")
+            total_length = 40 + payload_length
+            if total_length > MAX_PACKET_SIZE:
+                raise ProtocolError("IPv6 packet exceeds maximum size")
+            try:
+                packet = header + await reader.readexactly(payload_length)
+            except Exception as exc:
+                raise ProtocolError("connection closed inside IPv6 packet") from exc
             if activity is not None:
                 activity()
-            continue
-        if len(lines) != 2 or lines[0] != "TPF/1 DATA":
-            raise ProtocolError("invalid direct-stream message")
-        if not lines[1].startswith("Length: "):
-            raise ProtocolError("invalid TPF Length field")
-        try:
-            length = int(lines[1][8:])
-        except ValueError as exc:
-            raise ProtocolError("invalid TPF payload length") from exc
-        if length < 1 or length > MAX_PACKET_SIZE:
-            raise ProtocolError("TPF payload length is out of range")
-        try:
-            payload = await reader.readexactly(length)
-        except Exception as exc:
-            raise ProtocolError("connection closed inside TPF payload") from exc
-        if activity is not None:
-            activity()
-        return decode_data(payload)
+            return packet
+
+        if first == b"T":
+            try:
+                message = first + await reader.readuntil(b"\r\n\r\n")
+            except Exception as exc:
+                raise ProtocolError("connection closed inside data-plane TPCP") from exc
+            if len(message) > 256:
+                raise ProtocolError("data-plane TPCP message is too large")
+            if message == encode_data_plane_control("KEEPALIVE"):
+                if writer is not None:
+                    writer.write(encode_data_plane_control("PONG"))
+                    await writer.drain()
+                if activity is not None:
+                    activity()
+                continue
+            if message == encode_data_plane_control("PONG"):
+                if activity is not None:
+                    activity()
+                continue
+            raise ProtocolError("invalid data-plane TPCP message")
+
+        raise ProtocolError(f"invalid raw IP/TPCP stream prefix: 0x{first[0]:02x}")

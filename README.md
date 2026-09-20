@@ -6,7 +6,7 @@ TCP is the outer transport used for VPN traffic. A lightweight coordinator provi
 
 The coordinator does **not** relay tunneled traffic.
 
-Once a direct connection is established, IPv4 and IPv6 packets are transferred directly between peers inside TCPeer Framing (TPF) frames.
+Once a direct connection is established, original IPv4 and IPv6 packets are transferred directly between peers as a raw IP byte stream.
 
 > [!WARNING]
 > TCPeer is not an encrypted VPN.
@@ -27,7 +27,7 @@ TCPeer currently provides:
 - Separate IPv4 and IPv6 endpoint registration
 - TCP simultaneous-open / TCP hole punching
 - HMAC-SHA256 Secret Key authentication
-- TPF-framed IPv4 and IPv6 Layer 3 tunneling
+- Raw IPv4 and IPv6 Layer 3 tunneling
 - In-band TPCP data-plane keepalive
 - Linux TUN interface
 - Native Android `VpnService` client
@@ -89,7 +89,7 @@ A normal TCPeer deployment consists of:
                              |
                          DATA PLANE
                              |
-                   TPF DATA frames
+                   raw IP packets
 ```
 
 The coordinator participates only in the control plane.
@@ -136,35 +136,24 @@ IPv6
   |
  TCP
   |
-  +-- TPF DATA + IPv4 packet
-  +-- TPF DATA + IPv6 packet
+  +-- raw IPv4 packet
+  +-- raw IPv6 packet
 ```
 
 ---
 
-# TCPeer Framing
+# Raw-IP data stream
 
-**TPF** means **TCPeer Framing**. It gives binary IP packets explicit boundaries in the direct TCP byte stream. TPF is used exclusively for `DATA`.
+TCPeer adds no DATA frame, magic, length prefix, or per-packet metadata. Each validated IPv4 or IPv6 packet read from TUN is written byte-for-byte to the direct TCP stream. Packet boundaries come from the IP headers already present in the stream: IPv4 uses `Total Length`, while IPv6 uses its fixed 40-byte header plus `Payload Length`.
 
-Every frame begins with a cleartext ASCII header:
-
-```text
-TPF/1 DATA\r\n
-Length: 1280\r\n
-\r\n
-<1280 bytes of binary IPv4 or IPv6 data>
-```
-
-`Length` is decimal ASCII and specifies the exact payload size. A DATA payload remains the original binary IP packet; TPF does not reconstruct transport headers or alter application bytes. Invalid types, non-ASCII headers, invalid lengths, truncated payloads, and non-IP DATA payloads terminate the connection instead of leaving the TCP stream silently desynchronized.
-
-TPCP liveness messages share the direct TCP stream as independent top-level messages; they are not inside TPF:
+TPCP liveness messages share the direct TCP stream as independent top-level ASCII messages:
 
 ```text
 TPCP/2 KEEPALIVE\r\n
 \r\n
 ```
 
-The receiver answers with a top-level `TPCP/2 PONG` message. This traffic keeps stateful NAT mappings active and makes a dead direct path observable even when no tunneled packets are being exchanged. The stream parser distinguishes the ASCII `TPCP/2` first line from the ASCII `TPF/1 DATA` first line. TPF is not TCPD: it contains only a DATA payload length and does not translate IP or transport headers.
+The receiver answers with a top-level `TPCP/2 PONG` message. This traffic keeps stateful NAT mappings active and makes a dead direct path observable even when no tunneled packets are being exchanged. Detection is unambiguous from the first byte: high nibble `4` means IPv4, high nibble `6` means IPv6, and ASCII `T` begins TPCP. No DATA framing is used.
 
 ---
 
@@ -201,7 +190,7 @@ Conceptually:
 Complete packet = N bytes
 ```
 
-TCPeer uses this value to validate and trim the packet obtained from TUN before writing its explicit TPF `Length` field.
+TCPeer uses this value to validate and trim the packet obtained from TUN before writing it directly to TCP.
 
 IPv4 options are naturally included because `Total Length` covers the complete IPv4 packet.
 
@@ -237,13 +226,13 @@ Conceptually:
 Complete packet = 40 + N bytes
 ```
 
-TCPeer validates this length before encapsulating the packet in TPF.
+TCPeer validates this length before writing the packet to the raw-IP stream.
 
 ---
 
 # Inner protocols
 
-The TPF data plane is not limited to TCP payloads.
+The raw-IP data plane is not limited to TCP payloads.
 
 TCPeer carries complete Layer 3 packets.
 
@@ -301,13 +290,13 @@ VpnService TUN
 inner IP packet
         |
         v
-TPF DATA frame
+raw IP packet
         |
         v
 direct TCP connection
         |
         v
-TPF decoder
+raw IP stream parser
         |
         v
 inner IP packet
@@ -322,7 +311,7 @@ Linux tcppeer0
         +------> Internet
 ```
 
-TPF is inserted between the two TUN endpoints; TCPD is not used.
+No TCPeer DATA framing is inserted between the two TUN endpoints; TCPD is not used.
 
 ---
 
@@ -335,13 +324,13 @@ Linux tcppeer0
 inner IP packet
         |
         v
-TPF DATA frame
+raw IP packet
         |
         v
 direct TCP connection
         |
         v
-TPF decoder
+raw IP stream parser
         |
         v
 inner IP packet
@@ -424,7 +413,7 @@ data-plane path.
 
 TPCP primarily operates on the Coordinator control connection. The direct
 data-plane connection additionally carries the narrow `KEEPALIVE` and `PONG`
-subset inside TPF frames so NAT state and half-open connections can be detected.
+subset as top-level ASCII messages so NAT state and half-open connections can be detected.
 TPCP is distinct from **TPP**, the IPv6-only TCPPeerPing protocol carried inside
 an IPv6 packet with Next Header 99.
 
@@ -433,7 +422,7 @@ an IPv6 packet with Next Header 99.
 After direct connectivity is established, the peer-to-peer data stream carries:
 
 ```text
-TPF DATA frames containing binary IP packets
+raw binary IPv4/IPv6 packets, interleaved only with top-level TPCP liveness messages
 ```
 
 There is no TCPD translation layer between outer TCP and the inner IP packets.
@@ -597,7 +586,7 @@ Typical requirements:
 
 Linux can also join a PeerNet as a non-routing client. It reuses the same TCP
 endpoint discovery, TCP4/TCP6 simultaneous-open, deterministic direct-socket
-arbitration, TPF stream, mesh, and TPP implementation as the Exit Node.
+arbitration, raw-IP stream, mesh, and TPP implementation as the Exit Node.
 
 The selected `target_peer` must provide TCPeer DHCPv4 and SLAAC so the client
 can receive its overlay addresses. With `routing.use_exit_node = false`, only
@@ -624,7 +613,7 @@ The Android client handles:
 - TUN/VPN configuration
 - IPv4 routing
 - IPv6 routing
-- TPF-framed IP packet transfer
+- Raw-IP packet transfer
 - Automatic reconnect
 - Network-change handling
 - Device information
@@ -733,7 +722,7 @@ ICMPv6
 Router Advertisement
 ```
 
-travel through the same TPF DATA path as any other IPv6 packet.
+travel through the same raw-IP path as any other IPv6 packet.
 
 ---
 
@@ -1456,23 +1445,21 @@ Typical direct port:
 
 ---
 
-# TPF implementation
+# Raw-IP implementation
 
-The sender validates the IP packet length, creates an ASCII `TPF/1 DATA` header with a decimal `Length`, and writes the header and unchanged binary packet payload as one frame. The receiver reads the header terminator, validates its ASCII fields and bounded length, then reads exactly that payload. TCP segmentation and coalescing therefore cannot change TPF frame boundaries.
+The sender validates the IP packet length and writes exactly that binary packet to the TCP stream. The receiver reads the first byte, selects IPv4, IPv6, or TPCP parsing, and obtains the remaining packet length from the native IP header. IPv4 `Total Length` and IPv6 `Payload Length` preserve boundaries even when TCP splits or coalesces stream segments.
 
-Top-level `TPCP/2 KEEPALIVE` messages are sent every 15 seconds and receive a top-level `TPCP/2 PONG`. They are consumed by the direct-stream protocol parser and are never written to the TUN. Only binary IP packets are encapsulated in TPF DATA frames. Unknown commands or malformed messages close the direct connection.
+Top-level `TPCP/2 KEEPALIVE` messages are sent every 15 seconds and receive a top-level `TPCP/2 PONG`. They are consumed by the direct-stream protocol parser and are never written to the TUN. Unknown TPCP commands, invalid IP versions, malformed lengths, or truncated packets close the direct connection.
 
-The inner IPv4 or IPv6 packet remains intact, including transport headers, checksums, and application bytes. TPF does not perform the header conversion or reconstruction previously associated with TCPD.
+The inner IPv4 or IPv6 packet remains intact, including transport headers, checksums, and application bytes. TCPeer performs no DATA encapsulation, header conversion, or reconstruction.
 
 # MTU
 
-TPF adds a short variable-length ASCII header to each tunneled packet. The configured TUN MTU still describes the inner IP packet; the outer IP, TCP, and TPF bytes are carried by the underlay.
+The configured TUN MTU describes the exact raw inner IP packet. Only the underlay IP and TCP headers are added on the physical network.
 
 # Performance
 
-TPF deliberately performs only small, bounded framing work. For each tunneled
-packet, TCPeer creates or parses one ASCII header containing the frame type and
-decimal payload length. It does not need to:
+The raw-IP hot path performs only bounded IP-length validation. It does not need to:
 
 ```text
 serialize TCPD
@@ -1496,13 +1483,13 @@ TUN
 binary IP packet
  |
  v
-TPF DATA encoder
+raw IP stream writer
  |
  v
 TCP stream
  |
  v
-TPF DATA decoder
+raw IP stream parser
  |
  v
 binary IP packet
@@ -1544,7 +1531,7 @@ logcat --pid=$(pidof com.tcppeer.android)
 
 Both peers must run compatible TCPeer versions.
 
-In particular, a client using an obsolete TCPD/data-frame implementation is not compatible with a server expecting the current TPF data plane.
+In particular, a client using an obsolete framed data-plane implementation is not compatible with a server expecting the current raw-IP data plane.
 
 ---
 
@@ -1564,7 +1551,7 @@ Unsupported TCPD transport protocol
 
 indicate code from the previous TCPD-based implementation.
 
-The current TPF data plane should not require TCPD parsing for direct tunneled packets.
+The current raw-IP data plane does not require legacy DATA-frame parsing for direct tunneled packets.
 
 Make sure both the Python server package and Android APK were rebuilt/reinstalled from the current source.
 
@@ -1880,14 +1867,14 @@ end-to-end encrypted application protocols
 
 # Protocol summary
 
-The Coordinator control stream uses TPCP for authentication, discovery, endpoint registration, and simultaneous-open coordination. Direct TCP4/TCP6 streams contain TPF DATA frames and top-level TPCP `KEEPALIVE`/`PONG` messages. Only binary IPv4/IPv6 packets are placed inside TPF. TPP remains an IPv6 Next Header 99 protocol inside a TPF DATA payload.
+The Coordinator control stream uses TPCP for authentication, discovery, endpoint registration, and simultaneous-open coordination. Direct TCP4/TCP6 streams contain raw IP packets and top-level TPCP `KEEPALIVE`/`PONG` messages. TPP remains an IPv6 Next Header 99 protocol inside the raw IPv6 packet.
 
 ```text
 Coordinator <-- TPCP control --> Peer
-Peer <== direct TCP + (TPF DATA or TPCP liveness) ==> Peer
+Peer <== direct TCP + (raw IPv4/IPv6 or TPCP liveness) ==> Peer
 ```
 
-The Coordinator never relays these data-plane frames. TCPD is not used.
+The Coordinator never relays this data plane. No TCPeer DATA framing is used.
 
 # Development and AI assistance
 

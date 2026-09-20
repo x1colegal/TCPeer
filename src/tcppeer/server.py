@@ -888,7 +888,7 @@ class Server:
                 if packet_count % 32 == 0:
                     await asyncio.sleep(0)
         except ProtocolError as exc:
-            if "connection closed while reading TPF header" in str(exc):
+            if "connection closed while reading IP version or TPCP" in str(exc):
                 LOG.info(
                     "direct-adopt eof ts=%.6f peer_id=%s family=%s attempt=%s initiated=%s fd=%s local=%s remote=%s packets=%s reason=%s",
                     time.time(),

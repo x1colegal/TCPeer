@@ -41,9 +41,6 @@ data class ControlMessage(
 }
 
 object TcpPeerProtocol {
-    private val dataHeaders = java.util.concurrent.ConcurrentHashMap<Int, ByteArray>()
-    private val dataFrames = java.util.WeakHashMap<OutputStream, ByteArray>()
-
     fun writeControl(output: OutputStream, message: ControlMessage) {
         output.write(message.encode())
         output.flush()
@@ -331,18 +328,7 @@ object TcpPeerProtocol {
         }
         if (wireLength > length) throw ProtocolException("Truncated IP packet")
 
-        // Keep one socket write per packet without allocating a new combined
-        // frame on every TUN read. Callers serialize each output, so its
-        // reusable frame buffer cannot be modified by concurrent DATA writes.
-        val header = dataHeaders.computeIfAbsent(wireLength) {
-            "TPF/1 DATA\r\nLength: $wireLength\r\n\r\n".toByteArray(StandardCharsets.US_ASCII)
-        }
-        val frame = synchronized(dataFrames) {
-            dataFrames.getOrPut(output) { ByteArray(MAX_PACKET_SIZE + 64) }
-        }
-        header.copyInto(frame)
-        packet.copyInto(frame, header.size, offset, offset + wireLength)
-        output.write(frame, 0, header.size + wireLength)
+        output.write(packet, offset, wireLength)
     }
 
     fun writeDataPlaneControl(output: OutputStream, command: String) {
@@ -353,30 +339,53 @@ object TcpPeerProtocol {
 
     fun readData(input: InputStream, output: OutputStream? = null, activity: (() -> Unit)? = null): ByteArray {
         while (true) {
-            when (val length = input.readDirectHeader()) {
-                DIRECT_KEEPALIVE -> {
-                    output?.let { synchronized(it) { writeDataPlaneControl(it, "PONG") } }
+            val first = input.read()
+            if (first < 0) throw EOFException("Connection closed while reading IP version or TPCP")
+            when ((first ushr 4) and 0x0f) {
+                4 -> {
+                    val packet = ByteArray(20)
+                    packet[0] = first.toByte()
+                    input.readIntoExactly(packet, 1, 19)
+                    val ihl = (packet[0].toInt() and 0x0f) * 4
+                    val totalLength = ((packet[2].toInt() and 0xff) shl 8) or
+                        (packet[3].toInt() and 0xff)
+                    if (ihl !in 20..60 || totalLength < ihl || totalLength > MAX_PACKET_SIZE)
+                        throw ProtocolException("Invalid IPv4 packet length")
+                    val complete = packet.copyOf(totalLength)
+                    input.readIntoExactly(complete, 20, totalLength - 20)
                     activity?.invoke()
-                    continue
+                    return complete
                 }
-                DIRECT_PONG -> {
+                6 -> {
+                    val packet = ByteArray(40)
+                    packet[0] = first.toByte()
+                    input.readIntoExactly(packet, 1, 39)
+                    val payloadLength = ((packet[4].toInt() and 0xff) shl 8) or
+                        (packet[5].toInt() and 0xff)
+                    val totalLength = 40 + payloadLength
+                    if (totalLength > MAX_PACKET_SIZE)
+                        throw ProtocolException("IPv6 packet exceeds maximum size")
+                    val complete = packet.copyOf(totalLength)
+                    input.readIntoExactly(complete, 40, payloadLength)
                     activity?.invoke()
-                    continue
+                    return complete
                 }
                 else -> {
-                    val payload = input.readExactly(length)
-                    activity?.invoke()
-                    val version = (payload[0].toInt() ushr 4) and 0x0f
-                    if (version != 4 && version != 6) throw ProtocolException("TPF DATA is neither IPv4 nor IPv6")
-                    val declared = if (version == 4) {
-                        if (payload.size < 20) throw ProtocolException("Truncated IPv4 header")
-                        ((payload[2].toInt() and 0xff) shl 8) or (payload[3].toInt() and 0xff)
-                    } else {
-                        if (payload.size < 40) throw ProtocolException("Truncated IPv6 header")
-                        40 + (((payload[4].toInt() and 0xff) shl 8) or (payload[5].toInt() and 0xff))
+                    if (first != 'T'.code) throw ProtocolException(
+                        "Invalid raw IP/TPCP stream prefix: 0x${first.toString(16).padStart(2, '0')}"
+                    )
+                    when (input.readDataPlaneTpcp(first)) {
+                        DIRECT_KEEPALIVE -> {
+                            output?.let { synchronized(it) { writeDataPlaneControl(it, "PONG") } }
+                            activity?.invoke()
+                            continue
+                        }
+                        DIRECT_PONG -> {
+                            activity?.invoke()
+                            continue
+                        }
+                        else -> throw ProtocolException("Invalid data-plane TPCP message")
                     }
-                    if (declared != payload.size) throw ProtocolException("TPF length does not match IP packet length")
-                    return payload
                 }
             }
         }
@@ -385,23 +394,23 @@ object TcpPeerProtocol {
 
 private const val DIRECT_KEEPALIVE = -1
 private const val DIRECT_PONG = -2
-private val TPF_DATA_PREFIX = "TPF/1 DATA\r\nLength: ".toByteArray(StandardCharsets.US_ASCII)
 private val TPCP_KEEPALIVE_HEADER = "TPCP/2 KEEPALIVE\r\n\r\n".toByteArray(StandardCharsets.US_ASCII)
 private val TPCP_PONG_HEADER = "TPCP/2 PONG\r\n\r\n".toByteArray(StandardCharsets.US_ASCII)
 private val directHeaderBuffer = object : ThreadLocal<ByteArray>() {
     override fun initialValue() = ByteArray(256)
 }
 
-/** Parse the fixed TPF/TPCP direct-stream grammar without per-packet Strings or Lists. */
-private fun InputStream.readDirectHeader(): Int {
+/** Parse a TPCP message after the leading ASCII 'T' has already been read. */
+private fun InputStream.readDataPlaneTpcp(first: Int): Int {
     val bytes = directHeaderBuffer.get()!!
-    var size = 0
+    bytes[0] = first.toByte()
+    var size = 1
     var matched = 0
     while (matched < 4) {
         val value = read()
-        if (value < 0) throw EOFException("Connection closed while reading TPF header")
-        if (value > 127) throw ProtocolException("TPF header is not ASCII")
-        if (size >= bytes.size) throw ProtocolException("TPF header is too large")
+        if (value < 0) throw EOFException("Connection closed inside data-plane TPCP")
+        if (value > 127) throw ProtocolException("Data-plane TPCP is not ASCII")
+        if (size >= bytes.size) throw ProtocolException("Data-plane TPCP message is too large")
         bytes[size++] = value.toByte()
         matched = when {
             (matched == 0 || matched == 2) && value == 13 -> matched + 1
@@ -412,23 +421,7 @@ private fun InputStream.readDirectHeader(): Int {
     }
     if (bytes.regionMatches(size, TPCP_KEEPALIVE_HEADER)) return DIRECT_KEEPALIVE
     if (bytes.regionMatches(size, TPCP_PONG_HEADER)) return DIRECT_PONG
-    if (size <= TPF_DATA_PREFIX.size + 4 || !bytes.startsWith(TPF_DATA_PREFIX))
-        throw ProtocolException("Invalid direct-stream message")
-    var length = 0
-    for (index in TPF_DATA_PREFIX.size until size - 4) {
-        val digit = bytes[index].toInt() - '0'.code
-        if (digit !in 0..9) throw ProtocolException("Invalid TPF payload length")
-        length = length * 10 + digit
-        if (length > MAX_PACKET_SIZE) throw ProtocolException("TPF payload length is out of range")
-    }
-    if (length < 1) throw ProtocolException("TPF payload length is out of range")
-    return length
-}
-
-private fun ByteArray.startsWith(prefix: ByteArray): Boolean {
-    if (size < prefix.size) return false
-    for (index in prefix.indices) if (this[index] != prefix[index]) return false
-    return true
+    throw ProtocolException("Invalid data-plane TPCP message")
 }
 
 private fun ByteArray.regionMatches(length: Int, expected: ByteArray): Boolean {
@@ -437,13 +430,11 @@ private fun ByteArray.regionMatches(length: Int, expected: ByteArray): Boolean {
     return true
 }
 
-private fun InputStream.readExactly(size: Int): ByteArray {
-    val result = ByteArray(size)
-    var offset = 0
-    while (offset < size) {
-        val count = read(result, offset, size - offset)
-        if (count < 0) throw EOFException("Connection closed while reading a frame")
-        offset += count
+private fun InputStream.readIntoExactly(destination: ByteArray, offset: Int, length: Int) {
+    var written = 0
+    while (written < length) {
+        val count = read(destination, offset + written, length - written)
+        if (count < 0) throw EOFException("Connection closed inside raw IP packet")
+        written += count
     }
-    return result
 }

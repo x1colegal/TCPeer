@@ -11,8 +11,8 @@ Compose, Material 3, and Material You dynamic color.
 - Protects coordinator and direct TCP sockets from the VPN route.
 - Protects the Secret Key with HMAC-SHA256 challenge response.
 - Keeps all other ASCII control fields and VPN traffic cleartext.
-- Uses binary DATA frames for inner IPv4 and IPv6 packets.
-- Negotiates stateful IPv4 by sending DHCP packets inside DATA frames.
+- Carries inner IPv4 and IPv6 packets as an unframed raw-IP byte stream.
+- Negotiates stateful IPv4 by sending raw DHCP/IP packets through the data plane.
 - Derives an IPv6 SLAAC address from the server Router Advertisement.
 - Performs coordinated direct TCP simultaneous-open.
 - Never opens a UDP socket and never uses relay, QUIC, WebRTC, or TLS.
