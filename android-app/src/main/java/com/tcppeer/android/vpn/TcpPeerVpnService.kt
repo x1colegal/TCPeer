@@ -1861,14 +1861,20 @@ class TcpPeerVpnService : VpnService() {
             closeQuietly(descriptor)
             throw CancellationException("VPN interface belongs to a cancelled connection")
         }
-        val input = FileInputStream(descriptor.fileDescriptor)
-        val output = try {
-            FileOutputStream(descriptor.fileDescriptor)
+        // Give each stream its own duplicated descriptor. Sharing the exact
+        // FileDescriptor object lets a stream close invalidate that object
+        // before ParcelFileDescriptor.close() reaches the owning TUN fd on
+        // Android 9's libcore implementation.
+        val inputDescriptor = ParcelFileDescriptor.dup(descriptor.fileDescriptor)
+        val outputDescriptor = try {
+            ParcelFileDescriptor.dup(descriptor.fileDescriptor)
         } catch (error: Exception) {
-            closeQuietly(input)
+            closeQuietly(inputDescriptor)
             closeQuietly(descriptor)
             throw error
         }
+        val input = ParcelFileDescriptor.AutoCloseInputStream(inputDescriptor)
+        val output = ParcelFileDescriptor.AutoCloseOutputStream(outputDescriptor)
         tunnel = descriptor
         tunnelInput = input
         tunnelOutput = output

@@ -33,6 +33,13 @@
             <intent-filter>
                 <action android:name="android.net.VpnService" />
             </intent-filter>
+            <!-- TCPeer sessions are explicitly controlled by the in-app
+                 switch. Opt out of Android's default API-27+ always-on support
+                 so the system cannot retain/restart a session after the user
+                 requests Disconnect. -->
+            <meta-data
+                android:name="android.net.VpnService.SUPPORTS_ALWAYS_ON"
+                android:value="false" />
         </service>
     </application>
 </manifest>
