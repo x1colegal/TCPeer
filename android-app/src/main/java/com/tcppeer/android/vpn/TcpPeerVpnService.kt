@@ -1819,6 +1819,7 @@ class TcpPeerVpnService : VpnService() {
         connectionJob = null
         stoppedJob?.cancel()
         closeResources()
+        releaseLegacyVpnAgent()
         TcpPeerRuntime.replace(VpnRuntimeState())
         TcpPeerRuntime.setServiceActive(false)
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -1827,6 +1828,26 @@ class TcpPeerVpnService : VpnService() {
         // leaving Android's VPN network and routes registered even though all
         // TCPeer sockets are already closed and the UI says Disconnected.
         stopSelf()
+    }
+
+    /**
+     * Android 9 can keep the framework's VpnService binding and notification
+     * after the active TUN has gone DOWN when a worker was blocked in a read on
+     * that interface. Replacing it with a descriptor that is never handed to a
+     * worker, then closing that descriptor immediately, gives the framework a
+     * deterministic interface-removed event and releases the system VPN agent.
+     */
+    private fun releaseLegacyVpnAgent() {
+        if (Build.VERSION.SDK_INT > Build.VERSION_CODES.P) return
+        runCatching {
+            Builder()
+                .setSession("TCPeer disconnecting")
+                .addAddress("192.0.2.1", 32)
+                .establish()
+                ?.close()
+        }.onFailure { error ->
+            Log.w(TAG, "Could not explicitly release the Android 9 VPN agent", error)
+        }
     }
 
     /**
