@@ -17,7 +17,7 @@ COMMANDS = frozenset(
     {
         "AUTH", "AUTH-CHALLENGE", "AUTH-PROOF", "AUTH-OK", "AUTH-ERROR", "REGISTER", "PEER-INFO",
         "ENDPOINT-INFO", "ENDPOINT-QUERY", "PUNCH-READY", "PUNCH-GO", "PING", "PONG",
-        "KEEPALIVE", "ERROR", "DISCONNECT",
+        "KEEPALIVE", "TPP-PING", "TPP-PONG", "ERROR", "DISCONNECT",
     }
 )
 
@@ -395,6 +395,36 @@ def encode_data_plane_control(command: str) -> bytes:
     return f"TPCP/2 {command}\r\n\r\n".encode("ascii")
 
 
+def encode_tpp_control(command: str, identifier: int, timestamp_ns: int) -> bytes:
+    """Encode a TPP probe as a top-level data-plane TPCP message."""
+    if command not in {"TPP-PING", "TPP-PONG"}:
+        raise ProtocolError("invalid TPP command")
+    if not 0 <= identifier <= 0x7fffffffffffffff:
+        raise ProtocolError("invalid TPP identifier")
+    if not 0 <= timestamp_ns <= 0x7fffffffffffffff:
+        raise ProtocolError("invalid TPP timestamp")
+    return ControlMessage(command, {
+        "Identifier": str(identifier),
+        "Timestamp-Ns": str(timestamp_ns),
+    }).encode()
+
+
+def parse_tpp_control(message: ControlMessage) -> tuple[int, int]:
+    """Validate and return the identifier and timestamp of a TPP message."""
+    if message.command not in {"TPP-PING", "TPP-PONG"}:
+        raise ProtocolError("not a TPP message")
+    if set(name.casefold() for name in message.fields) != {"identifier", "timestamp-ns"}:
+        raise ProtocolError("invalid TPP fields")
+    try:
+        identifier = int(message.get("Identifier", ""), 10)
+        timestamp_ns = int(message.get("Timestamp-Ns", ""), 10)
+    except ValueError as exc:
+        raise ProtocolError("invalid TPP numeric field") from exc
+    if not 0 <= identifier <= 0x7fffffffffffffff or not 0 <= timestamp_ns <= 0x7fffffffffffffff:
+        raise ProtocolError("TPP numeric field is out of range")
+    return identifier, timestamp_ns
+
+
 def _parse_tcpd_header(header: bytes) -> dict[str, str]:
     try:
         text = header.decode("ascii")
@@ -667,7 +697,7 @@ def decode_data(frame: bytes) -> bytes:
     return frame
 
 
-async def read_data(reader, writer=None, activity=None) -> bytes:
+async def read_data(reader, writer=None, activity=None, tpp=None) -> bytes:
     """Read raw IP packets and top-level TPCP liveness from one TCP stream."""
     while True:
         try:
@@ -717,7 +747,7 @@ async def read_data(reader, writer=None, activity=None) -> bytes:
                 message = first + await reader.readuntil(b"\r\n\r\n")
             except Exception as exc:
                 raise ProtocolError("connection closed inside data-plane TPCP") from exc
-            if len(message) > 256:
+            if len(message) > 512:
                 raise ProtocolError("data-plane TPCP message is too large")
             if message == encode_data_plane_control("KEEPALIVE"):
                 if writer is not None:
@@ -727,6 +757,19 @@ async def read_data(reader, writer=None, activity=None) -> bytes:
                     activity()
                 continue
             if message == encode_data_plane_control("PONG"):
+                if activity is not None:
+                    activity()
+                continue
+            control = parse_control(message)
+            if control.command in {"TPP-PING", "TPP-PONG"}:
+                identifier, timestamp_ns = parse_tpp_control(control)
+                if control.command == "TPP-PING" and writer is not None:
+                    writer.write(encode_tpp_control("TPP-PONG", identifier, timestamp_ns))
+                    await writer.drain()
+                if tpp is not None:
+                    result = tpp(control.command, identifier, timestamp_ns)
+                    if hasattr(result, "__await__"):
+                        await result
                 if activity is not None:
                     activity()
                 continue

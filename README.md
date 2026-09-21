@@ -45,7 +45,7 @@ TCPeer currently provides:
 - Persistent SQLite server state and coordinator device inventory
 - Device/peer synchronization
 - Automatic Android reconnection
-- TPP / TCPPeerPing
+- TPP / TCPPeerPing over TPCP
 - Coordinator-local administration
 - Interactive Linux configuration
 - systemd services
@@ -157,14 +157,14 @@ the receiver still separates packets exclusively from their IP length fields.
 Android bounds batching to a short interval and flushes payload-free TCP control
 packets immediately so inner ACK, SYN, and FIN feedback is not delayed.
 
-TPCP liveness messages share the direct TCP stream as independent top-level ASCII messages:
+TPCP liveness and TPP messages share the direct TCP stream as independent top-level ASCII messages:
 
 ```text
 TPCP/2 KEEPALIVE\r\n
 \r\n
 ```
 
-The receiver answers with a top-level `TPCP/2 PONG` message. This traffic keeps stateful NAT mappings active and makes a dead direct path observable even when no tunneled packets are being exchanged. Detection is unambiguous from the first byte: high nibble `4` means IPv4, high nibble `6` means IPv6, and ASCII `T` begins TPCP. No DATA framing is used.
+The receiver answers with a top-level `TPCP/2 PONG` message. This traffic keeps stateful NAT mappings active and makes a dead direct path observable even when no tunneled packets are being exchanged. TPP uses the same top-level TPCP syntax with the distinct `TPP-PING` and `TPP-PONG` commands. Detection is unambiguous from the first byte: high nibble `4` means IPv4, high nibble `6` means IPv6, and ASCII `T` begins TPCP. No DATA framing is used.
 
 ---
 
@@ -261,7 +261,6 @@ IPv6 / UDP
 IPv6 / ICMPv6
 IPv6 / SCTP
 IPv6 / DCCP
-IPv6 / TPP
 ```
 
 TCPeer does not need to convert the inner transport header into separate metadata.
@@ -280,7 +279,7 @@ For example, an IPv6/TCP packet remains:
 
 The complete byte sequence is transferred as the inner IPv6 packet.
 
-The same principle applies to UDP, ICMP, ICMPv6, SCTP, DCCP, TPP, DHCP, DNS, and other protocols carried inside IPv4 or IPv6.
+The same principle applies to UDP, ICMP, ICMPv6, SCTP, DCCP, DHCP, DNS, and other protocols carried inside IPv4 or IPv6. TPP is different: it is a top-level TPCP direct-stream function rather than an inner IP protocol.
 
 ---
 
@@ -423,17 +422,16 @@ and future connection coordination; it does not turn the Coordinator into a
 data-plane path.
 
 TPCP primarily operates on the Coordinator control connection. The direct
-data-plane connection additionally carries the narrow `KEEPALIVE` and `PONG`
-subset as top-level ASCII messages so NAT state and half-open connections can be detected.
-TPCP is distinct from **TPP**, the IPv6-only TCPPeerPing protocol carried inside
-an IPv6 packet with Next Header 99.
+data-plane connection additionally carries `KEEPALIVE`, `PONG`, `TPP-PING`, and
+`TPP-PONG` as top-level ASCII messages. Liveness messages detect expired NAT
+state and half-open connections; TPP messages measure the direct peer path.
 
 ## Data plane
 
 After direct connectivity is established, the peer-to-peer data stream carries:
 
 ```text
-raw binary IPv4/IPv6 packets, interleaved only with top-level TPCP liveness messages
+raw binary IPv4/IPv6 packets, interleaved with top-level TPCP liveness and TPP messages
 ```
 
 There is no TCPD translation layer between outer TCP and the inner IP packets.
@@ -840,37 +838,42 @@ A DNS packet remains an ordinary IPv4 or IPv6 packet in the tunnel.
 
 # TPP / TCPPeerPing
 
-TCPPeerPing, abbreviated **TPP**, is TCPeer's latency protocol.
+TCPPeerPing, abbreviated **TPP**, is TCPeer's direct-path latency protocol. The
+current protocol is carried as top-level TPCP messages on an established direct
+TCP4 or TCP6 stream. It does not synthesize an inner IP packet and does not pass
+through the TUN.
 
-TPP uses IPv6 Next Header:
-
-```text
-99
-```
-
-and the protocol magic:
+A probe and its reply use the existing TPCP version prefix:
 
 ```text
-TPP1
+TPCP/2 TPP-PING\r\n
+Identifier: 42\r\n
+Timestamp-Ns: 123456789\r\n
+\r\n
+
+TPCP/2 TPP-PONG\r\n
+Identifier: 42\r\n
+Timestamp-Ns: 123456789\r\n
+\r\n
 ```
 
-TPP requests and replies contain timing information used to calculate round-trip latency.
+`Identifier` and `Timestamp-Ns` are non-negative signed 64-bit decimal integers. The
+receiver echoes both fields in `TPP-PONG`; the sender matches the identifier and
+calculates RTT from its local monotonic clock. The direct stream itself identifies
+the target peer, so TPP needs no overlay source or destination address. This also
+makes the same implementation work over both TCP4 and TCP6.
 
-A TPP packet is an ordinary inner IPv6 packet:
+`TPP-PING`/`TPP-PONG` are deliberately distinct from the Coordinator's
+`PING`/`PONG` and the data-plane `KEEPALIVE`/`PONG`: TPP produces a user-visible
+measurement, while keepalive only verifies stream liveness. The Android app and
+Linux CLI provide continuous TPP latency measurements for connected peers.
 
-```text
-+----------------------+
-| IPv6 header          |
-| Next Header = 99     |
-+----------------------+
-| TPP                  |
-| Magic = TPP1         |
-+----------------------+
-```
+## Historical TPP format
 
-Because the TCPeer data plane carries inner IPv6 packets, no special TCPD handling is required for TPP.
-
-The Android application can provide continuous TPP latency measurements for connected peers.
+Through TCPeer 1.0 Beta 65, TPP was an inner IPv6 protocol using Next Header 99
+and the binary magic `TPP1`. Those probes were injected as IPv6 packets and were
+therefore IPv6-only. The current TPCP-integrated format replaced that wire format;
+legacy Next Header 99 probes are no longer generated or interpreted by TCPeer.
 
 ---
 
@@ -1460,7 +1463,7 @@ Typical direct port:
 
 The sender validates the IP packet length and writes exactly that binary packet to the TCP stream. The receiver reads the first byte, selects IPv4, IPv6, or TPCP parsing, and obtains the remaining packet length from the native IP header. IPv4 `Total Length` and IPv6 `Payload Length` preserve boundaries even when TCP splits or coalesces stream segments.
 
-Top-level `TPCP/2 KEEPALIVE` messages are sent every 15 seconds and receive a top-level `TPCP/2 PONG`. They are consumed by the direct-stream protocol parser and are never written to the TUN. Unknown TPCP commands, invalid IP versions, malformed lengths, or truncated packets close the direct connection.
+Top-level `TPCP/2 KEEPALIVE` messages are sent every 15 seconds and receive a top-level `TPCP/2 PONG`. TPP probes use top-level `TPCP/2 TPP-PING` and `TPCP/2 TPP-PONG`. These commands are consumed by the direct-stream protocol parser and are never written to the TUN. Unknown TPCP commands, invalid IP versions, malformed lengths, or truncated packets close the direct connection.
 
 The inner IPv4 or IPv6 packet remains intact, including transport headers, checksums, and application bytes. TCPeer performs no DATA encapsulation, header conversion, or reconstruction.
 
@@ -1834,7 +1837,6 @@ TCPeer/
 │       ├── ra.py
 │       ├── server.py
 │       ├── state.py
-│       ├── tpp.py
 │       ├── transport.py
 │       └── tun.py
 │
@@ -1883,11 +1885,11 @@ end-to-end encrypted application protocols
 
 # Protocol summary
 
-The Coordinator control stream uses TPCP for authentication, discovery, endpoint registration, and simultaneous-open coordination. Direct TCP4/TCP6 streams contain raw IP packets and top-level TPCP `KEEPALIVE`/`PONG` messages. TPP remains an IPv6 Next Header 99 protocol inside the raw IPv6 packet.
+The Coordinator control stream uses TPCP for authentication, discovery, endpoint registration, and simultaneous-open coordination. Direct TCP4/TCP6 streams contain raw IP packets plus top-level TPCP `KEEPALIVE`/`PONG` and `TPP-PING`/`TPP-PONG` messages.
 
 ```text
 Coordinator <-- TPCP control --> Peer
-Peer <== direct TCP + (raw IPv4/IPv6 or TPCP liveness) ==> Peer
+Peer <== direct TCP + (raw IPv4/IPv6 or TPCP liveness/TPP) ==> Peer
 ```
 
 The Coordinator never relays this data plane. No TCPeer DATA framing is used.

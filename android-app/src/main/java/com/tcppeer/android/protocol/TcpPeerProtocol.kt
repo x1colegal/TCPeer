@@ -1,6 +1,7 @@
 package com.tcppeer.android.protocol
 
 import java.io.BufferedInputStream
+import java.io.ByteArrayInputStream
 import java.io.EOFException
 import java.io.InputStream
 import java.io.OutputStream
@@ -337,7 +338,21 @@ object TcpPeerProtocol {
         output.flush()
     }
 
-    fun readData(input: InputStream, output: OutputStream? = null, activity: (() -> Unit)? = null): ByteArray {
+    fun writeTppControl(output: OutputStream, command: String, identifier: Long, timestampNs: Long) {
+        require(command == "TPP-PING" || command == "TPP-PONG")
+        require(identifier >= 0 && timestampNs >= 0)
+        writeControl(output, ControlMessage(command, linkedMapOf(
+            "Identifier" to identifier.toString(),
+            "Timestamp-Ns" to timestampNs.toString(),
+        )))
+    }
+
+    fun readData(
+        input: InputStream,
+        output: OutputStream? = null,
+        activity: (() -> Unit)? = null,
+        tpp: ((String, Long, Long) -> Unit)? = null,
+    ): ByteArray {
         while (true) {
             val first = input.read()
             if (first < 0) throw EOFException("Connection closed while reading IP version or TPCP")
@@ -374,13 +389,28 @@ object TcpPeerProtocol {
                     if (first != 'T'.code) throw ProtocolException(
                         "Invalid raw IP/TPCP stream prefix: 0x${first.toString(16).padStart(2, '0')}"
                     )
-                    when (input.readDataPlaneTpcp(first)) {
-                        DIRECT_KEEPALIVE -> {
+                    val control = input.readDataPlaneTpcp(first)
+                    when (control.command) {
+                        "KEEPALIVE" -> {
                             output?.let { synchronized(it) { writeDataPlaneControl(it, "PONG") } }
                             activity?.invoke()
                             continue
                         }
-                        DIRECT_PONG -> {
+                        "PONG" -> {
+                            activity?.invoke()
+                            continue
+                        }
+                        "TPP-PING", "TPP-PONG" -> {
+                            val identifier = control.field("Identifier")?.toLongOrNull()
+                                ?: throw ProtocolException("Invalid TPP identifier")
+                            val timestamp = control.field("Timestamp-Ns")?.toLongOrNull()
+                                ?: throw ProtocolException("Invalid TPP timestamp")
+                            if (identifier < 0 || timestamp < 0 || control.fields.size != 2)
+                                throw ProtocolException("Invalid TPP fields")
+                            if (control.command == "TPP-PING") output?.let {
+                                synchronized(it) { writeTppControl(it, "TPP-PONG", identifier, timestamp) }
+                            }
+                            tpp?.invoke(control.command, identifier, timestamp)
                             activity?.invoke()
                             continue
                         }
@@ -397,6 +427,7 @@ object TcpPeerProtocol {
         destination: ByteArray,
         output: OutputStream? = null,
         activity: (() -> Unit)? = null,
+        tpp: ((String, Long, Long) -> Unit)? = null,
     ): Int {
         require(destination.size >= MAX_PACKET_SIZE)
         while (true) {
@@ -429,12 +460,26 @@ object TcpPeerProtocol {
                     if (first != 'T'.code) throw ProtocolException(
                         "Invalid raw IP/TPCP stream prefix: 0x${first.toString(16).padStart(2, '0')}"
                     )
-                    when (input.readDataPlaneTpcp(first)) {
-                        DIRECT_KEEPALIVE -> {
+                    val control = input.readDataPlaneTpcp(first)
+                    when (control.command) {
+                        "KEEPALIVE" -> {
                             output?.let { synchronized(it) { writeDataPlaneControl(it, "PONG") } }
                             activity?.invoke()
                         }
-                        DIRECT_PONG -> activity?.invoke()
+                        "PONG" -> activity?.invoke()
+                        "TPP-PING", "TPP-PONG" -> {
+                            val identifier = control.field("Identifier")?.toLongOrNull()
+                                ?: throw ProtocolException("Invalid TPP identifier")
+                            val timestamp = control.field("Timestamp-Ns")?.toLongOrNull()
+                                ?: throw ProtocolException("Invalid TPP timestamp")
+                            if (identifier < 0 || timestamp < 0 || control.fields.size != 2)
+                                throw ProtocolException("Invalid TPP fields")
+                            if (control.command == "TPP-PING") output?.let {
+                                synchronized(it) { writeTppControl(it, "TPP-PONG", identifier, timestamp) }
+                            }
+                            tpp?.invoke(control.command, identifier, timestamp)
+                            activity?.invoke()
+                        }
                         else -> throw ProtocolException("Invalid data-plane TPCP message")
                     }
                 }
@@ -443,10 +488,6 @@ object TcpPeerProtocol {
     }
 }
 
-private const val DIRECT_KEEPALIVE = -1
-private const val DIRECT_PONG = -2
-private val TPCP_KEEPALIVE_HEADER = "TPCP/2 KEEPALIVE\r\n\r\n".toByteArray(StandardCharsets.US_ASCII)
-private val TPCP_PONG_HEADER = "TPCP/2 PONG\r\n\r\n".toByteArray(StandardCharsets.US_ASCII)
 private val directHeaderBuffer = object : ThreadLocal<ByteArray>() {
     override fun initialValue() = ByteArray(256)
 }
@@ -455,7 +496,7 @@ private val ipHeaderBuffer = object : ThreadLocal<ByteArray>() {
 }
 
 /** Parse a TPCP message after the leading ASCII 'T' has already been read. */
-private fun InputStream.readDataPlaneTpcp(first: Int): Int {
+private fun InputStream.readDataPlaneTpcp(first: Int): ControlMessage {
     val bytes = directHeaderBuffer.get()!!
     bytes[0] = first.toByte()
     var size = 1
@@ -473,15 +514,10 @@ private fun InputStream.readDataPlaneTpcp(first: Int): Int {
             else -> 0
         }
     }
-    if (bytes.regionMatches(size, TPCP_KEEPALIVE_HEADER)) return DIRECT_KEEPALIVE
-    if (bytes.regionMatches(size, TPCP_PONG_HEADER)) return DIRECT_PONG
-    throw ProtocolException("Invalid data-plane TPCP message")
-}
-
-private fun ByteArray.regionMatches(length: Int, expected: ByteArray): Boolean {
-    if (length != expected.size) return false
-    for (index in expected.indices) if (this[index] != expected[index]) return false
-    return true
+    val message = TcpPeerProtocol.readControl(ByteArrayInputStream(bytes.copyOf(size)))
+    if (message.command !in setOf("KEEPALIVE", "PONG", "TPP-PING", "TPP-PONG"))
+        throw ProtocolException("Invalid data-plane TPCP message")
+    return message
 }
 
 private fun InputStream.readIntoExactly(destination: ByteArray, offset: Int, length: Int) {

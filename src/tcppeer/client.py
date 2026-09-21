@@ -27,7 +27,6 @@ from tcppeer.server import (
     public_address,
 )
 from tcppeer.state import StateStore
-from tcppeer.tpp import ECHO_REPLY, ECHO_REQUEST, build_reply as build_tpp_reply, parse_tpp
 from tcppeer.tun import TunDevice
 
 LOG = logging.getLogger("tcppeer.client")
@@ -336,17 +335,6 @@ class Client(Server):
         subprocess.run(command, check=True, capture_output=True, text=True)
 
     async def _handle_peer_packet(self, packet: bytes, writer, peer_id: str) -> None:
-        tpp = parse_tpp(packet)
-        if tpp is not None and tpp.kind == ECHO_REPLY and tpp.destination == self._overlay_ipv6:
-            future = self._pending_tpp_pings.get(tpp.identifier)
-            if future is not None and not future.done():
-                future.set_result(tpp)
-            return
-        if tpp is not None and tpp.kind == ECHO_REQUEST and tpp.destination == self._overlay_ipv6:
-            reply = build_tpp_reply(packet)
-            if reply is not None:
-                await self._write_data(writer, reply)
-            return
         self._queue_tun_packet(peer_id, packet)
 
 

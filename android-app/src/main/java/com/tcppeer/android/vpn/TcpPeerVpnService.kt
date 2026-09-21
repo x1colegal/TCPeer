@@ -33,7 +33,6 @@ import com.tcppeer.android.protocol.DirectFamily
 import com.tcppeer.android.protocol.ProtocolException
 import com.tcppeer.android.protocol.TcpPeerProtocol
 import com.tcppeer.android.protocol.TransportPolicy
-import com.tcppeer.android.protocol.TppProtocol
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -789,6 +788,7 @@ class TcpPeerVpnService : VpnService() {
                     BufferedInputStream(directInput, DIRECT_STREAM_BUFFER_BYTES),
                     primaryDataOutput,
                     addresses.second.address,
+                    targetPeerId,
                     peerOutputs,
                     tunPackets,
                 )
@@ -875,7 +875,9 @@ class TcpPeerVpnService : VpnService() {
             }
             try {
                 while (true) {
-                    val packet = TcpPeerProtocol.readData(input, output) { lastRx.set(System.nanoTime()) }
+                    val packet = TcpPeerProtocol.readData(
+                        input, output, { lastRx.set(System.nanoTime()) },
+                    ) { command, identifier, _ -> handleTppControl(peerId, command, identifier) }
                     commitMeshSocket(peerId, socket)
                     processInboundPacket(packet, peerId, overlayIpv6, output, tunPackets)
                 }
@@ -976,7 +978,9 @@ class TcpPeerVpnService : VpnService() {
             }
             try {
                 while (true) {
-                    val packet = TcpPeerProtocol.readData(input, output) { lastRx.set(System.nanoTime()) }
+                    val packet = TcpPeerProtocol.readData(
+                        input, output, { lastRx.set(System.nanoTime()) },
+                    ) { command, identifier, _ -> handleTppControl(peerId, command, identifier) }
                     commitMeshSocket(peerId, socket)
                     processInboundPacket(packet, peerId, overlayIpv6, output, tunPackets)
                 }
@@ -1079,33 +1083,17 @@ class TcpPeerVpnService : VpnService() {
         length: Int = packet.size,
     ): Int {
         if (AddressNegotiation.isRouterAdvertisement(packet)) return 0
-        val tpp = TppProtocol.parse(packet, length)
-        return when (tpp?.type) {
-            TppProtocol.ECHO_REQUEST -> {
-                if (tpp.destination == overlayIpv6) {
-                    val reply = TppProtocol.reply(tpp)
-                    synchronized(output) { TcpPeerProtocol.writeData(output, reply) }
-                    Log.d(TAG, "TPP reply sent directly to peer_id=$peerId identifier=${tpp.identifier}")
-                    reply.size
-                } else {
-                    if (!tunPackets.offer(packet, length))
-                        Log.w(TAG, "TUN receive queue full; dropping packet from peer_id=$peerId")
-                    0
-                }
-            }
-            TppProtocol.ECHO_REPLY -> {
-                pendingTppPings.remove(tpp.identifier)?.let { (pingPeerId, sentAt) ->
-                    val latencyMillis = (System.nanoTime() - sentAt) / 1_000_000.0
-                    TcpPeerRuntime.recordPing(pingPeerId, latencyMillis)
-                    Log.d(TAG, "TPP reply received directly from peer_id=$peerId identifier=${tpp.identifier}")
-                }
-                0
-            }
-            else -> {
-                if (!tunPackets.offer(packet, length))
-                    Log.w(TAG, "TUN receive queue full; dropping packet from peer_id=$peerId")
-                0
-            }
+        if (!tunPackets.offer(packet, length))
+            Log.w(TAG, "TUN receive queue full; dropping packet from peer_id=$peerId")
+        return 0
+    }
+
+    private fun handleTppControl(peerId: String, command: String, identifier: Long) {
+        if (command != "TPP-PONG") return
+        pendingTppPings.remove(identifier)?.let { (pingPeerId, sentAt) ->
+            val latencyMillis = (System.nanoTime() - sentAt) / 1_000_000.0
+            TcpPeerRuntime.recordPing(pingPeerId, latencyMillis)
+            Log.d(TAG, "TPCP TPP reply received peer_id=$peerId identifier=$identifier")
         }
     }
 
@@ -1587,6 +1575,7 @@ class TcpPeerVpnService : VpnService() {
         directInput: java.io.InputStream,
         directOutput: java.io.OutputStream,
         overlayIpv6: Inet6Address,
+        primaryPeerId: String,
         peerOutputs: ConcurrentHashMap<String, java.io.OutputStream>,
         tunPackets: TunPacketSink,
     ) = coroutineScope {
@@ -1685,11 +1674,6 @@ class TcpPeerVpnService : VpnService() {
             TcpPeerRuntime.pingTarget.collectLatest { request ->
                 pendingTppPings.clear()
                 if (request == null) return@collectLatest
-                val destination = runCatching { InetAddress.getByName(request.ipv6) as Inet6Address }.getOrNull()
-                if (destination == null) {
-                    TcpPeerRuntime.recordPing(request.peerId, null)
-                    return@collectLatest
-                }
                 while (true) {
                     val output = peerOutputs[request.peerId]
                     if (output == null) {
@@ -1699,13 +1683,10 @@ class TcpPeerVpnService : VpnService() {
                     }
                     val identifier = nextTppPingId.incrementAndGet()
                     val sentAt = System.nanoTime()
-                    val packet = TppProtocol.request(overlayIpv6, destination, identifier, sentAt)
                     pendingTppPings[identifier] = request.peerId to sentAt
                     synchronized(output) {
-                        TcpPeerProtocol.writeData(output, packet)
+                        TcpPeerProtocol.writeTppControl(output, "TPP-PING", identifier, sentAt)
                     }
-                    if (output === directOutput) outputPending.set(true)
-                    pendingTxBytes.addAndGet(packet.size.toLong())
                     launch {
                         delay(3_000)
                         pendingTppPings.remove(identifier)?.let { (peerId, _) ->
@@ -1734,8 +1715,13 @@ class TcpPeerVpnService : VpnService() {
             var byteBatch = 0L
             var packetBatch = 0
             while (true) {
-                val packetLength = TcpPeerProtocol.readDataInto(directInput, packet, directOutput) {
-                    lastDataPlaneRx.set(System.nanoTime())
+                val packetLength = TcpPeerProtocol.readDataInto(
+                    directInput,
+                    packet,
+                    directOutput,
+                    { lastDataPlaneRx.set(System.nanoTime()) },
+                ) { command, identifier, _ ->
+                    handleTppControl(primaryPeerId, command, identifier)
                 }
                 byteBatch += packetLength
                 packetBatch++

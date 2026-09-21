@@ -17,7 +17,6 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tcppeer.config import ClientConfig, ConfigurationError, ServerConfig
-from tcppeer.tpp import ECHO_REPLY, build_tpp, parse_tpp
 
 
 def _rows(connection: sqlite3.Connection, query: str) -> list[sqlite3.Row]:
@@ -108,7 +107,7 @@ def _run_ping(config: LinuxConfig, peer_id: str) -> None:
         client.connect("/run/tcppeer/server-admin.sock")
         client.sendall(f"PING {peer_id}\n".encode("ascii"))
 
-        print(f"TPP ping {peer_id} - IPv6 Next Header 99")
+        print(f"TPP ping {peer_id} - TPCP direct-stream probes")
 
         try:
             with client.makefile("r", encoding="ascii") as stream:

@@ -100,6 +100,27 @@ class TcpPeerProtocolTest {
     }
 
     @Test
+    fun tppPingIsAnsweredInsideTpcp() {
+        val packet = ByteArray(40).also { it[0] = 0x60 }
+        val stream = ByteArrayOutputStream().also {
+            TcpPeerProtocol.writeTppControl(it, "TPP-PING", 42, 123456789)
+            TcpPeerProtocol.writeData(it, packet)
+        }
+        val replies = ByteArrayOutputStream()
+        val received = mutableListOf<Triple<String, Long, Long>>()
+        assertArrayEquals(packet, TcpPeerProtocol.readData(
+            ByteArrayInputStream(stream.toByteArray()), replies, tpp = { command, identifier, timestamp ->
+                received += Triple(command, identifier, timestamp)
+            },
+        ))
+        assertEquals(listOf(Triple("TPP-PING", 42L, 123456789L)), received)
+        assertEquals(
+            "TPCP/2 TPP-PONG\r\nIdentifier: 42\r\nTimestamp-Ns: 123456789\r\n\r\n",
+            replies.toString(Charsets.US_ASCII.name()),
+        )
+    }
+
+    @Test
     fun linkLocalIpv6IsNotUsable() {
         assertFalse(TransportPolicy.isUsableIpv6(InetAddress.getByName("fe80::1")))
         assertTrue(TransportPolicy.isUsableIpv6(InetAddress.getByName("2001:db8::1")))

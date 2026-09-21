@@ -27,7 +27,7 @@ data class NetworkDevice(
     val connectedUsing: String = "-",
 )
 
-data class TppPingRequest(val peerId: String, val ipv6: String)
+data class TppPingRequest(val peerId: String)
 
 data class TppPingSample(val timestampMillis: Long, val latencyMillis: Double?)
 
@@ -65,9 +65,9 @@ object TcpPeerRuntime {
         mutableServiceActive.value = active
     }
 
-    fun startContinuousPing(peerId: String, ipv6: String) {
+    fun startContinuousPing(peerId: String) {
         update { it.copy(activePingPeerId = peerId, pingSamples = emptyList()) }
-        mutablePingTarget.value = TppPingRequest(peerId, ipv6)
+        mutablePingTarget.value = TppPingRequest(peerId)
     }
 
     fun stopContinuousPing() {

@@ -412,7 +412,7 @@ private fun PeersTab(
                     isSelf = device.peerId == configuration.peerId,
                     onRename = onRenameSelf,
                 ) {
-                    TcpPeerRuntime.startContinuousPing(device.peerId, device.overlayIpv6)
+                    TcpPeerRuntime.startContinuousPing(device.peerId)
                 }
             }
         }
@@ -1195,7 +1195,7 @@ private fun TppPingDialog(peerId: String, samples: List<TppPingSample>, onClose:
                 Column {
                     Text("TPP continuous ping", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
                     Text(
-                        "$peerId • IPv6 Next Header 99 • 1 sample per second",
+                        "$peerId • TPCP direct-stream TPP • 1 sample per second",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )

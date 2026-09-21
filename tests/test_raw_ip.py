@@ -1,7 +1,7 @@
 import asyncio
 import unittest
 
-from tcppeer.protocol import ProtocolError, encode_data, encode_data_plane_control, read_data
+from tcppeer.protocol import ProtocolError, encode_data, encode_data_plane_control, encode_tpp_control, read_data
 
 
 class RawIpEncodingTests(unittest.TestCase):
@@ -34,6 +34,33 @@ class RawIpEncodingTests(unittest.TestCase):
             return await read_data(reader)
 
         self.assertEqual(bytes(packet), asyncio.run(parse()))
+
+    def test_tpp_ping_is_answered_inside_tpcp(self):
+        ping = encode_tpp_control("TPP-PING", 42, 123456789)
+        packet = bytearray(40)
+        packet[0] = 0x60
+
+        async def parse():
+            reader = asyncio.StreamReader()
+            reader.feed_data(ping + encode_data(bytes(packet)))
+            reader.feed_eof()
+            output = type("Writer", (), {
+                "data": bytearray(),
+                "write": lambda self, value: self.data.extend(value),
+                "drain": lambda self: asyncio.sleep(0),
+            })()
+            received = []
+            parsed = await read_data(
+                reader, output, tpp=lambda command, identifier, timestamp: received.append(
+                    (command, identifier, timestamp)
+                ),
+            )
+            return parsed, bytes(output.data), received
+
+        parsed, reply, received = asyncio.run(parse())
+        self.assertEqual(bytes(packet), parsed)
+        self.assertEqual(encode_tpp_control("TPP-PONG", 42, 123456789), reply)
+        self.assertEqual([("TPP-PING", 42, 123456789)], received)
 
 
 if __name__ == "__main__":
