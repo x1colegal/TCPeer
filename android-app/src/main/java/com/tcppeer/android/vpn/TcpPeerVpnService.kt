@@ -122,6 +122,8 @@ class TcpPeerVpnService : VpnService() {
     private val meshAdoptionLock = Any()
     private val meshConnecting = ConcurrentHashMap.newKeySet<String>()
     private val meshPunchActive = ConcurrentHashMap.newKeySet<String>()
+    private val meshReadySentAt = ConcurrentHashMap<String, Long>()
+    private val inFlightSockets = ConcurrentHashMap.newKeySet<Socket>()
     private val nextTppPingId = AtomicLong(System.nanoTime())
     private val connectionGeneration = AtomicLong(0)
     private val pendingTppPings = ConcurrentHashMap<Long, Pair<String, Long>>()
@@ -294,7 +296,22 @@ class TcpPeerVpnService : VpnService() {
                         stopForeground(STOP_FOREGROUND_REMOVE)
                         stopAfterConnectivityRefresh()
                     } else {
-                        Log.i(TAG, "Ignoring cleanup from superseded connection generation=$generation")
+                        Log.i(TAG, "Superseded connection generation=$generation stopped; starting the replacement session")
+                        connectionJob = null
+                        restartRequested.set(false)
+                        TcpPeerRuntime.update {
+                            it.copy(
+                                status = ConnectionStatus.CONNECTING,
+                                detail = "Underlying network changed. Reconnecting.",
+                                connectedAtMillis = null,
+                                devices = emptyList(),
+                            )
+                        }
+                        updateNotification(ConnectionStatus.CONNECTING)
+                        serviceScope.launch {
+                            delay(250)
+                            if (!disconnectRequested.get() && connectionJob?.isActive != true) connect()
+                        }
                     }
                     return@launch
                 }
@@ -339,6 +356,7 @@ class TcpPeerVpnService : VpnService() {
 
     private fun restartForNetworkChange() {
         if (!restartRequested.compareAndSet(false, true)) return
+        connectionGeneration.incrementAndGet()
         TcpPeerRuntime.update {
             it.copy(
                 status = ConnectionStatus.CONNECTING,
@@ -380,6 +398,12 @@ class TcpPeerVpnService : VpnService() {
                         capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
                 } == true
             }
+        if (physicalNetwork != null) {
+            synchronized(this@TcpPeerVpnService) {
+                underlyingNetwork = physicalNetwork
+                underlyingNetworkSignature = physicalNetwork.toString()
+            }
+        }
         val activeLinkProperties = physicalNetwork?.let(connectivityManager::getLinkProperties)
         val activeAddresses = activeLinkProperties?.linkAddresses?.map { it.address }.orEmpty() +
             TransportPolicy.clatIpv4Addresses()
@@ -677,8 +701,9 @@ class TcpPeerVpnService : VpnService() {
                                         device.peerId != config.peerId &&
                                         device.peerId != targetPeerId &&
                                         !meshSockets.containsKey(device.peerId) &&
-                                        meshConnecting.add(device.peerId)
+                                        shouldRequestMeshPunch(device.peerId)
                                     ) {
+                                        Log.i(TAG, "Requesting mesh punch peer_id=${device.peerId} reason=no-direct-socket")
                                         writeCoordinatorControl(
                                             controlOutput,
                                             ControlMessage("PUNCH-READY", mapOf("Peer-ID" to device.peerId)),
@@ -722,6 +747,7 @@ class TcpPeerVpnService : VpnService() {
                             "PUNCH-GO" -> {
                                 val punchPeer = message.field("Peer-ID")
                                 if (punchPeer != null && meshPunchActive.add(punchPeer)) {
+                                    meshReadySentAt.remove(punchPeer)
                                     launch {
                                         try {
                                             connectMeshPeer(
@@ -757,6 +783,7 @@ class TcpPeerVpnService : VpnService() {
                                 // no compatible endpoint must not tear down the healthy
                                 // Exit Node connection and the entire Android VPN.
                                 meshConnecting.clear()
+                                meshReadySentAt.clear()
                                 Log.w(TAG, "Mesh request rejected by coordinator: $reason")
                             }
                         }
@@ -895,6 +922,7 @@ class TcpPeerVpnService : VpnService() {
             Log.w(TAG, "Direct mesh connection to $peerId closed", error)
         } finally {
             meshConnecting.remove(peerId)
+            meshReadySentAt.remove(peerId)
             closeQuietly(socket)
         }
     }
@@ -1003,6 +1031,8 @@ class TcpPeerVpnService : VpnService() {
                 meshCommitted.remove(peerId)
                 updateConnectedUsing(peerId, "-", null)
             }
+            meshConnecting.remove(peerId)
+            meshReadySentAt.remove(peerId)
             closeQuietly(socket)
         }
     }
@@ -1054,6 +1084,17 @@ class TcpPeerVpnService : VpnService() {
                 "remote=${socket.remoteSocketAddress} key=$key",
         )
         updateConnectedUsing(peerId, formatSocketEndpoint(socket), socketFamily(socket))
+        meshReadySentAt.remove(peerId)
+        return true
+    }
+
+    private fun shouldRequestMeshPunch(peerId: String): Boolean {
+        meshConnecting.add(peerId)
+        if (meshPunchActive.contains(peerId)) return false
+        val now = android.os.SystemClock.elapsedRealtime()
+        val previous = meshReadySentAt[peerId]
+        if (previous != null && now - previous < MESH_PUNCH_RETRY_MS) return false
+        meshReadySentAt[peerId] = now
         return true
     }
 
@@ -1220,6 +1261,7 @@ class TcpPeerVpnService : VpnService() {
         addresses.forEach { address ->
             val family = if (address is Inet6Address) DirectFamily.IPV6 else DirectFamily.IPV4
             val socket = Socket()
+            inFlightSockets.add(socket)
             try {
                 socket.reuseAddress = true
                 physicalNetwork?.bindSocket(socket)
@@ -1236,6 +1278,7 @@ class TcpPeerVpnService : VpnService() {
                 return socket
             } catch (error: Exception) {
                 lastError = error
+                inFlightSockets.remove(socket)
                 socket.close()
             }
         }
@@ -1255,6 +1298,7 @@ class TcpPeerVpnService : VpnService() {
         }
         addresses.forEach { address ->
             val socket = Socket()
+            inFlightSockets.add(socket)
             try {
                 socket.reuseAddress = true
                 physicalNetwork?.bindSocket(socket)
@@ -1280,6 +1324,7 @@ class TcpPeerVpnService : VpnService() {
                     error,
                 )
             } finally {
+                inFlightSockets.remove(socket)
                 socket.close()
             }
         }
@@ -1327,8 +1372,10 @@ class TcpPeerVpnService : VpnService() {
         peerId: String,
     ): Socket {
         val socket = Socket()
+        inFlightSockets.add(socket)
         try {
             socket.reuseAddress = true
+            underlyingNetwork?.bindSocket(socket)
             val wildcard = if (family == DirectFamily.IPV6) InetAddress.getByName("::") else InetAddress.getByName("0.0.0.0")
             // TCP simultaneous-open requires the same local endpoint that was
             // used for public mapping discovery. An ephemeral source port makes
@@ -1346,6 +1393,7 @@ class TcpPeerVpnService : VpnService() {
             socket.connect(InetSocketAddress(address, port), 12_000)
             socket.tcpNoDelay = true
             socket.soTimeout = 15_000
+            inFlightSockets.remove(socket)
             Log.i(
                 TAG,
                 "Direct connect succeeded peer_id=$peerId family=${familyLabel(family)} " +
@@ -1361,6 +1409,7 @@ class TcpPeerVpnService : VpnService() {
                     "remote=${formatEndpoint(address, port)} reason=${error.message}",
                 error,
             )
+            inFlightSockets.remove(socket)
             socket.close()
             val label = if (family == DirectFamily.IPV6) "TCP6" else "TCP4"
             throw IllegalStateException("$label direct connection failed; no fallback is allowed", error)
@@ -1889,6 +1938,7 @@ class TcpPeerVpnService : VpnService() {
      */
     @Synchronized
     private fun publishCoordinatorSocket(generation: Long, socket: Socket): Socket {
+        inFlightSockets.remove(socket)
         if (disconnectRequested.get() || connectionGeneration.get() != generation) {
             closeQuietly(socket)
             throw CancellationException("Coordinator socket belongs to a cancelled connection")
@@ -1899,6 +1949,7 @@ class TcpPeerVpnService : VpnService() {
 
     @Synchronized
     private fun publishDirectSocket(generation: Long, socket: Socket): Socket {
+        inFlightSockets.remove(socket)
         if (disconnectRequested.get() || connectionGeneration.get() != generation) {
             closeQuietly(socket)
             throw CancellationException("Direct socket belongs to a cancelled connection")
@@ -1955,6 +2006,9 @@ class TcpPeerVpnService : VpnService() {
         meshCommitted.clear()
         meshConnecting.clear()
         meshPunchActive.clear()
+        meshReadySentAt.clear()
+        inFlightSockets.forEach(::closeQuietly)
+        inFlightSockets.clear()
         closeDirectListeners()
         closeQuietly(coordinatorSocket)
         coordinatorSocket = null
@@ -2027,6 +2081,7 @@ class TcpPeerVpnService : VpnService() {
         private const val NETWORK_REFRESH_TIMEOUT_MS = 1_000
         private const val DATA_PLANE_ACCOUNTING_BATCH = 64
         private const val DEVICE_REFRESH_INTERVAL_MS = 5_000L
+        private const val MESH_PUNCH_RETRY_MS = 5_000L
         private const val TAG = "TCPeerVpnService"
     }
 }
