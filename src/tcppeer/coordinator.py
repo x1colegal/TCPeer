@@ -530,11 +530,18 @@ class Coordinator:
             "Peer-ID": right.peer_id, "Address": str(right_address),
             "Port": str(right_port), "Family": family, "Start-Ms": start,
             "Traversal": traversal,
+            # Identifies the remote control-plane incarnation.  A peer can
+            # reconnect from a new physical network while its previous TCP
+            # data stream remains half-open on the other side.  Consumers use
+            # this value to retire that stale owner without treating repeated
+            # PUNCH-GO messages from the same session as replacements.
+            "Peer-Session": repr(right.connected_at),
         })
         await self.send(right.writer, "PUNCH-GO", **{
             "Peer-ID": left.peer_id, "Address": str(left_address),
             "Port": str(left_port), "Family": family, "Start-Ms": start,
             "Traversal": traversal,
+            "Peer-Session": repr(left.connected_at),
         })
 
     @staticmethod

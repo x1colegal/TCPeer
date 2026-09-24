@@ -1181,6 +1181,18 @@ class TcpPeerVpnService : VpnService() {
                 "AUTH-ERROR", "DISCONNECT", "ERROR" -> throw ProtocolException(
                     message.field("Reason") ?: "Coordinator rejected $phase",
                 )
+                "PEER-INFO", "PUNCH-GO" -> {
+                    // Directory and punch notifications are asynchronous and
+                    // may be queued immediately before a retrying REGISTER.
+                    // The primary/mesh loops request fresh state after this
+                    // synchronous phase, so a stale notification must not
+                    // tear down the newly established control session.
+                    Log.i(
+                        TAG,
+                        "Deferred asynchronous coordinator message command=${message.command} " +
+                            "while waiting for $expectedCommand during $phase",
+                    )
+                }
                 else -> throw ProtocolException(
                     "Coordinator sent ${message.command} while waiting for $expectedCommand during $phase",
                 )

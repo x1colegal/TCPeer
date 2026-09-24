@@ -175,6 +175,7 @@ class Server:
         self._direct_adoption_lock = asyncio.Lock()
         self._direct_owner_tokens: dict[str, str] = {}
         self._direct_owner_keys: dict[str, tuple[str, str]] = {}
+        self._direct_owner_peer_sessions: dict[str, str] = {}
         self._direct_owner_committed: set[str] = set()
         self._direct_attempt_counter = 0
         self._byte_counters: dict[tuple[str, str], int] = {}
@@ -255,6 +256,7 @@ class Server:
             self.direct_writers.clear()
             self._direct_owner_tokens.clear()
             self._direct_owner_keys.clear()
+            self._direct_owner_peer_sessions.clear()
             self._direct_owner_committed.clear()
             await asyncio.gather(*(listener.wait_closed() for listener in self._listeners), return_exceptions=True)
             self.tun.close()
@@ -470,12 +472,9 @@ class Server:
                 await writer.drain()
             elif message.command == "PUNCH-GO":
                 peer_id = message.get("Peer-ID") or "unknown"
-                current_writer = self.direct_writers.get(peer_id)
-                if current_writer is not None:
-                    LOG.info(
-                        "direct-connect ignore-duplicate ts=%.6f peer_id=%s fd=%s reason=direct-owner-active",
-                        time.time(), peer_id, self._socket_fd(current_writer),
-                    )
+                if not self._prepare_owner_for_peer_session(
+                    peer_id, message.get("Peer-Session") or "",
+                ):
                     continue
                 previous = self._direct_connect_tasks.get(peer_id)
                 if previous is not None and not previous.done():
@@ -688,6 +687,7 @@ class Server:
         if delay > 0:
             await asyncio.sleep(delay)
         peer_id = message.get("Peer-ID") or "unknown"
+        peer_session = message.get("Peer-Session") or ""
         attempt = self._next_direct_attempt()
         writer = None
         handed_off = False
@@ -734,6 +734,7 @@ class Server:
                 f"{remote.address}:{remote.port}",
                 initiated=True,
                 attempt=attempt,
+                peer_session=peer_session,
             )
         except asyncio.CancelledError:
             LOG.info(
@@ -779,6 +780,37 @@ class Server:
         """Arbitrate duplicates only until the selected stream carries data."""
         return peer_id not in self._direct_owner_committed and incoming_key < current_key
 
+    def _prepare_owner_for_peer_session(self, peer_id: str, peer_session: str) -> bool:
+        """Retire a black-holed owner when the remote control session changed."""
+        current_writer = self.direct_writers.get(peer_id)
+        if current_writer is None:
+            return True
+        owner_session = self._direct_owner_peer_sessions.get(peer_id, "")
+        if not peer_session or peer_session == owner_session:
+            LOG.info(
+                "direct-connect ignore-duplicate ts=%.6f peer_id=%s fd=%s reason=direct-owner-active",
+                time.time(), peer_id, self._socket_fd(current_writer),
+            )
+            return False
+
+        # The remote peer re-registered through a new control session, but its
+        # old data socket may be black-holed and unable to deliver FIN/RST.
+        # Remove only this exact owner. Its finally block is token-guarded and
+        # therefore cannot remove a subsequently adopted replacement.
+        LOG.info(
+            "direct-connect retire-stale-owner ts=%.6f peer_id=%s fd=%s old_session=%s new_session=%s reason=remote-control-session-changed",
+            time.time(), peer_id, self._socket_fd(current_writer),
+            owner_session or "unknown", peer_session,
+        )
+        if self.direct_writers.get(peer_id) is current_writer:
+            self.direct_writers.pop(peer_id, None)
+            self._direct_owner_tokens.pop(peer_id, None)
+            self._direct_owner_keys.pop(peer_id, None)
+            self._direct_owner_peer_sessions.pop(peer_id, None)
+            self._direct_owner_committed.discard(peer_id)
+        current_writer.close()
+        return True
+
     async def _adopt_direct(
         self,
         reader,
@@ -789,6 +821,7 @@ class Server:
         *,
         initiated: bool,
         attempt: int,
+        peer_session: str = "",
     ) -> None:
         token = str(uuid.uuid4())
         connection_key = self._connection_key(writer)
@@ -825,6 +858,7 @@ class Server:
             self.direct_writers[peer_id] = writer
             self._direct_owner_tokens[peer_id] = token
             self._direct_owner_keys[peer_id] = connection_key
+            self._direct_owner_peer_sessions[peer_id] = peer_session
             self._direct_owner_committed.discard(peer_id)
             losing_connect_task = self._competing_direct_connect_task(
                 peer_id, asyncio.current_task(),
@@ -944,6 +978,7 @@ class Server:
                 self.direct_writers.pop(peer_id, None)
                 self._direct_owner_tokens.pop(peer_id, None)
                 self._direct_owner_keys.pop(peer_id, None)
+                self._direct_owner_peer_sessions.pop(peer_id, None)
                 self._direct_owner_committed.discard(peer_id)
                 self.store.update_peer(peer_id, transport="Disconnected")
                 released_owner = True

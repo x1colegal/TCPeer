@@ -34,6 +34,33 @@ def test_late_duplicate_cannot_replace_connection_carrying_data() -> None:
     assert not server._incoming_direct_wins("phone", ("z", "z"), ("a", "a"))
 
 
+def test_new_peer_session_retires_black_holed_direct_owner() -> None:
+    server = Server.__new__(Server)
+    stale = FakeWriter()
+    server.direct_writers = {"phone": stale}
+    server._direct_owner_tokens = {"phone": "old-token"}
+    server._direct_owner_keys = {"phone": ("a", "b")}
+    server._direct_owner_peer_sessions = {"phone": "old-session"}
+    server._direct_owner_committed = {"phone"}
+
+    assert server._prepare_owner_for_peer_session("phone", "new-session")
+    assert stale.closed
+    assert "phone" not in server.direct_writers
+    assert "phone" not in server._direct_owner_tokens
+    assert "phone" not in server._direct_owner_peer_sessions
+
+
+def test_same_peer_session_keeps_healthy_direct_owner() -> None:
+    server = Server.__new__(Server)
+    current = FakeWriter()
+    server.direct_writers = {"phone": current}
+    server._direct_owner_peer_sessions = {"phone": "same-session"}
+
+    assert not server._prepare_owner_for_peer_session("phone", "same-session")
+    assert not current.closed
+    assert server.direct_writers["phone"] is current
+
+
 def test_failed_stale_write_never_removes_new_owner() -> None:
     server = Server.__new__(Server)
     stale = FakeWriter()
