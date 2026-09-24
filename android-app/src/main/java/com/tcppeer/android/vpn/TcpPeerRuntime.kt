@@ -42,6 +42,8 @@ data class VpnRuntimeState(
     val detail: String = "TCPeer provides connectivity, not confidentiality.",
     val devices: List<NetworkDevice> = emptyList(),
     val activePingPeerId: String? = null,
+    val pingStartedAtMillis: Long? = null,
+    val pingSampleCount: Long = 0,
     val pingSamples: List<TppPingSample> = emptyList(),
 )
 
@@ -66,18 +68,29 @@ object TcpPeerRuntime {
     }
 
     fun startContinuousPing(peerId: String) {
-        update { it.copy(activePingPeerId = peerId, pingSamples = emptyList()) }
+        update { it.copy(
+            activePingPeerId = peerId,
+            pingStartedAtMillis = System.currentTimeMillis(),
+            pingSampleCount = 0,
+            pingSamples = emptyList(),
+        ) }
         mutablePingTarget.value = TppPingRequest(peerId)
     }
 
     fun stopContinuousPing() {
         mutablePingTarget.value = null
-        update { it.copy(activePingPeerId = null, pingSamples = emptyList()) }
+        update { it.copy(
+            activePingPeerId = null,
+            pingStartedAtMillis = null,
+            pingSampleCount = 0,
+            pingSamples = emptyList(),
+        ) }
     }
 
     fun recordPing(peerId: String, latencyMillis: Double?) {
         update { state ->
             if (state.activePingPeerId != peerId) state else state.copy(
+                pingSampleCount = state.pingSampleCount + 1,
                 pingSamples = (state.pingSamples + TppPingSample(
                     System.currentTimeMillis(), latencyMillis,
                 )).takeLast(60),

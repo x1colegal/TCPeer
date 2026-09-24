@@ -29,6 +29,7 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -40,6 +41,8 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
@@ -58,6 +61,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedTextField
@@ -68,6 +72,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
@@ -210,7 +215,13 @@ private fun TcpPeerScreen(
         runtime.status == ConnectionStatus.TCP6_DIRECT
 
     runtime.activePingPeerId?.let { peerId ->
-        TppPingDialog(peerId, runtime.pingSamples, TcpPeerRuntime::stopContinuousPing)
+        TppPingSheet(
+            peerId = peerId,
+            samples = runtime.pingSamples,
+            startedAtMillis = runtime.pingStartedAtMillis,
+            sampleCount = runtime.pingSampleCount,
+            onClose = TcpPeerRuntime::stopContinuousPing,
+        )
     }
 
     Scaffold(
@@ -1173,58 +1184,74 @@ private fun DeviceCard(
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun TppPingDialog(peerId: String, samples: List<TppPingSample>, onClose: () -> Unit) {
+private fun TppPingSheet(
+    peerId: String,
+    samples: List<TppPingSample>,
+    startedAtMillis: Long?,
+    sampleCount: Long,
+    onClose: () -> Unit,
+) {
     val successful = samples.mapNotNull { it.latencyMillis }
     val latest = samples.lastOrNull()?.latencyMillis
     val minimum = successful.minOrNull()
     val average = successful.takeIf { it.isNotEmpty() }?.average()
     val maximum = successful.maxOrNull()
+    val jitter = successful.zipWithNext { previous, current ->
+        kotlin.math.abs(current - previous)
+    }.takeIf { it.isNotEmpty() }?.average()
     val lossPercent = if (samples.isEmpty()) 0.0 else (samples.count { it.latencyMillis == null } * 100.0 / samples.size)
+    val elapsedMillis = startedAtMillis?.let { started ->
+        ((samples.lastOrNull()?.timestampMillis ?: System.currentTimeMillis()) - started).coerceAtLeast(0)
+    } ?: 0
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
-    Dialog(onDismissRequest = onClose) {
-        Surface(
-            modifier = Modifier.fillMaxWidth().widthIn(max = 560.dp),
-            shape = MaterialTheme.shapes.extraLarge,
-            tonalElevation = 6.dp,
+    ModalBottomSheet(
+        onDismissRequest = onClose,
+        sheetState = sheetState,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .fillMaxHeight(0.72f)
+                .verticalScroll(rememberScrollState())
+                .padding(start = 20.dp, end = 20.dp, bottom = 24.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
-            Column(
-                modifier = Modifier.fillMaxWidth().padding(20.dp),
-                verticalArrangement = Arrangement.spacedBy(14.dp),
-            ) {
-                Column {
-                    Text("TPP continuous ping", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
-                    Text(
-                        "$peerId • TPCP direct-stream TPP • 1 sample per second",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
+            Column {
+                Text("TPP continuous ping", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
                 Text(
-                    latest?.let { String.format(Locale.US, "%.1f ms", it) }
-                        ?: if (samples.isEmpty()) "Waiting for first reply..." else "Timed out",
-                    style = MaterialTheme.typography.headlineMedium,
-                    color = if (latest == null && samples.isNotEmpty()) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
-                )
-                Text(
-                    "This live graph measures latency to the selected PeerNet IPv6 peer.",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    "$peerId • TPCP direct-stream TPP • 1 sample per second",
                     style = MaterialTheme.typography.bodySmall,
-                )
-                TppPingChart(samples)
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    PingStatistic("Min", minimum?.let(::formatLatency) ?: "-")
-                    PingStatistic("Avg", average?.let(::formatLatency) ?: "-")
-                    PingStatistic("Max", maximum?.let(::formatLatency) ?: "-")
-                    PingStatistic("Loss", String.format(Locale.US, "%.0f%%", lossPercent))
-                }
-                Text(
-                    "Last ${samples.size} samples from the rolling 60-second window.",
-                    style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                Button(onClick = onClose, modifier = Modifier.fillMaxWidth()) { Text("Stop ping") }
             }
+            Text(
+                latest?.let { String.format(Locale.US, "%.1f ms", it) }
+                    ?: if (samples.isEmpty()) "Waiting for first reply..." else "Timed out",
+                style = MaterialTheme.typography.headlineMedium,
+                color = if (latest == null && samples.isNotEmpty()) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+            )
+            Text(
+                "Live round-trip latency over the direct TCPeer connection.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodySmall,
+            )
+            TppPingChart(samples)
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                PingStatistic("Min", minimum?.let(::formatLatency) ?: "-")
+                PingStatistic("Avg", average?.let(::formatLatency) ?: "-")
+                PingStatistic("Max", maximum?.let(::formatLatency) ?: "-")
+                PingStatistic("Jitter", jitter?.let(::formatLatency) ?: "-")
+                PingStatistic("Loss", String.format(Locale.US, "%.0f%%", lossPercent))
+            }
+            Text(
+                "Running for ${formatElapsedTime(elapsedMillis)} • Showing latest ${samples.size} of $sampleCount samples.",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Button(onClick = onClose, modifier = Modifier.fillMaxWidth()) { Text("Stop ping") }
         }
     }
 }
@@ -1276,6 +1303,17 @@ private fun PingStatistic(label: String, value: String) {
 }
 
 private fun formatLatency(value: Double): String = String.format(Locale.US, "%.1f ms", value)
+
+private fun formatElapsedTime(elapsedMillis: Long): String {
+    val totalSeconds = elapsedMillis / 1_000
+    val hours = totalSeconds / 3_600
+    val minutes = (totalSeconds % 3_600) / 60
+    val seconds = totalSeconds % 60
+    return when {
+        hours > 0 -> String.format(Locale.US, "%d:%02d:%02d", hours, minutes, seconds)
+        else -> String.format(Locale.US, "%d:%02d", minutes, seconds)
+    }
+}
 
 @Composable
 private fun DetailRow(label: String, value: String) {
