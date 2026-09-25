@@ -60,6 +60,7 @@ import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.ServerSocket
 import java.net.SocketTimeoutException
+import java.util.Collections
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -118,12 +119,16 @@ class TcpPeerVpnService : VpnService() {
     private val meshSockets = ConcurrentHashMap<String, Socket>()
     private val meshSocketKeys = ConcurrentHashMap<String, String>()
     private val meshEndpoints = ConcurrentHashMap<String, String>()
-    private val meshCommitted = ConcurrentHashMap.newKeySet<String>()
+    private val meshCommitted: MutableSet<String> =
+        Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
     private val meshAdoptionLock = Any()
-    private val meshConnecting = ConcurrentHashMap.newKeySet<String>()
-    private val meshPunchActive = ConcurrentHashMap.newKeySet<String>()
+    private val meshConnecting: MutableSet<String> =
+        Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
+    private val meshPunchActive: MutableSet<String> =
+        Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
     private val meshReadySentAt = ConcurrentHashMap<String, Long>()
-    private val inFlightSockets = ConcurrentHashMap.newKeySet<Socket>()
+    private val inFlightSockets: MutableSet<Socket> =
+        Collections.newSetFromMap(ConcurrentHashMap<Socket, Boolean>())
     private val nextTppPingId = AtomicLong(System.nanoTime())
     private val connectionGeneration = AtomicLong(0)
     private val pendingTppPings = ConcurrentHashMap<Long, Pair<String, Long>>()
@@ -202,7 +207,15 @@ class TcpPeerVpnService : VpnService() {
         TcpPeerRuntime.setServiceActive(true)
         createNotificationChannel()
         connectivityManager = getSystemService(ConnectivityManager::class.java)
-        connectivityManager.registerDefaultNetworkCallback(networkCallback)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            connectivityManager.registerDefaultNetworkCallback(networkCallback)
+        } else {
+            val request = NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                .build()
+            connectivityManager.registerNetworkCallback(request, networkCallback)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -293,7 +306,7 @@ class TcpPeerVpnService : VpnService() {
                         closeResources()
                         TcpPeerRuntime.replace(VpnRuntimeState())
                         TcpPeerRuntime.setServiceActive(false)
-                        stopForeground(STOP_FOREGROUND_REMOVE)
+                        removeForegroundNotification()
                         stopAfterConnectivityRefresh()
                     } else {
                         Log.i(TAG, "Superseded connection generation=$generation stopped; starting the replacement session")
@@ -322,7 +335,7 @@ class TcpPeerVpnService : VpnService() {
                 if (disconnectRequested.get()) {
                     connectionJob = null
                     TcpPeerRuntime.replace(VpnRuntimeState())
-                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    removeForegroundNotification()
                     stopAfterConnectivityRefresh()
                 } else {
                     connectionJob = null
@@ -1899,7 +1912,7 @@ class TcpPeerVpnService : VpnService() {
         closeResources()
         TcpPeerRuntime.replace(VpnRuntimeState())
         TcpPeerRuntime.setServiceActive(false)
-        stopForeground(STOP_FOREGROUND_REMOVE)
+        removeForegroundNotification()
         // Disconnect is authoritative. stopSelfResult(startId) can refuse to
         // stop when Android has delivered a newer start request,
         // leaving Android's VPN network and routes registered even though all
@@ -1938,7 +1951,11 @@ class TcpPeerVpnService : VpnService() {
             .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
             .build()
         runCatching {
-            connectivityManager.requestNetwork(request, callback, NETWORK_REFRESH_TIMEOUT_MS)
+            connectivityManager.requestNetwork(request, callback)
+            serviceScope.launch {
+                delay(NETWORK_REFRESH_TIMEOUT_MS.toLong())
+                finish()
+            }
         }.onFailure { finish() }
     }
 
@@ -2027,12 +2044,22 @@ class TcpPeerVpnService : VpnService() {
     }
 
     private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val channel = NotificationChannel(
             CHANNEL_ID,
             getString(R.string.notification_channel_name),
             NotificationManager.IMPORTANCE_LOW,
         ).apply { description = getString(R.string.notification_channel_description) }
         getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun removeForegroundNotification() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } else {
+            stopForeground(true)
+        }
     }
 
     private fun notification(status: ConnectionStatus): Notification {

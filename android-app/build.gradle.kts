@@ -12,10 +12,10 @@ android {
 
     defaultConfig {
         applicationId = "com.tcppeer.android"
-        minSdk = 26
+        minSdk = 23
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 71
+        versionName = "1.0-beta.71"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
