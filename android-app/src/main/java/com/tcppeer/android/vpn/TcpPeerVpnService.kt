@@ -1285,7 +1285,7 @@ class TcpPeerVpnService : VpnService() {
                 socket.bind(InetSocketAddress(wildcard, 0))
                 if (!protect(socket)) throw IllegalStateException("Cannot protect the coordinator socket from the VPN")
                 socket.connect(InetSocketAddress(address, config.coordinatorPort), 10_000)
-                socket.tcpNoDelay = true
+                socket.tcpNoDelay = false
                 socket.soTimeout = COORDINATOR_TIMEOUT_MS
                 return socket
             } catch (error: Exception) {
@@ -1403,7 +1403,7 @@ class TcpPeerVpnService : VpnService() {
             socket.sendBufferSize = DIRECT_SOCKET_BUFFER_BYTES
             socket.receiveBufferSize = DIRECT_SOCKET_BUFFER_BYTES
             socket.connect(InetSocketAddress(address, port), 12_000)
-            socket.tcpNoDelay = true
+            socket.tcpNoDelay = false
             socket.soTimeout = 15_000
             inFlightSockets.remove(socket)
             Log.i(
@@ -1439,7 +1439,7 @@ class TcpPeerVpnService : VpnService() {
             }
             it.sendBufferSize = DIRECT_SOCKET_BUFFER_BYTES
             it.receiveBufferSize = DIRECT_SOCKET_BUFFER_BYTES
-            it.tcpNoDelay = true
+            it.tcpNoDelay = false
             it.soTimeout = 15_000
             Log.i(
                 TAG,

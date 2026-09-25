@@ -175,6 +175,12 @@ class DirectConnector:
                 )
 
                 reader, writer = await asyncio.open_connection(sock=sock)
+                # asyncio enables TCP_NODELAY for TCP transports by default.
+                # TCPeer intentionally leaves Nagle enabled so adjacent raw-IP
+                # writes can be coalesced by the kernel.
+                transport_socket = writer.get_extra_info("socket")
+                if transport_socket is not None:
+                    transport_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 0)
                 return reader, writer
 
             except asyncio.CancelledError:

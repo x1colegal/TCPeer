@@ -131,6 +131,11 @@ class Coordinator:
 
     async def handle_client(self, reader, writer) -> None:
         peer: RegisteredPeer | None = None
+        transport_socket = writer.get_extra_info("socket")
+        if transport_socket is not None and hasattr(transport_socket, "setsockopt"):
+            # asyncio enables TCP_NODELAY automatically. Keep Nagle enabled on
+            # the coordinator side as well as on direct TCP connections.
+            transport_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 0)
         endpoint = writer.get_extra_info("peername") or ("unknown", 0)
         observed_address, observed_port = str(endpoint[0]), int(endpoint[1])
         try:

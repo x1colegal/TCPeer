@@ -312,6 +312,7 @@ class Server:
         attempt = self._next_direct_attempt()
         try:
             direct_socket = writer.get_extra_info("socket")
+            direct_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 0)
             direct_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
             direct_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
             LOG.info(
@@ -605,6 +606,9 @@ class Server:
                     elif family == socket.AF_INET and selected_address != "0.0.0.0":
                         self._direct_bind_ipv4 = selected_address
                     reader, writer = await asyncio.open_connection(sock=sock)
+                    transport_socket = writer.get_extra_info("socket")
+                    if transport_socket is not None:
+                        transport_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 0)
                     writer.write(ControlMessage("ENDPOINT-QUERY", {}).encode())
                     await writer.drain()
                     response = await asyncio.wait_for(read_control(reader), timeout=5)
@@ -667,7 +671,11 @@ class Server:
                     elif family == socket.AF_INET and selected_address != "0.0.0.0":
                         self._direct_bind_ipv4 = selected_address
                         self._registered_ipv4 = public_address(selected_address)
-                    return await asyncio.open_connection(sock=sock)
+                    reader, writer = await asyncio.open_connection(sock=sock)
+                    transport_socket = writer.get_extra_info("socket")
+                    if transport_socket is not None:
+                        transport_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 0)
+                    return reader, writer
                 except OSError as exc:
                     last_error = exc
                     sock.close()
