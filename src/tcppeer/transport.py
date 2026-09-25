@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import asyncio
+import errno
 import ipaddress
 import logging
 import socket
@@ -71,6 +72,10 @@ class DirectConnector:
 
     def __init__(self, timeout: float = 10.0):
         self.timeout = timeout
+
+    @staticmethod
+    def _retry_without_prebound(exc: Exception) -> bool:
+        return isinstance(exc, OSError) and exc.errno == errno.EADDRNOTAVAIL
 
     async def connect(
         self,
@@ -211,6 +216,22 @@ class DirectConnector:
                 sock.close()
 
                 if prebound_socket is not None:
+                    if self._retry_without_prebound(exc):
+                        # A recently closed direct stream can leave its exact
+                        # four-tuple unavailable even though the local address
+                        # is still valid. The reserved candidate is only an
+                        # optimization; discard it and continue the same retry
+                        # window with a freshly bound socket.
+                        LOG.info(
+                            "direct-connect retry-fresh-socket ts=%.6f peer_id=%s family=%s attempt=%s reason=prebound-eaddrnotavail",
+                            loop.time(),
+                            peer_id,
+                            "tcp6" if required_family == socket.AF_INET6 else "tcp4",
+                            attempt,
+                        )
+                        prebound_socket = None
+                        await asyncio.sleep(0.1)
+                        continue
                     break
 
                 await asyncio.sleep(0.1)
