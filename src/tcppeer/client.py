@@ -15,7 +15,7 @@ from pathlib import Path
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tcppeer.address_negotiation import dhcp_discover, dhcp_request, parse_dhcp, parse_ra, router_solicitation, transaction_id
+from tcppeer.address_negotiation import SlaacLease, dhcp_discover, dhcp_request, parse_dhcp, parse_ra, router_solicitation, transaction_id
 from tcppeer.config import ClientConfig, ConfigurationError
 from tcppeer.dns import discover_upstream_dns
 from tcppeer.protocol import ControlMessage, ProtocolError, read_data
@@ -336,7 +336,59 @@ class Client(Server):
         subprocess.run(command, check=True, capture_output=True, text=True)
 
     async def _handle_peer_packet(self, packet: bytes, writer, peer_id: str) -> None:
+        if peer_id == self.config.target_peer and self._configured.is_set():
+            interface_id = int.from_bytes(
+                hashlib.sha256(self.config.peer_id.encode("ascii")).digest()[:8],
+                "big",
+            )
+            slaac = parse_ra(packet, interface_id)
+            if slaac is not None and slaac.address != self._overlay_ipv6:
+                await self._apply_slaac_update(slaac)
+                return
         self._queue_tun_packet(peer_id, packet)
+
+    async def _apply_slaac_update(self, slaac: SlaacLease) -> None:
+        """Replace a stale client SLAAC address announced by the Exit Node."""
+        old_ipv6 = self._overlay_ipv6
+        old_prefix = self._overlay_ipv6_prefix
+        if old_ipv6 is not None:
+            self._remove_overlay_route(old_ipv6, old_prefix)
+            self.tun.remove_address(str(old_ipv6), old_prefix)
+
+        self._overlay_ipv6 = slaac.address
+        self._overlay_ipv6_prefix = slaac.prefix.prefixlen
+        self._active_server_ipv6 = slaac.address
+        overlay_ipv4 = self._overlay_ipv4
+        if overlay_ipv4 is None:
+            raise ProtocolError("cannot update SLAAC before DHCPv4 configuration")
+        self.tun.configure(
+            str(overlay_ipv4),
+            self._overlay_ipv4_prefix,
+            str(slaac.address),
+            slaac.prefix.prefixlen,
+        )
+        subprocess.run(
+            ("ip", "-6", "route", "replace", str(slaac.prefix), "dev", self.tun.name),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        coordinator = self._coordinator_writer
+        if coordinator is not None and not coordinator.is_closing():
+            coordinator.write(ControlMessage("PEER-INFO", {
+                "Action": "Overlay-Update",
+                "Overlay-IPv4": str(overlay_ipv4),
+                "Overlay-IPv6": str(slaac.address),
+            }).encode())
+            await coordinator.drain()
+        LOG.info(
+            "PeerNet IPv6 prefix changed IPv6=%s/%s previous=%s/%s",
+            slaac.address,
+            slaac.prefix.prefixlen,
+            old_ipv6 or "none",
+            old_prefix,
+        )
 
 
 def main() -> None:

@@ -1507,6 +1507,7 @@ class Server:
             self.exit_node.nat66_enabled = False
             self.exit_node.apply()
 
+            await self._announce_overlay_update()
             await self._broadcast_direct(self._ra_packet())
 
     async def _switch_to_ipv6_fallback(self) -> None:
@@ -1521,7 +1522,25 @@ class Server:
 
         self.exit_node.apply()
 
+        await self._announce_overlay_update()
         await self._broadcast_direct(self._ra_packet())
+
+    async def _announce_overlay_update(self) -> None:
+        """Publish the effective server addresses after a PD transition."""
+        writer = self._coordinator_writer
+        if writer is None or writer.is_closing():
+            return
+        writer.write(ControlMessage("PEER-INFO", {
+            "Action": "Overlay-Update",
+            "Overlay-IPv4": str(self.config.server_ipv4),
+            "Overlay-IPv6": str(self._active_server_ipv6),
+        }).encode())
+        await writer.drain()
+        LOG.info(
+            "Published updated PeerNet addresses IPv4=%s IPv6=%s",
+            self.config.server_ipv4,
+            self._active_server_ipv6,
+        )
 
     def _ra_packet(self, destination: ipaddress.IPv6Address = ALL_NODES) -> bytes:
         return build_router_advertisement(
