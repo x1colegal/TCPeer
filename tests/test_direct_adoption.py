@@ -148,10 +148,45 @@ def test_direct_connect_done_callback_retrieves_failure() -> None:
 
         task = asyncio.create_task(fail())
         server._direct_connect_tasks = {"phone": task}
+        server._direct_connect_peer_sessions = {"phone": "session"}
         await asyncio.wait({task})
         server._clear_direct_connect_task("phone", task)
 
         assert "phone" not in server._direct_connect_tasks
+        assert "phone" not in server._direct_connect_peer_sessions
         assert task.exception() is not None
+
+    asyncio.run(scenario())
+
+
+def test_new_peer_session_cancels_stale_connect_attempt() -> None:
+    async def scenario() -> None:
+        server = Server.__new__(Server)
+        stale = asyncio.create_task(asyncio.Event().wait())
+        server._direct_connect_tasks = {"phone": stale}
+        server._direct_connect_peer_sessions = {"phone": "old-session"}
+
+        assert await server._prepare_connect_attempt_for_peer_session(
+            "phone", "new-session",
+        )
+        assert stale.cancelled()
+        assert "phone" not in server._direct_connect_tasks
+
+    asyncio.run(scenario())
+
+
+def test_same_peer_session_keeps_inflight_connect_attempt() -> None:
+    async def scenario() -> None:
+        server = Server.__new__(Server)
+        current = asyncio.create_task(asyncio.Event().wait())
+        server._direct_connect_tasks = {"phone": current}
+        server._direct_connect_peer_sessions = {"phone": "same-session"}
+
+        assert not await server._prepare_connect_attempt_for_peer_session(
+            "phone", "same-session",
+        )
+        assert not current.done()
+        current.cancel()
+        await asyncio.gather(current, return_exceptions=True)
 
     asyncio.run(scenario())

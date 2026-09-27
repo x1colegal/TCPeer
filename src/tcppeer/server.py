@@ -172,6 +172,7 @@ class Server:
         self._registered_port_ipv6: int | None = config.direct_port if self._registered_ipv6 else None
         self._direct_candidates: dict[socket.AddressFamily, socket.socket] = {}
         self._direct_connect_tasks: dict[str, asyncio.Task] = {}
+        self._direct_connect_peer_sessions: dict[str, str] = {}
         self._direct_adoption_lock = asyncio.Lock()
         self._direct_owner_tokens: dict[str, str] = {}
         self._direct_owner_keys: dict[str, tuple[str, str]] = {}
@@ -246,6 +247,7 @@ class Server:
             for candidate in self._direct_candidates.values():
                 candidate.close()
             self._direct_candidates.clear()
+            self._direct_connect_peer_sessions.clear()
             for writer in list(self.direct_writers.values()):
                 writer.close()
             for task in self._peer_send_tasks.values():
@@ -479,18 +481,13 @@ class Server:
                     continue
                 previous = self._direct_connect_tasks.get(peer_id)
                 if previous is not None and not previous.done():
-                    # Directory refreshes can produce duplicate PUNCH-READY /
-                    # PUNCH-GO messages while the original TCP simultaneous-open
-                    # is still inside its retry window. Cancelling that attempt
-                    # every few seconds guarantees that a NAT traversal needing
-                    # longer than one SYN timeout can never complete.
-                    LOG.info(
-                        "direct-connect ignore-duplicate ts=%.6f peer_id=%s reason=attempt-already-active",
-                        time.time(), peer_id,
-                    )
-                    continue
+                    if not await self._prepare_connect_attempt_for_peer_session(
+                        peer_id, message.get("Peer-Session") or "",
+                    ):
+                        continue
                 task = asyncio.create_task(self._connect_direct(message), name=f"direct-connect:{peer_id}")
                 self._direct_connect_tasks[peer_id] = task
+                self._direct_connect_peer_sessions[peer_id] = message.get("Peer-Session") or ""
                 self._tasks.add(task)
                 task.add_done_callback(self._tasks.discard)
                 task.add_done_callback(lambda done, pid=peer_id: self._clear_direct_connect_task(pid, done))
@@ -1046,6 +1043,7 @@ class Server:
     def _clear_direct_connect_task(self, peer_id: str, task: asyncio.Task) -> None:
         if self._direct_connect_tasks.get(peer_id) is task:
             self._direct_connect_tasks.pop(peer_id, None)
+            self._direct_connect_peer_sessions.pop(peer_id, None)
         if task.cancelled():
             return
         try:
@@ -1057,6 +1055,31 @@ class Server:
                 "direct-connect task ended ts=%.6f peer_id=%s reason=%s",
                 time.time(), peer_id, error,
             )
+
+    async def _prepare_connect_attempt_for_peer_session(
+        self, peer_id: str, peer_session: str,
+    ) -> bool:
+        """Replace an in-flight attempt only for a newer remote session."""
+        previous = self._direct_connect_tasks.get(peer_id)
+        if previous is None or previous.done():
+            return True
+        previous_session = self._direct_connect_peer_sessions.get(peer_id, "")
+        if not peer_session or peer_session == previous_session:
+            LOG.info(
+                "direct-connect ignore-duplicate ts=%.6f peer_id=%s reason=attempt-already-active",
+                time.time(), peer_id,
+            )
+            return False
+        LOG.info(
+            "direct-connect replace-attempt ts=%.6f peer_id=%s old_session=%s new_session=%s reason=remote-control-session-changed",
+            time.time(), peer_id, previous_session or "unknown", peer_session,
+        )
+        previous.cancel()
+        await asyncio.gather(previous, return_exceptions=True)
+        if self._direct_connect_tasks.get(peer_id) is previous:
+            self._direct_connect_tasks.pop(peer_id, None)
+            self._direct_connect_peer_sessions.pop(peer_id, None)
+        return True
 
     def _competing_direct_connect_task(
         self, peer_id: str, current_task: asyncio.Task | None,
