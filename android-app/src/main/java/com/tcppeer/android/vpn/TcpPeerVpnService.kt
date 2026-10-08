@@ -890,7 +890,7 @@ class TcpPeerVpnService : VpnService() {
             if (candidateSocket == null) try {
                 candidateSocket = openActiveDirect(
                     address, candidate, activeLocalPort, family, peerId,
-                    if (portGuesses.isEmpty()) 12_000 else 750,
+                    if (portGuesses.isEmpty()) 12_000 else 2_000,
                 )
             } catch (error: Exception) {
                 meshError = error
@@ -1454,7 +1454,7 @@ class TcpPeerVpnService : VpnService() {
                 try {
                     return@withContext openActiveDirect(
                         address, candidate, localPort, family, "primary",
-                        if (portGuesses.isEmpty()) 12_000 else 750,
+                        if (portGuesses.isEmpty()) 12_000 else 2_000,
                     )
                 } catch (error: Exception) {
                     lastError = error

@@ -77,6 +77,10 @@ class DirectConnector:
     def _retry_without_prebound(exc: Exception) -> bool:
         return isinstance(exc, OSError) and exc.errno == errno.EADDRNOTAVAIL
 
+    @staticmethod
+    def _effective_retry_window(port_count: int, retry_window: float) -> float:
+        return retry_window if port_count <= 1 else max(retry_window, port_count * 1.1)
+
     async def connect(
         self,
         local: Endpoint,
@@ -92,9 +96,13 @@ class DirectConnector:
         if local.family != required_family or remote.family != required_family:
             raise DirectConnectionError("endpoint family violates transport policy")
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + retry_window
-        last_exc = None
         ports = tuple(dict.fromkeys((remote.port, *remote_ports)))
+        # Preserve the ten-second EIM window. EDM is a second-stage attempt and
+        # needs enough time to give every bounded candidate a real one-second
+        # simultaneous-open opportunity.
+        effective_window = self._effective_retry_window(len(ports), retry_window)
+        deadline = loop.time() + effective_window
+        last_exc = None
         port_index = 0
 
         while loop.time() < deadline:
@@ -169,8 +177,8 @@ class DirectConnector:
 
                 remaining = deadline - loop.time()
                 # A normal EIM attempt gets the full Linux ten-second window.
-                # EDM candidates must rotate within that same bounded window.
-                per_candidate = self.timeout if len(ports) == 1 else 0.35
+                # The separately bounded EDM window gives each candidate 1 s.
+                per_candidate = self.timeout if len(ports) == 1 else 1.0
                 attempt_timeout = min(per_candidate, remaining)
                 await asyncio.wait_for(
                     loop.sock_connect(sock, (remote.address, current_port)),

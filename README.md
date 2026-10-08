@@ -528,7 +528,10 @@ mapped source port changes in a consistent sequence, TCPeer classifies that addr
 family as endpoint-dependent mapping (EDM). It predicts the next mapped port
 and registers a bounded set of nearby candidates. The Coordinator includes
 those candidates in the next `PUNCH-GO`, and the remote peer rotates through
-them while both sides continue normal TCP simultaneous-open.
+them while both sides continue normal TCP simultaneous-open. Linux gives each
+EDM candidate up to one second; Android gives each candidate up to two seconds.
+The EDM-stage window is sized separately so every bounded candidate can be
+attempted without changing the normal Linux EIM timeout.
 
 This remains direct-only TCP traversal: probe connections carry control-plane
 metadata only, the Coordinator never relays VPN packets, and TCPeer neither
