@@ -514,6 +514,30 @@ Actual success depends on:
 
 Restrictive or endpoint-dependent NAT implementations can prevent a direct connection.
 
+### Automatic EDM port prediction
+
+TCPeer first attempts ordinary endpoint-independent mapping (EIM) TCP
+simultaneous-open. The Linux implementation gives that normal attempt a
+10-second retry window; Android keeps its platform direct-connect timeout. EDM
+detection is never run preemptively.
+
+After the normal attempt times out, the peer opens endpoint queries from its
+direct TCP port to three additional Coordinator probe ports (`port + 100`
+through `port + 102`). If the observed public address remains stable while the
+mapped source port changes in a consistent sequence, TCPeer classifies that address
+family as endpoint-dependent mapping (EDM). It predicts the next mapped port
+and registers a bounded set of nearby candidates. The Coordinator includes
+those candidates in the next `PUNCH-GO`, and the remote peer rotates through
+them while both sides continue normal TCP simultaneous-open.
+
+This remains direct-only TCP traversal: probe connections carry control-plane
+metadata only, the Coordinator never relays VPN packets, and TCPeer neither
+opens UDP sockets nor falls back to another address family. Port prediction is
+necessarily heuristic. Randomized mappings, carrier-grade firewalls, or NATs
+that allocate unrelated ports can still prevent a direct connection. At most
+17 validated predicted ports, plus the currently registered port, are tried,
+so EDM mode cannot become an unbounded port scan.
+
 ---
 
 # IPv4 and IPv6 direct connectivity
@@ -976,10 +1000,12 @@ Typical defaults are:
 
 | Purpose | Protocol | Port |
 |---|---|---:|
-| Coordinator | TCP | 7443 |
+| Coordinator control | TCP | 7443 |
+| Coordinator EDM probes | TCP | 7543-7545 |
 | Direct peer connection | TCP | 7444 |
 
-Both are configurable.
+The Coordinator control and direct peer ports are configurable. EDM probe
+ports are derived from the configured Coordinator port.
 
 TCPeer does not require an outer UDP data-plane port.
 
@@ -1415,10 +1441,10 @@ Common coordinator configuration areas include:
 | `runtime` | `keepalive_seconds` | Coordinator keepalive |
 | `paths` | `state_db` | Persistent known-device database |
 
-Typical coordinator port:
+Typical Coordinator control and EDM probe ports:
 
 ```text
-7443/TCP
+7443/TCP and 7543-7545/TCP
 ```
 
 ---

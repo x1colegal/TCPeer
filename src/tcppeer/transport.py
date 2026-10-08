@@ -86,14 +86,20 @@ class DirectConnector:
         *,
         peer_id: str = "unknown",
         attempt: int = 0,
+        remote_ports: tuple[int, ...] = (),
+        retry_window: float = 10.0,
     ):
         if local.family != required_family or remote.family != required_family:
             raise DirectConnectionError("endpoint family violates transport policy")
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + 60.0
+        deadline = loop.time() + retry_window
         last_exc = None
+        ports = tuple(dict.fromkeys((remote.port, *remote_ports)))
+        port_index = 0
 
         while loop.time() < deadline:
+            current_port = ports[port_index % len(ports)]
+            port_index += 1
             sock = prebound_socket or socket.socket(required_family, socket.SOCK_STREAM, socket.IPPROTO_TCP)
             sock.setblocking(False)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -162,9 +168,12 @@ class DirectConnector:
                 )
 
                 remaining = deadline - loop.time()
-                attempt_timeout = min(self.timeout, remaining)
+                # A normal EIM attempt gets the full Linux ten-second window.
+                # EDM candidates must rotate within that same bounded window.
+                per_candidate = self.timeout if len(ports) == 1 else 0.35
+                attempt_timeout = min(per_candidate, remaining)
                 await asyncio.wait_for(
-                    loop.sock_connect(sock, (remote.address, remote.port)),
+                    loop.sock_connect(sock, (remote.address, current_port)),
                     attempt_timeout,
                 )
 
@@ -232,7 +241,11 @@ class DirectConnector:
                         prebound_socket = None
                         await asyncio.sleep(0.1)
                         continue
-                    break
+                    # The reserved socket is only the first simultaneous-open
+                    # candidate. A fast RST/timeout must not shorten the EIM
+                    # policy window; continue with fresh sockets until the
+                    # full ten seconds have elapsed.
+                    prebound_socket = None
 
                 await asyncio.sleep(0.1)
 

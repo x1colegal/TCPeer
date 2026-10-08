@@ -22,6 +22,7 @@ from tcppeer.coordinator_state import CoordinatorStore
 from tcppeer.auth import proof_matches
 from tcppeer.protocol import ControlMessage, ProtocolError, read_control
 from tcppeer.transport import is_usable_ipv6
+from tcppeer.edm import PROBE_PORT_OFFSETS, format_port_guesses, parse_port_guesses
 
 LOG = logging.getLogger("tcppeer.coordinator")
 
@@ -40,6 +41,8 @@ class RegisteredPeer:
     declared_ipv6: str | None = None
     mapped_ipv4_port: int | None = None
     mapped_ipv6_port: int | None = None
+    edm_ipv4_ports: tuple[int, ...] = ()
+    edm_ipv6_ports: tuple[int, ...] = ()
     local_ipv4: str | None = None
     local_ipv6: str | None = None
     listen_port: int | None = None
@@ -88,20 +91,25 @@ class Coordinator:
 
     async def start(self) -> None:
         await self._start_admin_listener()
-        if self.config.listen_ipv6:
-            self.servers.append(await asyncio.start_server(
-                self.handle_client, self.config.listen_ipv6, self.config.port,
-                family=socket.AF_INET6,
-            ))
-        if self.config.listen_ipv4:
-            try:
+        for offset in (0, *PROBE_PORT_OFFSETS):
+            port = self.config.port + offset
+            if port > 65535:
+                continue
+            handler = self.handle_client if offset == 0 else self.handle_endpoint_probe
+            if self.config.listen_ipv6:
                 self.servers.append(await asyncio.start_server(
-                    self.handle_client, self.config.listen_ipv4, self.config.port,
-                    family=socket.AF_INET,
+                    handler, self.config.listen_ipv6, port,
+                    family=socket.AF_INET6,
                 ))
-            except OSError:
-                await self.close()
-                raise
+            if self.config.listen_ipv4:
+                try:
+                    self.servers.append(await asyncio.start_server(
+                        handler, self.config.listen_ipv4, port,
+                        family=socket.AF_INET,
+                    ))
+                except OSError:
+                    await self.close()
+                    raise
 
     async def serve_forever(self) -> None:
         await self.start()
@@ -128,6 +136,26 @@ class Coordinator:
     async def send(self, writer, command: str, **fields: str) -> None:
         writer.write(ControlMessage(command, fields).encode())
         await writer.drain()
+
+    async def handle_endpoint_probe(self, reader, writer) -> None:
+        """Reflect one observed TCP endpoint; never accept control sessions."""
+        endpoint = writer.get_extra_info("peername") or ("unknown", 0)
+        try:
+            message = await asyncio.wait_for(
+                read_control(reader, self.config.max_message_size), timeout=5,
+            )
+            if message.command != "ENDPOINT-QUERY":
+                await self.send(writer, "ERROR", Reason="probe endpoint accepts ENDPOINT-QUERY only")
+                return
+            await self.send(
+                writer, "ENDPOINT-INFO",
+                Address=str(endpoint[0]), Port=str(int(endpoint[1])),
+            )
+        except (TimeoutError, ProtocolError, ConnectionError):
+            pass
+        finally:
+            writer.close()
+            await asyncio.gather(writer.wait_closed(), return_exceptions=True)
 
     async def handle_client(self, reader, writer) -> None:
         peer: RegisteredPeer | None = None
@@ -246,6 +274,13 @@ class Coordinator:
             mapped_ipv6_port = message.get("Mapped-IPv6-Port")
             peer.mapped_ipv4_port = int(mapped_ipv4_port) if mapped_ipv4_port else None
             peer.mapped_ipv6_port = int(mapped_ipv6_port) if mapped_ipv6_port else None
+            peer.edm_ipv4_ports = parse_port_guesses(message.get("EDM-IPv4-Ports"))
+            peer.edm_ipv6_ports = parse_port_guesses(message.get("EDM-IPv6-Ports"))
+            if peer.edm_ipv4_ports or peer.edm_ipv6_ports:
+                LOG.info(
+                    "Peer %s registered bounded EDM candidates TCP4=%s TCP6=%s",
+                    peer.peer_id, peer.edm_ipv4_ports, peer.edm_ipv6_ports,
+                )
             peer.local_ipv4 = message.get("Local-IPv4")
             peer.local_ipv6 = message.get("Local-IPv6")
             port = message.get("Port")
@@ -497,9 +532,11 @@ class Coordinator:
         if both_ipv6:
             left_port = left.mapped_ipv6_port or left.listen_port
             right_port = right.mapped_ipv6_port or right.listen_port
+            left_guesses, right_guesses = left.edm_ipv6_ports, right.edm_ipv6_ports
         else:
             left_port = left.mapped_ipv4_port or (left.observed_port if left_observed_version == 4 else left.listen_port)
             right_port = right.mapped_ipv4_port or (right.observed_port if right_observed_version == 4 else right.listen_port)
+            left_guesses, right_guesses = left.edm_ipv4_ports, right.edm_ipv4_ports
         local_left = left.local_ipv6 if both_ipv6 else left.local_ipv4
         local_right = right.local_ipv6 if both_ipv6 else right.local_ipv4
         if self._can_use_local_candidates(
@@ -509,6 +546,7 @@ class Coordinator:
             right_address = local_right
             left_port = left.listen_port
             right_port = right.listen_port
+            left_guesses, right_guesses = (), ()
             LOG.info(
                 "Using local TCP%s candidates for peers %s and %s",
                 6 if both_ipv6 else 4, left.peer_id, right.peer_id,
@@ -541,12 +579,14 @@ class Coordinator:
             # this value to retire that stale owner without treating repeated
             # PUNCH-GO messages from the same session as replacements.
             "Peer-Session": repr(right.connected_at),
+            "Port-Guesses": format_port_guesses(right_guesses),
         })
         await self.send(right.writer, "PUNCH-GO", **{
             "Peer-ID": left.peer_id, "Address": str(left_address),
             "Port": str(left_port), "Family": family, "Start-Ms": start,
             "Traversal": traversal,
             "Peer-Session": repr(left.connected_at),
+            "Port-Guesses": format_port_guesses(left_guesses),
         })
 
     @staticmethod

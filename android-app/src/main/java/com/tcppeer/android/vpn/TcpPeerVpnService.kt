@@ -458,6 +458,8 @@ class TcpPeerVpnService : VpnService() {
         var endpointIpv6 = if (localIpv6.isNotEmpty()) {
             queryPublicEndpoint(config, DirectFamily.IPV6, physicalNetwork)
         } else null
+        var edmIpv4Ports = emptyList<Int>()
+        var edmIpv6Ports = emptyList<Int>()
         val directPublicIpv4 = localIpv4.firstOrNull(TransportPolicy::isPublicIpv4)?.hostAddress
         val directPublicIpv6 = localIpv6.firstOrNull(TransportPolicy::isPublicIpv6)?.hostAddress?.substringBefore('%')
         var advertisedIpv4 = ""
@@ -475,6 +477,8 @@ class TcpPeerVpnService : VpnService() {
                 "IPv6" to advertisedIpv6,
                 "Mapped-IPv4-Port" to (mappedIpv4Port?.toString() ?: ""),
                 "Mapped-IPv6-Port" to (mappedIpv6Port?.toString() ?: ""),
+                "EDM-IPv4-Ports" to edmIpv4Ports.joinToString(","),
+                "EDM-IPv6-Ports" to edmIpv6Ports.joinToString(","),
                 "Local-IPv4" to (localIpv4.firstOrNull()?.hostAddress ?: ""),
                 "Local-IPv6" to (localIpv6.firstOrNull()?.hostAddress?.substringBefore('%') ?: ""),
                 "Port" to config.directPort.toString(),
@@ -538,6 +542,7 @@ class TcpPeerVpnService : VpnService() {
 
             peerPort = punch.field("Port")?.toIntOrNull()
                 ?: throw ProtocolException("PUNCH-GO has no valid port")
+            val peerPortGuesses = parsePortGuesses(punch.field("Port-Guesses"))
 
             updateConnecting(
                 "Opening a direct ${family.name.replace("IPV", "TCP")} connection."
@@ -546,7 +551,7 @@ class TcpPeerVpnService : VpnService() {
             try {
                 direct = publishDirectSocket(
                     generation,
-                    openDirect(address, peerPort, config.directPort, family),
+                    openDirect(address, peerPort, config.directPort, family, peerPortGuesses),
                 )
 
                 break
@@ -562,6 +567,10 @@ class TcpPeerVpnService : VpnService() {
                     "Direct connection attempt failed; requesting a new punch",
                     error,
                 )
+
+                val edmGuesses = detectEdm(config, family, physicalNetwork)
+                if (family == DirectFamily.IPV6) edmIpv6Ports = edmGuesses
+                else edmIpv4Ports = edmGuesses
 
                 // The failed active socket may have replaced the NAPT mapping
                 // that was discovered before REGISTER. Refresh both mapped
@@ -864,6 +873,7 @@ class TcpPeerVpnService : VpnService() {
         }
         val address = InetAddress.getByName(punch.field("Address") ?: return)
         val port = punch.field("Port")?.toIntOrNull() ?: return
+        val portGuesses = parsePortGuesses(punch.field("Port-Guesses"))
         val traversal = "Simultaneous-Open"
         val waitMillis = (punch.field("Start-Ms")?.toLongOrNull() ?: 0L) - System.currentTimeMillis()
         if (waitMillis > 0) delay(waitMillis)
@@ -874,10 +884,20 @@ class TcpPeerVpnService : VpnService() {
             "Mesh attempt peer_id=$peerId family=${familyLabel(family)} traversal=$traversal " +
                 "initiated=true local_port=$activeLocalPort remote=${formatEndpoint(address, port)}",
         )
-        val socket = try {
-            openActiveDirect(address, port, activeLocalPort, family, peerId)
-        } catch (error: Exception) {
-            Log.w(TAG, "Direct mesh connection to $peerId failed", error)
+        var meshError: Exception? = null
+        var candidateSocket: Socket? = null
+        (listOf(port) + portGuesses).distinct().forEach { candidate ->
+            if (candidateSocket == null) try {
+                candidateSocket = openActiveDirect(
+                    address, candidate, activeLocalPort, family, peerId,
+                    if (portGuesses.isEmpty()) 12_000 else 750,
+                )
+            } catch (error: Exception) {
+                meshError = error
+            }
+        }
+        val socket = candidateSocket ?: run {
+            Log.w(TAG, "Direct mesh connection to $peerId failed", meshError)
             meshConnecting.remove(peerId)
             prepareDirectListener(config.directPort, family)
             return
@@ -1314,6 +1334,7 @@ class TcpPeerVpnService : VpnService() {
         config: VpnConfiguration,
         family: DirectFamily,
         physicalNetwork: Network?,
+        coordinatorPort: Int = config.coordinatorPort,
     ): PublicEndpoint? {
         val addresses = resolveCoordinatorAddresses(
             config.coordinatorAddress, physicalNetwork,
@@ -1330,7 +1351,7 @@ class TcpPeerVpnService : VpnService() {
                 val wildcard = if (family == DirectFamily.IPV6) InetAddress.getByName("::") else InetAddress.getByName("0.0.0.0")
                 socket.bind(InetSocketAddress(wildcard, config.directPort))
                 if (!protect(socket)) throw IllegalStateException("Cannot protect the endpoint query socket")
-                socket.connect(InetSocketAddress(address, config.coordinatorPort), 5_000)
+                socket.connect(InetSocketAddress(address, coordinatorPort), 5_000)
                 socket.soTimeout = 5_000
                 TcpPeerProtocol.writeControl(socket.getOutputStream(), ControlMessage("ENDPOINT-QUERY"))
                 val response = TcpPeerProtocol.readControl(socket.getInputStream())
@@ -1356,7 +1377,52 @@ class TcpPeerVpnService : VpnService() {
         return null
     }
 
-    private suspend fun openDirect(address: InetAddress, port: Int, localPort: Int, family: DirectFamily): Socket =
+    private fun parsePortGuesses(value: String?): List<Int> = value.orEmpty()
+        .split(',').mapNotNull { it.toIntOrNull() }
+        .filter { it in 1..65535 }.distinct().take(17)
+
+    private fun predictEdmPorts(samples: List<Int>): List<Int> {
+        if (samples.size < 3 || samples.distinct().size == 1) return emptyList()
+        val deltas = samples.zipWithNext { left, right -> right - left }
+        if (deltas.any { it == 0 || kotlin.math.abs(it) > 256 } ||
+            deltas.any { (it > 0) != (deltas.first() > 0) }) return emptyList()
+        val step = deltas.sorted()[deltas.size / 2]
+        if (deltas.any { kotlin.math.abs(it - step) > 2 }) return emptyList()
+        val predicted = samples.last() + step
+        if (predicted !in 1..65535) return emptyList()
+        return buildList {
+            for (distance in 0..8) {
+                val offsets = if (distance == 0) listOf(0) else listOf(distance, -distance)
+                offsets.forEach { offset ->
+                    val port = predicted + offset
+                    if (port in 1..65535 && port !in this) add(port)
+                }
+            }
+        }.take(17)
+    }
+
+    private fun detectEdm(
+        config: VpnConfiguration, family: DirectFamily, physicalNetwork: Network?,
+    ): List<Int> {
+        if (config.coordinatorPort > 65433) return emptyList()
+        val endpoints = listOf(100, 101, 102).mapNotNull { offset ->
+            queryPublicEndpoint(config, family, physicalNetwork, config.coordinatorPort + offset)
+        }
+        if (endpoints.size != 3 || endpoints.map { it.address }.distinct().size != 1) return emptyList()
+        val samples = endpoints.map { it.port }
+        val guesses = predictEdmPorts(samples)
+        Log.i(TAG, if (guesses.isEmpty()) {
+            "EDM not detected family=${familyLabel(family)} samples=$samples"
+        } else {
+            "EDM detected family=${familyLabel(family)} samples=$samples guesses=$guesses"
+        })
+        return guesses
+    }
+
+    private suspend fun openDirect(
+        address: InetAddress, port: Int, localPort: Int, family: DirectFamily,
+        portGuesses: List<Int> = emptyList(),
+    ): Socket =
         withContext(Dispatchers.IO) {
             try {
                 Log.i(
@@ -1382,7 +1448,19 @@ class TcpPeerVpnService : VpnService() {
             synchronized(directListeners) {
                 directListeners.remove(family)?.let(::closeQuietly)
             }
-            openActiveDirect(address, port, localPort, family)
+            var lastError: Exception? = null
+            val candidates = (listOf(port) + portGuesses).distinct()
+            candidates.forEach { candidate ->
+                try {
+                    return@withContext openActiveDirect(
+                        address, candidate, localPort, family, "primary",
+                        if (portGuesses.isEmpty()) 12_000 else 750,
+                    )
+                } catch (error: Exception) {
+                    lastError = error
+                }
+            }
+            throw lastError ?: ProtocolException("No direct port candidate")
         }
 
     private fun openActiveDirect(address: InetAddress, port: Int, localPort: Int, family: DirectFamily): Socket {
@@ -1395,6 +1473,7 @@ class TcpPeerVpnService : VpnService() {
         localPort: Int,
         family: DirectFamily,
         peerId: String,
+        connectTimeoutMs: Int = 12_000,
     ): Socket {
         val socket = Socket()
         inFlightSockets.add(socket)
@@ -1415,7 +1494,7 @@ class TcpPeerVpnService : VpnService() {
             if (!protect(socket)) throw IllegalStateException("Cannot protect the direct socket from the VPN")
             socket.sendBufferSize = DIRECT_SOCKET_BUFFER_BYTES
             socket.receiveBufferSize = DIRECT_SOCKET_BUFFER_BYTES
-            socket.connect(InetSocketAddress(address, port), 12_000)
+            socket.connect(InetSocketAddress(address, port), connectTimeoutMs)
             socket.tcpNoDelay = false
             socket.soTimeout = 15_000
             inFlightSockets.remove(socket)

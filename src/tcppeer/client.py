@@ -75,6 +75,8 @@ class Client(Server):
         self._registered_ipv6 = None
         self._registered_port_ipv4 = config.direct_port if self._registered_ipv4 else None
         self._registered_port_ipv6 = None
+        self._edm_ipv4_ports: tuple[int, ...] = ()
+        self._edm_ipv6_ports: tuple[int, ...] = ()
         self._direct_candidates = {}
         self._direct_connect_tasks = {}
         self._direct_connect_peer_sessions = {}
@@ -106,14 +108,14 @@ class Client(Server):
         return str(self._overlay_ipv4 or ""), str(self._overlay_ipv6 or "")
 
     async def _query_observed_endpoint(
-        self, family: socket.AddressFamily,
+        self, family: socket.AddressFamily, coordinator_port: int | None = None,
     ) -> tuple[str, int] | None:
         """Discover NAPT endpoints without colliding with the punch socket."""
         reserved = self._direct_candidates.pop(family, None)
         if reserved is not None:
             reserved.close()
         try:
-            return await super()._query_observed_endpoint(family)
+            return await super()._query_observed_endpoint(family, coordinator_port)
         finally:
             local_address = (
                 self._direct_bind_ipv6 if family == socket.AF_INET6

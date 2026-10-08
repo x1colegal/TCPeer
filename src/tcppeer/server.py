@@ -22,6 +22,7 @@ from tcppeer.config import ConfigurationError, ServerConfig
 from tcppeer.auth import authentication_proof
 from tcppeer.dhcp import DhcpServer
 from tcppeer.dns import discover_upstream_dns
+from tcppeer.edm import PROBE_PORT_OFFSETS, format_port_guesses, parse_port_guesses, predict_ports
 from tcppeer.exit_node import ExitNodeFirewall
 from tcppeer.packet import build_dhcp_packet, extract_dhcp_payload
 from tcppeer.protocol import ControlMessage, ProtocolError, encode_data, encode_data_plane_control, encode_tpp_control, read_control, read_data
@@ -170,6 +171,8 @@ class Server:
         self._registered_ipv6 = public_address(config.direct_ipv6)
         self._registered_port_ipv4: int | None = config.direct_port if self._registered_ipv4 else None
         self._registered_port_ipv6: int | None = config.direct_port if self._registered_ipv6 else None
+        self._edm_ipv4_ports: tuple[int, ...] = ()
+        self._edm_ipv6_ports: tuple[int, ...] = ()
         self._direct_candidates: dict[socket.AddressFamily, socket.socket] = {}
         self._direct_connect_tasks: dict[str, asyncio.Task] = {}
         self._direct_connect_peer_sessions: dict[str, str] = {}
@@ -432,6 +435,8 @@ class Server:
             "IPv6": self._registered_ipv6 or "",
             "Mapped-IPv4-Port": str(self._registered_port_ipv4 or ""),
             "Mapped-IPv6-Port": str(self._registered_port_ipv6 or ""),
+            "EDM-IPv4-Ports": format_port_guesses(self._edm_ipv4_ports),
+            "EDM-IPv6-Ports": format_port_guesses(self._edm_ipv6_ports),
             "Local-IPv4": self._direct_bind_ipv4 or "",
             "Local-IPv6": self._direct_bind_ipv6 or "",
             "Port": str(self.config.direct_port),
@@ -579,10 +584,13 @@ class Server:
             except ValueError:
                 LOG.warning("Ignoring invalid overlay address peer_id=%s address=%s", peer_id, value)
 
-    async def _query_observed_endpoint(self, family: socket.AddressFamily) -> tuple[str, int] | None:
+    async def _query_observed_endpoint(
+        self, family: socket.AddressFamily, coordinator_port: int | None = None,
+    ) -> tuple[str, int] | None:
         local_address = self._direct_bind_ipv6 if family == socket.AF_INET6 else self._direct_bind_ipv4
         local_address = local_address or ("::" if family == socket.AF_INET6 else "0.0.0.0")
-        results = await resolve_tcp_endpoints(self.config.coordinator_address, self.config.coordinator_port)
+        port = coordinator_port or self.config.coordinator_port
+        results = await resolve_tcp_endpoints(self.config.coordinator_address, port)
         loop = asyncio.get_running_loop()
         family_name = "IPv6" if family == socket.AF_INET6 else "IPv4"
         family_results = [item for item in results if item[0] == family]
@@ -635,6 +643,30 @@ class Server:
             LOG.warning("Coordinator DNS has no %s address; that family cannot be advertised", family_name)
         return None
 
+    async def _detect_edm(self, family: socket.AddressFamily) -> tuple[int, ...]:
+        observations: list[tuple[str, int]] = []
+        for offset in PROBE_PORT_OFFSETS:
+            if self.config.coordinator_port + offset > 65535:
+                return ()
+            endpoint = await self._query_observed_endpoint(
+                family, self.config.coordinator_port + offset,
+            )
+            if endpoint is None:
+                return ()
+            observations.append(endpoint)
+        if len({address for address, _port in observations}) != 1:
+            return ()
+        prediction = predict_ports([port for _address, port in observations])
+        if prediction is None:
+            LOG.info("EDM was not detected for TCP%s samples=%s", 6 if family == socket.AF_INET6 else 4, observations)
+            return ()
+        LOG.warning(
+            "EDM detected for TCP%s samples=%s predicted=%s guesses=%s",
+            6 if family == socket.AF_INET6 else 4, prediction.samples,
+            prediction.predicted_port, prediction.guesses,
+        )
+        return prediction.guesses
+
     async def _open_coordinator_connection(self):
         """Use the direct local TCP port so the observed mapping is relevant."""
         loop = asyncio.get_running_loop()
@@ -685,6 +717,7 @@ class Server:
         if not local_address:
             local_address = "::" if family == socket.AF_INET6 else "0.0.0.0"
         remote = Endpoint(message.get("Address") or "", int(message.get("Port") or 0), family)
+        remote_ports = parse_port_guesses(message.get("Port-Guesses"))
         self._prepare_remote_route(remote.address, family)
         local = Endpoint(local_address, self.config.direct_port, family)
         start_ms = int(message.get("Start-Ms") or 0)
@@ -716,6 +749,7 @@ class Server:
             )
             reader, writer = await DirectConnector().connect(
                 local, remote, family, prebound_socket=candidate, peer_id=peer_id, attempt=attempt,
+                remote_ports=remote_ports, retry_window=10.0,
             )
             writer.write(ControlMessage("PEER-INFO", {
                 "Network": self.config.network, "Peer-ID": self.config.peer_id,
@@ -752,6 +786,11 @@ class Server:
             raise
         except DirectConnectionError:
             self.store.update_peer(peer_id, transport="No Direct Connection")
+            guesses = await self._detect_edm(family)
+            if family == socket.AF_INET6:
+                self._edm_ipv6_ports = guesses
+            else:
+                self._edm_ipv4_ports = guesses
             # A full retry window can leave the coordinator advertising a
             # stale NAPT mapping. Reconnect only the control plane so endpoint
             # discovery and REGISTER run again without restarting the TUN or
