@@ -580,6 +580,7 @@ class Coordinator:
             # PUNCH-GO messages from the same session as replacements.
             "Peer-Session": repr(right.connected_at),
             "Port-Guesses": format_port_guesses(right_guesses),
+            "Local-EDM": "yes" if left_guesses else "no",
         })
         await self.send(right.writer, "PUNCH-GO", **{
             "Peer-ID": left.peer_id, "Address": str(left_address),
@@ -587,6 +588,7 @@ class Coordinator:
             "Traversal": traversal,
             "Peer-Session": repr(left.connected_at),
             "Port-Guesses": format_port_guesses(left_guesses),
+            "Local-EDM": "yes" if right_guesses else "no",
         })
 
     @staticmethod

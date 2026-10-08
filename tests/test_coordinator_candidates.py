@@ -108,7 +108,9 @@ def test_punch_go_sends_remote_edm_candidates() -> None:
         await coordinator._punch_go(left, right)
 
         assert b"Port-Guesses: 51002,51003\r\n" in left_writer.data
+        assert b"Local-EDM: yes\r\n" in left_writer.data
         assert b"Port-Guesses: 50002,50003\r\n" in right_writer.data
+        assert b"Local-EDM: yes\r\n" in right_writer.data
 
     asyncio.run(scenario())
 

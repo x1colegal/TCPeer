@@ -718,6 +718,7 @@ class Server:
             local_address = "::" if family == socket.AF_INET6 else "0.0.0.0"
         remote = Endpoint(message.get("Address") or "", int(message.get("Port") or 0), family)
         remote_ports = parse_port_guesses(message.get("Port-Guesses"))
+        local_edm = message.get("Local-EDM") == "yes"
         self._prepare_remote_route(remote.address, family)
         local = Endpoint(local_address, self.config.direct_port, family)
         start_ms = int(message.get("Start-Ms") or 0)
@@ -750,6 +751,7 @@ class Server:
             reader, writer = await DirectConnector().connect(
                 local, remote, family, prebound_socket=candidate, peer_id=peer_id, attempt=attempt,
                 remote_ports=remote_ports, retry_window=10.0,
+                local_edm=local_edm,
             )
             writer.write(ControlMessage("PEER-INFO", {
                 "Network": self.config.network, "Peer-ID": self.config.peer_id,

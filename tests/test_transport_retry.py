@@ -21,3 +21,7 @@ def test_eim_window_remains_ten_seconds() -> None:
 
 def test_edm_window_fits_every_one_second_candidate() -> None:
     assert DirectConnector._effective_retry_window(18, 10.0) >= 19.8
+
+
+def test_local_edm_keeps_outbound_half_alive_for_remote_scan() -> None:
+    assert DirectConnector._effective_retry_window(1, 10.0, local_edm=True) == 20.0

@@ -543,6 +543,7 @@ class TcpPeerVpnService : VpnService() {
             peerPort = punch.field("Port")?.toIntOrNull()
                 ?: throw ProtocolException("PUNCH-GO has no valid port")
             val peerPortGuesses = parsePortGuesses(punch.field("Port-Guesses"))
+            val localEdm = punch.field("Local-EDM") == "yes"
 
             updateConnecting(
                 "Opening a direct ${family.name.replace("IPV", "TCP")} connection."
@@ -551,7 +552,10 @@ class TcpPeerVpnService : VpnService() {
             try {
                 direct = publishDirectSocket(
                     generation,
-                    openDirect(address, peerPort, config.directPort, family, peerPortGuesses),
+                    openDirect(
+                        address, peerPort, config.directPort, family,
+                        peerPortGuesses, localEdm,
+                    ),
                 )
 
                 break
@@ -874,6 +878,7 @@ class TcpPeerVpnService : VpnService() {
         val address = InetAddress.getByName(punch.field("Address") ?: return)
         val port = punch.field("Port")?.toIntOrNull() ?: return
         val portGuesses = parsePortGuesses(punch.field("Port-Guesses"))
+        val localEdm = punch.field("Local-EDM") == "yes"
         val traversal = "Simultaneous-Open"
         val waitMillis = (punch.field("Start-Ms")?.toLongOrNull() ?: 0L) - System.currentTimeMillis()
         if (waitMillis > 0) delay(waitMillis)
@@ -886,16 +891,21 @@ class TcpPeerVpnService : VpnService() {
         )
         var meshError: Exception? = null
         var candidateSocket: Socket? = null
-        (listOf(port) + portGuesses).distinct().forEach { candidate ->
-            if (candidateSocket == null) try {
-                candidateSocket = openActiveDirect(
-                    address, candidate, activeLocalPort, family, peerId,
-                    if (portGuesses.isEmpty()) 12_000 else 2_000,
-                )
-            } catch (error: Exception) {
-                meshError = error
+        val meshCandidates = (listOf(port) + portGuesses).distinct()
+        val meshDeadline = if (localEdm) System.nanoTime() + 22_000_000_000L else 0L
+        do {
+            meshCandidates.forEach { candidate ->
+                if (candidateSocket == null) try {
+                    candidateSocket = openActiveDirect(
+                        address, candidate, activeLocalPort, family, peerId,
+                        if (portGuesses.isEmpty() && !localEdm) 12_000 else 2_000,
+                    )
+                } catch (error: Exception) {
+                    meshError = error
+                }
             }
-        }
+            if (candidateSocket == null && localEdm) delay(100)
+        } while (candidateSocket == null && localEdm && System.nanoTime() < meshDeadline)
         val socket = candidateSocket ?: run {
             Log.w(TAG, "Direct mesh connection to $peerId failed", meshError)
             meshConnecting.remove(peerId)
@@ -1422,6 +1432,7 @@ class TcpPeerVpnService : VpnService() {
     private suspend fun openDirect(
         address: InetAddress, port: Int, localPort: Int, family: DirectFamily,
         portGuesses: List<Int> = emptyList(),
+        localEdm: Boolean = false,
     ): Socket =
         withContext(Dispatchers.IO) {
             try {
@@ -1450,16 +1461,20 @@ class TcpPeerVpnService : VpnService() {
             }
             var lastError: Exception? = null
             val candidates = (listOf(port) + portGuesses).distinct()
-            candidates.forEach { candidate ->
-                try {
-                    return@withContext openActiveDirect(
-                        address, candidate, localPort, family, "primary",
-                        if (portGuesses.isEmpty()) 12_000 else 2_000,
-                    )
-                } catch (error: Exception) {
-                    lastError = error
+            val deadline = if (localEdm) System.nanoTime() + 22_000_000_000L else 0L
+            do {
+                candidates.forEach { candidate ->
+                    try {
+                        return@withContext openActiveDirect(
+                            address, candidate, localPort, family, "primary",
+                            if (portGuesses.isEmpty() && !localEdm) 12_000 else 2_000,
+                        )
+                    } catch (error: Exception) {
+                        lastError = error
+                    }
                 }
-            }
+                if (localEdm) delay(100)
+            } while (localEdm && System.nanoTime() < deadline)
             throw lastError ?: ProtocolException("No direct port candidate")
         }
 

@@ -533,6 +533,12 @@ EDM candidate up to one second; Android gives each candidate up to two seconds.
 The EDM-stage window is sized separately so every bounded candidate can be
 attempted without changing the normal Linux EIM timeout.
 
+`PUNCH-GO` also identifies the peer whose local mapping is EDM. That peer
+keeps recreating its outbound simultaneous-open half for the duration of the
+remote candidate scan. This is required when a NAT or firewall returns a fast
+RST: without the repeated outbound half, the predicted mapping disappears
+before the other peer reaches the matching public port.
+
 This remains direct-only TCP traversal: probe connections carry control-plane
 metadata only, the Coordinator never relays VPN packets, and TCPeer neither
 opens UDP sockets nor falls back to another address family. Port prediction is

@@ -78,8 +78,11 @@ class DirectConnector:
         return isinstance(exc, OSError) and exc.errno == errno.EADDRNOTAVAIL
 
     @staticmethod
-    def _effective_retry_window(port_count: int, retry_window: float) -> float:
-        return retry_window if port_count <= 1 else max(retry_window, port_count * 1.1)
+    def _effective_retry_window(
+        port_count: int, retry_window: float, local_edm: bool = False,
+    ) -> float:
+        window = retry_window if port_count <= 1 else max(retry_window, port_count * 1.1)
+        return max(window, 20.0) if local_edm else window
 
     async def connect(
         self,
@@ -92,6 +95,7 @@ class DirectConnector:
         attempt: int = 0,
         remote_ports: tuple[int, ...] = (),
         retry_window: float = 10.0,
+        local_edm: bool = False,
     ):
         if local.family != required_family or remote.family != required_family:
             raise DirectConnectionError("endpoint family violates transport policy")
@@ -100,7 +104,12 @@ class DirectConnector:
         # Preserve the ten-second EIM window. EDM is a second-stage attempt and
         # needs enough time to give every bounded candidate a real one-second
         # simultaneous-open opportunity.
-        effective_window = self._effective_retry_window(len(ports), retry_window)
+        # Keep recreating the outbound half while the remote peer scans this
+        # peer's predicted mappings. Fast RSTs must not remove the EDM mapping
+        # before the matching remote SYN arrives.
+        effective_window = self._effective_retry_window(
+            len(ports), retry_window, local_edm,
+        )
         deadline = loop.time() + effective_window
         last_exc = None
         port_index = 0
