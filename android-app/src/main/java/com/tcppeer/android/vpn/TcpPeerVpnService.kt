@@ -62,10 +62,8 @@ import java.net.ServerSocket
 import java.net.SocketTimeoutException
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.locks.ReentrantLock
 
 private data class PublicEndpoint(val address: String, val port: Int)
 private data class RoutePrefix(val address: ByteArray, val prefixLength: Int)
@@ -76,35 +74,15 @@ private data class TunStreams(
 
 private class TunPacketSink(private val output: FileOutputStream) {
     private val packets = Channel<ByteArray>(capacity = 2048)
-    private val queued = AtomicInteger(0)
-    private val writeLock = ReentrantLock()
 
-    fun offer(packet: ByteArray, length: Int = packet.size): Boolean {
-        if (writeLock.tryLock()) {
-            try {
-                if (queued.get() == 0) {
-                    output.write(packet, 0, length)
-                    return true
-                }
-            } finally {
-                writeLock.unlock()
-            }
-        }
-        queued.incrementAndGet()
-        if (packets.trySend(packet.copyOf(length)).isSuccess) return true
-        queued.decrementAndGet()
-        return false
-    }
+    // Direct-socket readers must never block on a TUN write. A blocked
+    // FileOutputStream.write() would stall raw IP and TPCP for that peer.
+    fun offer(packet: ByteArray, length: Int = packet.size): Boolean =
+        packets.trySend(packet.copyOf(length)).isSuccess
 
     suspend fun consume() {
         for (packet in packets) {
-            writeLock.lock()
-            try {
-                output.write(packet)
-            } finally {
-                queued.decrementAndGet()
-                writeLock.unlock()
-            }
+            output.write(packet)
         }
     }
 
