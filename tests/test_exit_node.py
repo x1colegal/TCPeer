@@ -37,24 +37,19 @@ def test_nat44_falls_back_to_masquerade_without_selected_route() -> None:
     assert 'iifname "tcppeer0" oifname != "tcppeer0" masquerade' in rules
 
 
-def test_ipv6_isolation_only_blocks_overlay_and_host_addresses() -> None:
+def test_ipv6_isolation_only_blocks_the_exit_nodes_exact_lan_addresses() -> None:
     firewall = ExitNodeFirewall(config(), "tcppeer0")
     firewall.ipv6_overlay_prefix = ipaddress.ip_network("2001:db8:100::/64")
     rules = firewall._ruleset(
         (), None,
-        (ipaddress.ip_network("2001:db8:200::/64"),),
         (ipaddress.ip_address("2001:db8:200::10"),),
     )
 
-    lan_to_overlay = (
-        'iifname != "tcppeer0" ip6 saddr { 2001:db8:200::/64 } '
-        'ip6 daddr 2001:db8:100::/64 counter drop'
-    )
-    assert rules.count(lan_to_overlay) == 2
     assert (
         'iifname "tcppeer0" ip6 daddr { 2001:db8:200::10 } counter drop'
     ) in rules
     assert 'iifname "tcppeer0" accept' in rules
+    assert 'ip6 saddr { 2001:db8:200::/64 }' not in rules
     assert 'ip6 daddr 2001:db8:200::/64 counter drop' not in rules
 
 

@@ -49,8 +49,8 @@ class ExitNodeFirewall:
         nat44_route = self._selected_ipv4_route() if (
             self.config.exit_node_enabled and self.config.nat44
         ) else None
-        lan_ipv6_prefixes, local_ipv6_addresses = self._local_ipv6_lan()
-        rules = self._ruleset(upstream, nat44_route, lan_ipv6_prefixes, local_ipv6_addresses)
+        _lan_ipv6_prefixes, local_ipv6_addresses = self._local_ipv6_lan()
+        rules = self._ruleset(upstream, nat44_route, local_ipv6_addresses)
         try:
             subprocess.run(
                 ("nft", "-f", "-"), input=rules, text=True,
@@ -66,7 +66,7 @@ class ExitNodeFirewall:
             try:
                 subprocess.run(
                     ("nft", "-f", "-"), input=self._ruleset(
-                        (), nat44_route, lan_ipv6_prefixes, local_ipv6_addresses,
+                        (), nat44_route, local_ipv6_addresses,
                     ), text=True,
                     check=True, capture_output=True,
                 )
@@ -86,7 +86,6 @@ class ExitNodeFirewall:
         self,
         upstream: tuple[str, ...] = (),
         nat44_route: tuple[str, str] | None = None,
-        lan_ipv6_prefixes: tuple[ipaddress.IPv6Network, ...] = (),
         local_ipv6_addresses: tuple[ipaddress.IPv6Address, ...] = (),
     ) -> str:
         tun = self.interface
@@ -94,14 +93,6 @@ class ExitNodeFirewall:
         if local_ipv6_addresses:
             addresses = ", ".join(str(address) for address in local_ipv6_addresses)
             local_input_drop = f'    iifname "{tun}" ip6 daddr {{ {addresses} }} counter drop\n'
-        lan_to_overlay_drop = ""
-        if lan_ipv6_prefixes:
-            prefixes = ", ".join(str(prefix) for prefix in lan_ipv6_prefixes)
-            lan_to_overlay_drop = (
-                f'    iifname != "{tun}" ip6 saddr {{ {prefixes} }} '
-                f'ip6 daddr {self.ipv6_overlay_prefix} counter drop\n'
-            )
-        input_isolation = lan_to_overlay_drop + local_input_drop
         flowtable = ""
         flow_rules = ""
         if upstream:
@@ -117,7 +108,7 @@ class ExitNodeFirewall:
         sections = ['''table inet tcppeer_input {
   chain input {
     type filter hook input priority filter; policy accept;
-''' + input_isolation + '''\
+''' + local_input_drop + '''\
     meta l4proto { tcp, udp } accept
     meta l4proto { icmp, ipv6-icmp } accept
   }
@@ -127,7 +118,7 @@ class ExitNodeFirewall:
         sections.append(f'''table inet tcppeer_forward {{
 {flowtable}  chain forward {{
     type filter hook forward priority filter; policy accept;
-{lan_to_overlay_drop}{flow_rules}
+{flow_rules}
     iifname "{tun}" accept
     oifname "{tun}" ct state established,related accept
   }}
