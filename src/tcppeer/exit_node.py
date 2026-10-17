@@ -36,6 +36,7 @@ class ExitNodeFirewall:
         self.config = config
         self.interface = interface
         self.nat66_enabled = config.nat66
+        self.ipv6_overlay_prefix = config.ipv6_prefix
 
     def apply(self) -> None:
         if self.config.exit_node_enabled:
@@ -48,7 +49,8 @@ class ExitNodeFirewall:
         nat44_route = self._selected_ipv4_route() if (
             self.config.exit_node_enabled and self.config.nat44
         ) else None
-        rules = self._ruleset(upstream, nat44_route)
+        lan_ipv6_prefixes, local_ipv6_addresses = self._local_ipv6_lan()
+        rules = self._ruleset(upstream, nat44_route, lan_ipv6_prefixes, local_ipv6_addresses)
         try:
             subprocess.run(
                 ("nft", "-f", "-"), input=rules, text=True,
@@ -63,7 +65,9 @@ class ExitNodeFirewall:
             self._delete_tables()
             try:
                 subprocess.run(
-                    ("nft", "-f", "-"), input=self._ruleset((), nat44_route), text=True,
+                    ("nft", "-f", "-"), input=self._ruleset(
+                        (), nat44_route, lan_ipv6_prefixes, local_ipv6_addresses,
+                    ), text=True,
                     check=True, capture_output=True,
                 )
             except subprocess.CalledProcessError as fallback_exc:
@@ -82,8 +86,22 @@ class ExitNodeFirewall:
         self,
         upstream: tuple[str, ...] = (),
         nat44_route: tuple[str, str] | None = None,
+        lan_ipv6_prefixes: tuple[ipaddress.IPv6Network, ...] = (),
+        local_ipv6_addresses: tuple[ipaddress.IPv6Address, ...] = (),
     ) -> str:
         tun = self.interface
+        local_input_drop = ""
+        if local_ipv6_addresses:
+            addresses = ", ".join(str(address) for address in local_ipv6_addresses)
+            local_input_drop = f'    iifname "{tun}" ip6 daddr {{ {addresses} }} counter drop\n'
+        lan_to_overlay_drop = ""
+        if lan_ipv6_prefixes:
+            prefixes = ", ".join(str(prefix) for prefix in lan_ipv6_prefixes)
+            lan_to_overlay_drop = (
+                f'    iifname != "{tun}" ip6 saddr {{ {prefixes} }} '
+                f'ip6 daddr {self.ipv6_overlay_prefix} counter drop\n'
+            )
+        input_isolation = lan_to_overlay_drop + local_input_drop
         flowtable = ""
         flow_rules = ""
         if upstream:
@@ -99,6 +117,7 @@ class ExitNodeFirewall:
         sections = ['''table inet tcppeer_input {
   chain input {
     type filter hook input priority filter; policy accept;
+''' + input_isolation + '''\
     meta l4proto { tcp, udp } accept
     meta l4proto { icmp, ipv6-icmp } accept
   }
@@ -108,7 +127,7 @@ class ExitNodeFirewall:
         sections.append(f'''table inet tcppeer_forward {{
 {flowtable}  chain forward {{
     type filter hook forward priority filter; policy accept;
-{flow_rules}
+{lan_to_overlay_drop}{flow_rules}
     iifname "{tun}" accept
     oifname "{tun}" ct state established,related accept
   }}
@@ -132,6 +151,46 @@ class ExitNodeFirewall:
   }}
 }}''')
         return "\n\n".join(sections) + "\n"
+
+    def _local_ipv6_lan(
+        self,
+    ) -> tuple[tuple[ipaddress.IPv6Network, ...], tuple[ipaddress.IPv6Address, ...]]:
+        """Return on-link LAN prefixes and this host's exact non-TUN IPv6 addresses."""
+        try:
+            result = subprocess.run(
+                ("ip", "-j", "-6", "address", "show", "up"),
+                check=True, capture_output=True, text=True,
+            )
+            interfaces = json.loads(result.stdout)
+        except (
+            FileNotFoundError, subprocess.CalledProcessError, json.JSONDecodeError,
+            TypeError, ValueError,
+        ) as exc:
+            LOG.warning("Could not discover local IPv6 LAN addresses: %s", exc)
+            return (), ()
+
+        prefixes: set[ipaddress.IPv6Network] = set()
+        addresses: set[ipaddress.IPv6Address] = set()
+        for interface in interfaces:
+            name = str(interface.get("ifname", ""))
+            if name in {self.interface, "lo"}:
+                continue
+            for entry in interface.get("addr_info", ()):
+                if entry.get("family") != "inet6":
+                    continue
+                try:
+                    address = ipaddress.IPv6Address(entry["local"])
+                    prefixlen = int(entry["prefixlen"])
+                except (KeyError, TypeError, ValueError, ipaddress.AddressValueError):
+                    continue
+                if address.is_loopback or address.is_multicast or address.is_unspecified:
+                    continue
+                addresses.add(address)
+                if prefixlen < 128:
+                    prefixes.add(ipaddress.IPv6Network((address, prefixlen), strict=False))
+        return tuple(sorted(prefixes, key=lambda item: (int(item.network_address), item.prefixlen))), tuple(
+            sorted(addresses, key=int)
+        )
 
     def _selected_ipv4_route(self) -> tuple[str, str] | None:
         """Return the default-route interface and source selected by Linux.
