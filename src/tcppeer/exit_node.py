@@ -71,9 +71,13 @@ class HostIpv6Isolation:
             raise ExitNodeError("invalid TUN interface name for nftables")
         self.interface = interface
 
-    def apply(self, overlay_prefix: ipaddress.IPv6Network | None = None) -> None:
+    def apply(
+        self,
+        overlay_prefix: ipaddress.IPv6Network | None = None,
+        overlay_address: ipaddress.IPv6Address | None = None,
+    ) -> None:
         self.close()
-        _prefixes, addresses = _local_ipv6_lan(self.interface)
+        prefixes, addresses = _local_ipv6_lan(self.interface)
         address_set = ", ".join(str(address) for address in addresses)
         drop = ""
         if address_set:
@@ -84,6 +88,13 @@ class HostIpv6Isolation:
             if overlay_prefix is not None:
                 drop += (
                     f"    ip6 saddr {overlay_prefix} ip6 daddr {{ {address_set} }} "
+                    "counter drop\n"
+                )
+        if overlay_address is not None:
+            prefix_set = ", ".join(str(prefix) for prefix in prefixes)
+            if prefix_set:
+                drop += (
+                    f"    ip6 saddr {{ {prefix_set} }} ip6 daddr {overlay_address} "
                     "counter drop\n"
                 )
         rules = f'''table inet tcppeer_input {{
@@ -129,6 +140,7 @@ class ExitNodeFirewall:
         self.interface = interface
         self.nat66_enabled = config.nat66
         self.ipv6_overlay_prefix = config.ipv6_prefix
+        self.ipv6_overlay_address = config.server_ipv6
 
     def apply(self) -> None:
         if self.config.exit_node_enabled:
@@ -141,8 +153,10 @@ class ExitNodeFirewall:
         nat44_route = self._selected_ipv4_route() if (
             self.config.exit_node_enabled and self.config.nat44
         ) else None
-        _lan_ipv6_prefixes, local_ipv6_addresses = self._local_ipv6_lan()
-        rules = self._ruleset(upstream, nat44_route, local_ipv6_addresses)
+        lan_ipv6_prefixes, local_ipv6_addresses = self._local_ipv6_lan()
+        rules = self._ruleset(
+            upstream, nat44_route, lan_ipv6_prefixes, local_ipv6_addresses,
+        )
         try:
             subprocess.run(
                 ("nft", "-f", "-"), input=rules, text=True,
@@ -158,7 +172,7 @@ class ExitNodeFirewall:
             try:
                 subprocess.run(
                     ("nft", "-f", "-"), input=self._ruleset(
-                        (), nat44_route, local_ipv6_addresses,
+                        (), nat44_route, lan_ipv6_prefixes, local_ipv6_addresses,
                     ), text=True,
                     check=True, capture_output=True,
                 )
@@ -178,6 +192,7 @@ class ExitNodeFirewall:
         self,
         upstream: tuple[str, ...] = (),
         nat44_route: tuple[str, str] | None = None,
+        lan_ipv6_prefixes: tuple[ipaddress.IPv6Network, ...] = (),
         local_ipv6_addresses: tuple[ipaddress.IPv6Address, ...] = (),
     ) -> str:
         tun = self.interface
@@ -185,6 +200,13 @@ class ExitNodeFirewall:
         if local_ipv6_addresses:
             addresses = ", ".join(str(address) for address in local_ipv6_addresses)
             local_input_drop = f'    iifname "{tun}" ip6 daddr {{ {addresses} }} counter drop\n'
+        overlay_input_drop = ""
+        if lan_ipv6_prefixes:
+            prefixes = ", ".join(str(prefix) for prefix in lan_ipv6_prefixes)
+            overlay_input_drop = (
+                f"    ip6 saddr {{ {prefixes} }} ip6 daddr "
+                f"{self.ipv6_overlay_address} counter drop\n"
+            )
         flowtable = ""
         flow_rules = ""
         if upstream:
@@ -200,7 +222,7 @@ class ExitNodeFirewall:
         sections = ['''table inet tcppeer_input {
   chain input {
     type filter hook input priority filter; policy accept;
-''' + local_input_drop + '''\
+''' + local_input_drop + overlay_input_drop + '''\
     meta l4proto { tcp, udp } accept
     meta l4proto { icmp, ipv6-icmp } accept
   }

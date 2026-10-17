@@ -1477,6 +1477,7 @@ class Server:
         self._pd_active = True
         self.exit_node.nat66_enabled = False
         self.exit_node.ipv6_overlay_prefix = subnet
+        self.exit_node.ipv6_overlay_address = self._active_server_ipv6
 
         LOG.info(
             "Using delegated IPv6 prefix %s for TCPeer SLAAC; NAT66 disabled",
@@ -1489,6 +1490,7 @@ class Server:
         self._pd_active = False
         self.exit_node.nat66_enabled = self.config.nat66
         self.exit_node.ipv6_overlay_prefix = self.config.ipv6_prefix
+        self.exit_node.ipv6_overlay_address = self._active_server_ipv6
 
     async def _pd_loop(self) -> None:
         while True:
@@ -1531,6 +1533,7 @@ class Server:
 
             self.exit_node.nat66_enabled = False
             self.exit_node.ipv6_overlay_prefix = subnet
+            self.exit_node.ipv6_overlay_address = self._active_server_ipv6
             self.exit_node.apply()
 
             await self._announce_overlay_update()

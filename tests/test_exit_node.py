@@ -42,14 +42,17 @@ def test_ipv6_isolation_only_blocks_the_exit_nodes_exact_lan_addresses() -> None
     firewall.ipv6_overlay_prefix = ipaddress.ip_network("2001:db8:100::/64")
     rules = firewall._ruleset(
         (), None,
+        (ipaddress.ip_network("2001:db8:200::/64"),),
         (ipaddress.ip_address("2001:db8:200::10"),),
     )
 
     assert (
         'iifname "tcppeer0" ip6 daddr { 2001:db8:200::10 } counter drop'
     ) in rules
+    assert (
+        'ip6 saddr { 2001:db8:200::/64 } ip6 daddr fdfe:cafe:cafe::1 counter drop'
+    ) in rules
     assert 'iifname "tcppeer0" accept' in rules
-    assert 'ip6 saddr { 2001:db8:200::/64 }' not in rules
     assert 'ip6 daddr 2001:db8:200::/64 counter drop' not in rules
 
 
@@ -80,19 +83,25 @@ def test_local_ipv6_discovery_excludes_tun_and_loopback() -> None:
 def test_host_isolation_only_installs_exact_destination_drop() -> None:
     isolation = HostIpv6Isolation("tcppeer0")
     addresses = (
-        (),
+        (ipaddress.ip_network("2001:db8:200::/64"),),
         (ipaddress.ip_address("2001:db8:200::10"),),
     )
     with (
         patch("tcppeer.exit_node._local_ipv6_lan", return_value=addresses),
         patch("tcppeer.exit_node.subprocess.run") as run,
     ):
-        isolation.apply(ipaddress.ip_network("2001:db8:100::/64"))
+        isolation.apply(
+            ipaddress.ip_network("2001:db8:100::/64"),
+            ipaddress.ip_address("2001:db8:100::20"),
+        )
 
     rules = run.call_args_list[-1].kwargs["input"]
     assert 'iifname "tcppeer0" ip6 daddr { 2001:db8:200::10 } counter drop' in rules
     assert (
         'ip6 saddr 2001:db8:100::/64 ip6 daddr { 2001:db8:200::10 } counter drop'
+    ) in rules
+    assert (
+        'ip6 saddr { 2001:db8:200::/64 } ip6 daddr 2001:db8:100::20 counter drop'
     ) in rules
     assert "forward" not in rules
     assert "masquerade" not in rules

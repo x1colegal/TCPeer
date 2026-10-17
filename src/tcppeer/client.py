@@ -250,7 +250,7 @@ class Client(Server):
         self._active_server_ipv6 = slaac.address
         self.tun.configure(str(ack.address), ack.prefix_length, str(slaac.address), slaac.prefix.prefixlen)
         self._configure_routes(ack.server, slaac.prefix, tuple(ack.dns) + tuple(slaac.dns))
-        self.host_isolation.apply(slaac.prefix)
+        self.host_isolation.apply(slaac.prefix, slaac.address)
         self._configured.set()
         if self._coordinator_writer is not None:
             self._coordinator_writer.write(ControlMessage("PEER-INFO", {
