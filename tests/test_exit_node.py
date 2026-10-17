@@ -4,7 +4,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from tcppeer.config import ServerConfig
-from tcppeer.exit_node import ExitNodeFirewall
+from tcppeer.exit_node import ExitNodeFirewall, HostIpv6Isolation
 
 
 def config() -> ServerConfig:
@@ -75,3 +75,24 @@ def test_local_ipv6_discovery_excludes_tun_and_loopback() -> None:
         ipaddress.ip_address("2001:db8:200::10"),
         ipaddress.ip_address("fe80::10"),
     )
+
+
+def test_host_isolation_only_installs_exact_destination_drop() -> None:
+    isolation = HostIpv6Isolation("tcppeer0")
+    addresses = (
+        (),
+        (ipaddress.ip_address("2001:db8:200::10"),),
+    )
+    with (
+        patch("tcppeer.exit_node._local_ipv6_lan", return_value=addresses),
+        patch("tcppeer.exit_node.subprocess.run") as run,
+    ):
+        isolation.apply(ipaddress.ip_network("2001:db8:100::/64"))
+
+    rules = run.call_args_list[-1].kwargs["input"]
+    assert 'iifname "tcppeer0" ip6 daddr { 2001:db8:200::10 } counter drop' in rules
+    assert (
+        'ip6 saddr 2001:db8:100::/64 ip6 daddr { 2001:db8:200::10 } counter drop'
+    ) in rules
+    assert "forward" not in rules
+    assert "masquerade" not in rules

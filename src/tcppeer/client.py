@@ -18,6 +18,7 @@ if __package__ in {None, ""}:
 from tcppeer.address_negotiation import SlaacLease, dhcp_discover, dhcp_request, parse_dhcp, parse_ra, router_solicitation, transaction_id
 from tcppeer.config import ClientConfig, ConfigurationError
 from tcppeer.dns import discover_upstream_dns
+from tcppeer.exit_node import HostIpv6Isolation
 from tcppeer.protocol import ControlMessage, ProtocolError, read_data
 from tcppeer.server import (
     Server,
@@ -58,6 +59,7 @@ class Client(Server):
                 self.store.set_metadata("device_name", automatic_name)
         self.dns = discover_upstream_dns({config.tun_name})
         self.tun = TunDevice(config.tun_name, config.mtu)
+        self.host_isolation = HostIpv6Isolation(config.tun_name)
         self.direct_writers = {}
         self._overlay_peer_index = {}
         self._load_overlay_peer_index()
@@ -140,6 +142,7 @@ class Client(Server):
         configure_tcp_socket_buffer_limits()
         self.tun.open()
         try:
+            self.host_isolation.apply()
             self._prepare_direct_candidates()
             control = asyncio.create_task(self._control_loop(), name="control")
             registration = asyncio.create_task(self._registration_complete.wait(), name="registration-wait")
@@ -178,6 +181,7 @@ class Client(Server):
             await asyncio.gather(*self._tasks, return_exceptions=True)
             await asyncio.gather(*self._peer_send_tasks.values(), return_exceptions=True)
             self.tun.close()
+            self.host_isolation.close()
             self._flush_byte_counters()
             self.store.close()
 
@@ -246,6 +250,7 @@ class Client(Server):
         self._active_server_ipv6 = slaac.address
         self.tun.configure(str(ack.address), ack.prefix_length, str(slaac.address), slaac.prefix.prefixlen)
         self._configure_routes(ack.server, slaac.prefix, tuple(ack.dns) + tuple(slaac.dns))
+        self.host_isolation.apply(slaac.prefix)
         self._configured.set()
         if self._coordinator_writer is not None:
             self._coordinator_writer.write(ControlMessage("PEER-INFO", {

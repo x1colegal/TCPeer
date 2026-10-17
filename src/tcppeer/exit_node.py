@@ -16,8 +16,100 @@ _NFT_IDENTIFIER = re.compile(r"^[A-Za-z0-9_.:-]+$")
 _INPUT_RULE_COMMENT = "tcppeer-open-input"
 
 
+def _local_ipv6_lan(
+    excluded_interface: str,
+) -> tuple[tuple[ipaddress.IPv6Network, ...], tuple[ipaddress.IPv6Address, ...]]:
+    """Return on-link prefixes and exact addresses outside one TCPeer TUN."""
+    try:
+        result = subprocess.run(
+            ("ip", "-j", "-6", "address", "show", "up"),
+            check=True, capture_output=True, text=True,
+        )
+        interfaces = json.loads(result.stdout)
+    except (
+        FileNotFoundError, subprocess.CalledProcessError, json.JSONDecodeError,
+        TypeError, ValueError,
+    ) as exc:
+        LOG.warning("Could not discover local IPv6 LAN addresses: %s", exc)
+        return (), ()
+
+    prefixes: set[ipaddress.IPv6Network] = set()
+    addresses: set[ipaddress.IPv6Address] = set()
+    for interface in interfaces:
+        name = str(interface.get("ifname", ""))
+        if name in {excluded_interface, "lo"}:
+            continue
+        for entry in interface.get("addr_info", ()):
+            if entry.get("family") != "inet6":
+                continue
+            try:
+                address = ipaddress.IPv6Address(entry["local"])
+                prefixlen = int(entry["prefixlen"])
+            except (KeyError, TypeError, ValueError, ipaddress.AddressValueError):
+                continue
+            if address.is_loopback or address.is_multicast or address.is_unspecified:
+                continue
+            addresses.add(address)
+            if prefixlen < 128:
+                prefixes.add(ipaddress.IPv6Network((address, prefixlen), strict=False))
+    return tuple(sorted(prefixes, key=lambda item: (int(item.network_address), item.prefixlen))), tuple(
+        sorted(addresses, key=int)
+    )
+
+
 class ExitNodeError(RuntimeError):
     """Raised when exit-node forwarding cannot be configured."""
+
+
+class HostIpv6Isolation:
+    """Block PeerNet access to this host's exact non-TUN IPv6 addresses."""
+
+    TABLE = ("inet", "tcppeer_input")
+
+    def __init__(self, interface: str):
+        if not _INTERFACE.fullmatch(interface):
+            raise ExitNodeError("invalid TUN interface name for nftables")
+        self.interface = interface
+
+    def apply(self, overlay_prefix: ipaddress.IPv6Network | None = None) -> None:
+        self.close()
+        _prefixes, addresses = _local_ipv6_lan(self.interface)
+        address_set = ", ".join(str(address) for address in addresses)
+        drop = ""
+        if address_set:
+            drop = (
+                f'    iifname "{self.interface}" ip6 daddr {{ {address_set} }} '
+                "counter drop\n"
+            )
+            if overlay_prefix is not None:
+                drop += (
+                    f"    ip6 saddr {overlay_prefix} ip6 daddr {{ {address_set} }} "
+                    "counter drop\n"
+                )
+        rules = f'''table inet tcppeer_input {{
+  chain input {{
+    type filter hook input priority filter; policy accept;
+{drop}  }}
+}}
+'''
+        try:
+            subprocess.run(
+                ("nft", "-f", "-"), input=rules, text=True,
+                check=True, capture_output=True,
+            )
+        except FileNotFoundError as exc:
+            raise ExitNodeError("nft is not installed") from exc
+        except subprocess.CalledProcessError as exc:
+            raise ExitNodeError(
+                f"nftables rejected the TCPeer host-isolation rules: {exc.stderr.strip()}"
+            ) from exc
+
+    def close(self) -> None:
+        family, table = self.TABLE
+        subprocess.run(
+            ("nft", "delete", "table", family, table),
+            capture_output=True, check=False,
+        )
 
 
 class ExitNodeFirewall:
@@ -147,41 +239,7 @@ class ExitNodeFirewall:
         self,
     ) -> tuple[tuple[ipaddress.IPv6Network, ...], tuple[ipaddress.IPv6Address, ...]]:
         """Return on-link LAN prefixes and this host's exact non-TUN IPv6 addresses."""
-        try:
-            result = subprocess.run(
-                ("ip", "-j", "-6", "address", "show", "up"),
-                check=True, capture_output=True, text=True,
-            )
-            interfaces = json.loads(result.stdout)
-        except (
-            FileNotFoundError, subprocess.CalledProcessError, json.JSONDecodeError,
-            TypeError, ValueError,
-        ) as exc:
-            LOG.warning("Could not discover local IPv6 LAN addresses: %s", exc)
-            return (), ()
-
-        prefixes: set[ipaddress.IPv6Network] = set()
-        addresses: set[ipaddress.IPv6Address] = set()
-        for interface in interfaces:
-            name = str(interface.get("ifname", ""))
-            if name in {self.interface, "lo"}:
-                continue
-            for entry in interface.get("addr_info", ()):
-                if entry.get("family") != "inet6":
-                    continue
-                try:
-                    address = ipaddress.IPv6Address(entry["local"])
-                    prefixlen = int(entry["prefixlen"])
-                except (KeyError, TypeError, ValueError, ipaddress.AddressValueError):
-                    continue
-                if address.is_loopback or address.is_multicast or address.is_unspecified:
-                    continue
-                addresses.add(address)
-                if prefixlen < 128:
-                    prefixes.add(ipaddress.IPv6Network((address, prefixlen), strict=False))
-        return tuple(sorted(prefixes, key=lambda item: (int(item.network_address), item.prefixlen))), tuple(
-            sorted(addresses, key=int)
-        )
+        return _local_ipv6_lan(self.interface)
 
     def _selected_ipv4_route(self) -> tuple[str, str] | None:
         """Return the default-route interface and source selected by Linux.
