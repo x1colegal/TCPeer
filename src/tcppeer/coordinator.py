@@ -302,6 +302,11 @@ class Coordinator:
             LOG.info("Peer %s renamed to %s", peer.peer_id, display_name)
         elif message.command in {"PING", "KEEPALIVE"}:
             await self.send(peer.writer, "PONG")
+        elif message.command == "PONG":
+            # PONG is the expected answer to the coordinator's own idle
+            # liveness probe.  Treating it as an unknown command made every
+            # healthy idle peer receive an ERROR after proving it was alive.
+            pass
         elif message.command == "PUNCH-READY":
             target_id = message.get("Peer-ID") or ""
             async with self._punch_lock:

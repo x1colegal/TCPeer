@@ -3,7 +3,8 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from tcppeer.config import CoordinatorConfig
-from tcppeer.coordinator import Coordinator
+from tcppeer.coordinator import Coordinator, RegisteredPeer
+from tcppeer.protocol import ControlMessage
 
 
 class CoordinatorLivenessTests(unittest.IsolatedAsyncioTestCase):
@@ -49,6 +50,24 @@ class CoordinatorLivenessTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(known.online)
         sent = b"".join(call.args[0] for call in writer.write.call_args_list)
         self.assertIn(b"TPCP/2 PING\r\n", sent)
+        coordinator.store.close()
+
+    async def test_pong_is_accepted_as_liveness_reply(self):
+        config = CoordinatorConfig(
+            listen_ipv4=None,
+            listen_ipv6=None,
+            port=7443,
+            networks={"home": "secret"},
+            state_db=self._state_path(),
+        )
+        coordinator = Coordinator(config)
+        writer = MagicMock()
+        writer.drain = AsyncMock()
+        peer = RegisteredPeer("home", "phone", writer, "2001:db8::10", 50000)
+
+        await coordinator.handle_message(peer, ControlMessage("PONG", {}))
+
+        writer.write.assert_not_called()
         coordinator.store.close()
 
     def _state_path(self):
