@@ -471,66 +471,77 @@ class TcpPeerVpnService : VpnService() {
         var peerPort: Int
         var direct: Socket
 
-        while (true) {
-            updateConnecting("Waiting for $targetPeerId to become ready.")
-            writeCoordinatorControl(controlOutput, ControlMessage("PUNCH-READY", mapOf(
-                "Peer-ID" to targetPeerId,
-            )))
-
-            val punch = awaitPunchGo(controlInput, controlOutput, targetPeerId)
-
-            family = when (punch.field("Family")) {
-                "IPv6" -> DirectFamily.IPV6
-                "IPv4" -> DirectFamily.IPV4
-                else -> throw ProtocolException("Coordinator returned an invalid direct family")
+        // Direct connect and endpoint discovery are blocking operations on
+        // older Android releases. Keep the already authenticated control
+        // session active while no coroutine is reading it, otherwise the
+        // coordinator expires the peer in the middle of simultaneous-open.
+        val preDirectControlLiveness = serviceScope.launch(Dispatchers.IO) {
+            while (true) {
+                delay(5_000)
+                writeCoordinatorControl(controlOutput, ControlMessage("PONG"))
             }
+        }
+        try {
+            while (true) {
+                updateConnecting("Waiting for $targetPeerId to become ready.")
+                writeCoordinatorControl(controlOutput, ControlMessage("PUNCH-READY", mapOf(
+                    "Peer-ID" to targetPeerId,
+                )))
 
-            address = InetAddress.getByName(
-                punch.field("Address")
-                    ?: throw ProtocolException("PUNCH-GO has no address")
-            )
+                val punch = awaitPunchGo(controlInput, controlOutput, targetPeerId)
 
-            if (family == DirectFamily.IPV6 && address !is Inet6Address)
-                throw ProtocolException("TCP6 requires an IPv6 endpoint")
+                family = when (punch.field("Family")) {
+                    "IPv6" -> DirectFamily.IPV6
+                    "IPv4" -> DirectFamily.IPV4
+                    else -> throw ProtocolException("Coordinator returned an invalid direct family")
+                }
 
-            if (family == DirectFamily.IPV4 && address !is Inet4Address)
-                throw ProtocolException("TCP4 requires an IPv4 endpoint")
+                address = InetAddress.getByName(
+                    punch.field("Address")
+                        ?: throw ProtocolException("PUNCH-GO has no address")
+                )
 
-            if (
-                family == DirectFamily.IPV4 &&
-                localIpv6.isNotEmpty() &&
-                TransportPolicy.isUsableIpv6(address)
-            ) {
-                throw ProtocolException("TCP4 is forbidden when both peers have usable IPv6")
-            }
+                if (family == DirectFamily.IPV6 && address !is Inet6Address)
+                    throw ProtocolException("TCP6 requires an IPv6 endpoint")
+
+                if (family == DirectFamily.IPV4 && address !is Inet4Address)
+                    throw ProtocolException("TCP4 requires an IPv4 endpoint")
+
+                if (
+                    family == DirectFamily.IPV4 &&
+                    localIpv6.isNotEmpty() &&
+                    TransportPolicy.isUsableIpv6(address)
+                ) {
+                    throw ProtocolException("TCP4 is forbidden when both peers have usable IPv6")
+                }
 
             // Be reachable for the other half of the coordinated punch.  A
             // directly addressed peer (LAN or GUA) can then adopt the inbound
             // socket instead of rejecting it while Android only dials out.
-            prepareDirectListener(config.directPort, family)
+                prepareDirectListener(config.directPort, family)
 
-            val startMillis = punch.field("Start-Ms")?.toLongOrNull() ?: 0L
-            val waitMillis = startMillis - System.currentTimeMillis()
-            if (waitMillis > 0)
-                kotlinx.coroutines.delay(waitMillis)
+                val startMillis = punch.field("Start-Ms")?.toLongOrNull() ?: 0L
+                val waitMillis = startMillis - System.currentTimeMillis()
+                if (waitMillis > 0)
+                    kotlinx.coroutines.delay(waitMillis)
 
-            peerPort = punch.field("Port")?.toIntOrNull()
-                ?: throw ProtocolException("PUNCH-GO has no valid port")
+                peerPort = punch.field("Port")?.toIntOrNull()
+                    ?: throw ProtocolException("PUNCH-GO has no valid port")
 
-            updateConnecting(
-                "Opening a direct ${family.name.replace("IPV", "TCP")} connection."
-            )
-
-            try {
-                direct = publishDirectSocket(
-                    generation,
-                    openDirect(address, peerPort, config.directPort, family),
+                updateConnecting(
+                    "Opening a direct ${family.name.replace("IPV", "TCP")} connection."
                 )
 
-                break
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: Exception) {
+                try {
+                    direct = publishDirectSocket(
+                        generation,
+                        openDirect(address, peerPort, config.directPort, family),
+                    )
+
+                    break
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
                 updateConnecting(
                     "Attempt to direct connection timed out; retrying"
                 )
@@ -557,8 +568,11 @@ class TcpPeerVpnService : VpnService() {
                         "IPv4=${endpointIpv4?.address}:${endpointIpv4?.port} " +
                         "IPv6=${endpointIpv6?.address}:${endpointIpv6?.port}",
                 )
-                kotlinx.coroutines.delay(1_000)
+                    kotlinx.coroutines.delay(1_000)
+                }
             }
+        } finally {
+            preDirectControlLiveness.cancel()
         }
         val directInput = direct.getInputStream()
         val directOutput = direct.getOutputStream()
@@ -1371,30 +1385,11 @@ class TcpPeerVpnService : VpnService() {
 
     private suspend fun openDirect(address: InetAddress, port: Int, localPort: Int, family: DirectFamily): Socket =
         withContext(Dispatchers.IO) {
-            try {
-                Log.i(
-                    TAG,
-                    "Direct passive window started peer_id=primary family=${familyLabel(family)} " +
-                        "initiated=false local_port=$localPort remote=${formatEndpoint(address, port)}",
-                )
-                return@withContext acceptPassiveDirect(family).also {
-                    Log.i(
-                        TAG,
-                        "Direct passive winner peer_id=primary family=${familyLabel(family)} " +
-                            "socket=${socketToken(it)} initiated=false local=${it.localSocketAddress} " +
-                            "remote=${it.remoteSocketAddress}",
-                    )
-                }
-            } catch (_: SocketTimeoutException) {
-                Log.i(
-                    TAG,
-                    "Direct passive window expired peer_id=primary family=${familyLabel(family)} " +
-                        "reason=no-inbound-syn",
-                )
-            }
-            synchronized(directListeners) {
-                directListeners.remove(family)?.let(::closeQuietly)
-            }
+            // Both NATed peers must emit their SYN at the coordinator's shared
+            // start time. Waiting in accept() first delayed this side by one
+            // second, so the two endpoints were not actually simultaneous on
+            // older kernels/NAPT implementations.
+            closeDirectListener(family)
             openActiveDirect(address, port, localPort, family)
         }
 

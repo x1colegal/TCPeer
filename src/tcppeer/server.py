@@ -752,17 +752,14 @@ class Server:
             raise
         except DirectConnectionError:
             self.store.update_peer(peer_id, transport="No Direct Connection")
-            # A full retry window can leave the coordinator advertising a
-            # stale NAPT mapping. Reconnect only the control plane so endpoint
-            # discovery and REGISTER run again without restarting the TUN or
-            # established direct sessions.
-            coordinator = self._coordinator_writer
-            if coordinator is not None and not coordinator.is_closing():
-                LOG.warning(
-                    "direct-connect exhausted peer_id=%s; refreshing coordinator endpoint registration",
-                    peer_id,
-                )
-                coordinator.close()
+            # A failed path to one peer must not tear down the shared control
+            # plane. Closing it here cancelled coordination for every other
+            # peer and caused the failed peer's new control session to replace
+            # an otherwise valid in-flight simultaneous-open attempt.
+            LOG.warning(
+                "direct-connect exhausted peer_id=%s; keeping coordinator control session",
+                peer_id,
+            )
             raise
         finally:
             # A connector can be cancelled after connect() succeeds but before
