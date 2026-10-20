@@ -47,7 +47,9 @@ class RawIpEncodingTests(unittest.TestCase):
             output = type("Writer", (), {
                 "data": bytearray(),
                 "write": lambda self, value: self.data.extend(value),
-                "drain": lambda self: asyncio.sleep(0),
+                "drain": lambda self: (_ for _ in ()).throw(
+                    AssertionError("the socket reader must not wait for write backpressure")
+                ),
             })()
             received = []
             parsed = await read_data(

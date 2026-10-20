@@ -880,26 +880,34 @@ class TcpPeerVpnService : VpnService() {
             socket.soTimeout = 0
             if (!adoptMeshSocket(peerId, socket, output, peerOutputs, initiated = true)) return
             val lastRx = AtomicLong(System.nanoTime())
-            val keepalive = serviceScope.launch(Dispatchers.IO) {
+            val liveness = serviceScope.launch(Dispatchers.IO) {
                 while (true) {
-                    delay(15_000)
+                    delay(1_000)
                     if (System.nanoTime() - lastRx.get() >= 45_000_000_000L) {
                         Log.w(TAG, "Mesh data-plane TPCP keepalive timeout peer_id=$peerId")
                         closeQuietly(socket)
                         return@launch
                     }
+                }
+            }
+            val keepalive = serviceScope.launch(Dispatchers.IO) {
+                while (true) {
+                    delay(15_000)
                     synchronized(output) { TcpPeerProtocol.writeDataPlaneControl(output, "KEEPALIVE") }
                 }
             }
             try {
                 while (true) {
                     val packet = TcpPeerProtocol.readData(
-                        input, output, { lastRx.set(System.nanoTime()) },
-                    ) { command, identifier, _ -> handleTppControl(peerId, command, identifier) }
+                        input, null, { lastRx.set(System.nanoTime()) },
+                    ) { command, identifier, timestamp ->
+                        handleTppControl(peerId, command, identifier, timestamp, output)
+                    }
                     commitMeshSocket(peerId, socket)
                     processInboundPacket(packet, peerId, overlayIpv6, output, tunPackets)
                 }
             } finally {
+                liveness.cancel()
                 keepalive.cancel()
                 peerOutputs.remove(peerId, output)
                 if (meshSockets.remove(peerId, socket)) {
@@ -984,26 +992,34 @@ class TcpPeerVpnService : VpnService() {
             socket.soTimeout = 0
             if (!adoptMeshSocket(peerId, socket, output, peerOutputs, initiated = false)) return
             val lastRx = AtomicLong(System.nanoTime())
-            val keepalive = serviceScope.launch(Dispatchers.IO) {
+            val liveness = serviceScope.launch(Dispatchers.IO) {
                 while (true) {
-                    delay(15_000)
+                    delay(1_000)
                     if (System.nanoTime() - lastRx.get() >= 45_000_000_000L) {
                         Log.w(TAG, "Accepted mesh data-plane TPCP keepalive timeout peer_id=$peerId")
                         closeQuietly(socket)
                         return@launch
                     }
+                }
+            }
+            val keepalive = serviceScope.launch(Dispatchers.IO) {
+                while (true) {
+                    delay(15_000)
                     synchronized(output) { TcpPeerProtocol.writeDataPlaneControl(output, "KEEPALIVE") }
                 }
             }
             try {
                 while (true) {
                     val packet = TcpPeerProtocol.readData(
-                        input, output, { lastRx.set(System.nanoTime()) },
-                    ) { command, identifier, _ -> handleTppControl(peerId, command, identifier) }
+                        input, null, { lastRx.set(System.nanoTime()) },
+                    ) { command, identifier, timestamp ->
+                        handleTppControl(peerId, command, identifier, timestamp, output)
+                    }
                     commitMeshSocket(peerId, socket)
                     processInboundPacket(packet, peerId, overlayIpv6, output, tunPackets)
                 }
             } finally {
+                liveness.cancel()
                 keepalive.cancel()
             }
         } catch (error: Exception) {
@@ -1120,7 +1136,26 @@ class TcpPeerVpnService : VpnService() {
         return 0
     }
 
-    private fun handleTppControl(peerId: String, command: String, identifier: Long) {
+    private fun handleTppControl(
+        peerId: String,
+        command: String,
+        identifier: Long,
+        timestamp: Long = 0,
+        output: java.io.OutputStream? = null,
+    ) {
+        if (command == "TPP-PING" && output != null) {
+            // Never make the socket reader wait behind a blocked bulk-data
+            // flush. The independent liveness watchdog can still close the
+            // socket if this queued reply cannot be written.
+            serviceScope.launch(Dispatchers.IO) {
+                synchronized(output) {
+                    TcpPeerProtocol.writeTppControl(
+                        output, "TPP-PONG", identifier, timestamp,
+                    )
+                }
+            }
+            return
+        }
         if (command != "TPP-PONG") return
         pendingTppPings.remove(identifier)?.let { (pingPeerId, sentAt) ->
             val latencyMillis = (System.nanoTime() - sentAt) / 1_000_000.0
@@ -1749,14 +1784,19 @@ class TcpPeerVpnService : VpnService() {
                 }
             }
         }
-        val dataPlaneKeepalive = launch(Dispatchers.IO) {
+        val dataPlaneLiveness = launch(Dispatchers.IO) {
             while (true) {
-                delay(15_000)
+                delay(1_000)
                 if (System.nanoTime() - lastDataPlaneRx.get() >= 45_000_000_000L) {
                     Log.w(TAG, "Primary data-plane TPCP keepalive timeout; closing direct stream")
                     closeQuietly(directInput)
                     return@launch
                 }
+            }
+        }
+        val dataPlaneKeepalive = launch(Dispatchers.IO) {
+            while (true) {
+                delay(15_000)
                 synchronized(directOutput) {
                     TcpPeerProtocol.writeDataPlaneControl(directOutput, "KEEPALIVE")
                 }
@@ -1770,10 +1810,12 @@ class TcpPeerVpnService : VpnService() {
                 val packetLength = TcpPeerProtocol.readDataInto(
                     directInput,
                     packet,
-                    directOutput,
+                    null,
                     { lastDataPlaneRx.set(System.nanoTime()) },
-                ) { command, identifier, _ ->
-                    handleTppControl(primaryPeerId, command, identifier)
+                ) { command, identifier, timestamp ->
+                    handleTppControl(
+                        primaryPeerId, command, identifier, timestamp, directOutput,
+                    )
                 }
                 byteBatch += packetLength
                 packetBatch++
@@ -1805,6 +1847,7 @@ class TcpPeerVpnService : VpnService() {
             tunToPeer.cancel()
             peerToTun.cancel()
             pingRequests.cancel()
+            dataPlaneLiveness.cancel()
             dataPlaneKeepalive.cancel()
             statistics.cancel()
             outputFlusher.cancel()

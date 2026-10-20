@@ -908,16 +908,21 @@ class Server:
             if future is not None and not future.done():
                 future.set_result(timestamp_ns)
 
-        async def data_plane_keepalive() -> None:
+        async def data_plane_liveness() -> None:
             while True:
-                await asyncio.sleep(15)
+                await asyncio.sleep(1)
                 if time.monotonic() - last_data_plane_rx >= 45:
                     LOG.warning("data-plane liveness timeout peer_id=%s; closing direct stream", peer_id)
                     writer.close()
                     return
+
+        async def data_plane_keepalive() -> None:
+            while True:
+                await asyncio.sleep(15)
                 writer.write(encode_data_plane_control("KEEPALIVE"))
                 await writer.drain()
 
+        liveness_task = asyncio.create_task(data_plane_liveness())
         keepalive_task = asyncio.create_task(data_plane_keepalive())
         with self.store.connection:
             self.store.connection.execute(
@@ -973,8 +978,9 @@ class Server:
                 return
             raise
         finally:
+            liveness_task.cancel()
             keepalive_task.cancel()
-            await asyncio.gather(keepalive_task, return_exceptions=True)
+            await asyncio.gather(liveness_task, keepalive_task, return_exceptions=True)
             released_owner = False
             if (
                 self.direct_writers.get(peer_id) is writer

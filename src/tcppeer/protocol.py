@@ -752,7 +752,6 @@ async def read_data(reader, writer=None, activity=None, tpp=None) -> bytes:
             if message == encode_data_plane_control("KEEPALIVE"):
                 if writer is not None:
                     writer.write(encode_data_plane_control("PONG"))
-                    await writer.drain()
                 if activity is not None:
                     activity()
                 continue
@@ -765,7 +764,6 @@ async def read_data(reader, writer=None, activity=None, tpp=None) -> bytes:
                 identifier, timestamp_ns = parse_tpp_control(control)
                 if control.command == "TPP-PING" and writer is not None:
                     writer.write(encode_tpp_control("TPP-PONG", identifier, timestamp_ns))
-                    await writer.drain()
                 if tpp is not None:
                     result = tpp(control.command, identifier, timestamp_ns)
                     if hasattr(result, "__await__"):
