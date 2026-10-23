@@ -515,11 +515,6 @@ class TcpPeerVpnService : VpnService() {
                     throw ProtocolException("TCP4 is forbidden when both peers have usable IPv6")
                 }
 
-            // Be reachable for the other half of the coordinated punch.  A
-            // directly addressed peer (LAN or GUA) can then adopt the inbound
-            // socket instead of rejecting it while Android only dials out.
-                prepareDirectListener(config.directPort, family)
-
                 val startMillis = punch.field("Start-Ms")?.toLongOrNull() ?: 0L
                 val waitMillis = startMillis - System.currentTimeMillis()
                 if (waitMillis > 0)
@@ -1385,10 +1380,12 @@ class TcpPeerVpnService : VpnService() {
 
     private suspend fun openDirect(address: InetAddress, port: Int, localPort: Int, family: DirectFamily): Socket =
         withContext(Dispatchers.IO) {
-            // Both NATed peers must emit their SYN at the coordinator's shared
-            // start time. Waiting in accept() first delayed this side by one
-            // second, so the two endpoints were not actually simultaneous on
-            // older kernels/NAPT implementations.
+            // Both peers must emit their SYN from :7444 at the coordinator's
+            // shared start time. A primary listener here races with the active
+            // socket: the remote SYN can enter its accept queue immediately
+            // before the listener is closed, which resets the winning stream
+            // before PEER-INFO. Primary setup is therefore active-active only;
+            // the passive listener is prepared later for established mesh.
             closeDirectListener(family)
             openActiveDirect(address, port, localPort, family)
         }
