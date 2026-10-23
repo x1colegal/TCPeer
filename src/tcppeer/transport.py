@@ -75,7 +75,12 @@ class DirectConnector:
 
     @staticmethod
     def _retry_without_prebound(exc: Exception) -> bool:
-        return isinstance(exc, OSError) and exc.errno == errno.EADDRNOTAVAIL
+        # A reserved candidate is only the first SYN attempt.  In a real TCP
+        # simultaneous-open the other peer may not have entered SYN-SENT yet,
+        # so a NAT or host can reject that first SYN.  Discard the failed
+        # candidate and keep retrying from the same local port with fresh
+        # sockets during the existing retry window.
+        return isinstance(exc, (OSError, asyncio.TimeoutError))
 
     async def connect(
         self,
@@ -223,11 +228,12 @@ class DirectConnector:
                         # optimization; discard it and continue the same retry
                         # window with a freshly bound socket.
                         LOG.info(
-                            "direct-connect retry-fresh-socket ts=%.6f peer_id=%s family=%s attempt=%s reason=prebound-eaddrnotavail",
+                            "direct-connect retry-fresh-socket ts=%.6f peer_id=%s family=%s attempt=%s reason=prebound-connect-failed error=%s",
                             loop.time(),
                             peer_id,
                             "tcp6" if required_family == socket.AF_INET6 else "tcp4",
                             attempt,
+                            exc,
                         )
                         prebound_socket = None
                         await asyncio.sleep(0.1)

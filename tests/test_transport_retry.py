@@ -9,7 +9,7 @@ def test_prebound_eaddrnotavail_is_retryable() -> None:
     assert DirectConnector._retry_without_prebound(error)
 
 
-def test_unrelated_prebound_error_remains_terminal() -> None:
-    error = OSError(errno.ENETUNREACH, "Network is unreachable")
+def test_prebound_connection_refused_is_retryable() -> None:
+    error = OSError(errno.ECONNREFUSED, "Connection refused")
 
-    assert not DirectConnector._retry_without_prebound(error)
+    assert DirectConnector._retry_without_prebound(error)

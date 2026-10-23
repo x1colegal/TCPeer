@@ -41,6 +41,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
@@ -1390,20 +1391,26 @@ class TcpPeerVpnService : VpnService() {
             openActiveDirect(address, port, localPort, family)
         }
 
-    private fun openActiveDirect(address: InetAddress, port: Int, localPort: Int, family: DirectFamily): Socket {
+    private suspend fun openActiveDirect(address: InetAddress, port: Int, localPort: Int, family: DirectFamily): Socket {
         return openActiveDirect(address, port, localPort, family, "primary")
     }
 
-    private fun openActiveDirect(
+    private suspend fun openActiveDirect(
         address: InetAddress,
         port: Int,
         localPort: Int,
         family: DirectFamily,
         peerId: String,
     ): Socket {
-        val socket = Socket()
-        inFlightSockets.add(socket)
-        try {
+        val deadline = android.os.SystemClock.elapsedRealtime() + 12_000L
+        var attempt = 0
+        var lastError: Exception? = null
+        while (android.os.SystemClock.elapsedRealtime() < deadline) {
+            currentCoroutineContext().ensureActive()
+            attempt += 1
+            val socket = Socket()
+            inFlightSockets.add(socket)
+            try {
             socket.reuseAddress = true
             underlyingNetwork?.bindSocket(socket)
             val wildcard = if (family == DirectFamily.IPV6) InetAddress.getByName("::") else InetAddress.getByName("0.0.0.0")
@@ -1420,30 +1427,37 @@ class TcpPeerVpnService : VpnService() {
             if (!protect(socket)) throw IllegalStateException("Cannot protect the direct socket from the VPN")
             socket.sendBufferSize = DIRECT_SOCKET_BUFFER_BYTES
             socket.receiveBufferSize = DIRECT_SOCKET_BUFFER_BYTES
-            socket.connect(InetSocketAddress(address, port), 12_000)
+            val remaining = (deadline - android.os.SystemClock.elapsedRealtime()).coerceAtLeast(1L)
+            socket.connect(InetSocketAddress(address, port), minOf(1_000L, remaining).toInt())
             socket.tcpNoDelay = false
             socket.soTimeout = 15_000
             inFlightSockets.remove(socket)
             Log.i(
                 TAG,
                 "Direct connect succeeded peer_id=$peerId family=${familyLabel(family)} " +
-                    "socket=${socketToken(socket)} initiated=true local=${socket.localSocketAddress} " +
+                    "attempt=$attempt socket=${socketToken(socket)} initiated=true local=${socket.localSocketAddress} " +
                     "remote=${socket.remoteSocketAddress}",
             )
             return socket
-        } catch (error: Exception) {
-            Log.w(
-                TAG,
-                "Direct connect failed peer_id=$peerId family=${familyLabel(family)} " +
-                    "socket=${socketToken(socket)} initiated=true local=${socket.localSocketAddress} " +
-                    "remote=${formatEndpoint(address, port)} reason=${error.message}",
-                error,
-            )
+        } catch (error: CancellationException) {
             inFlightSockets.remove(socket)
             socket.close()
-            val label = if (family == DirectFamily.IPV6) "TCP6" else "TCP4"
-            throw IllegalStateException("$label direct connection failed; no fallback is allowed", error)
+            throw error
+        } catch (error: Exception) {
+                lastError = error
+                Log.w(
+                    TAG,
+                    "Direct connect failed peer_id=$peerId family=${familyLabel(family)} " +
+                        "attempt=$attempt socket=${socketToken(socket)} initiated=true local=${socket.localSocketAddress} " +
+                        "remote=${formatEndpoint(address, port)} reason=${error.message}",
+                )
+                inFlightSockets.remove(socket)
+                socket.close()
+                if (android.os.SystemClock.elapsedRealtime() < deadline) delay(100)
+            }
         }
+        val label = if (family == DirectFamily.IPV6) "TCP6" else "TCP4"
+        throw IllegalStateException("$label direct connection failed after retry window; no fallback is allowed", lastError)
     }
 
     private fun acceptPassiveDirect(family: DirectFamily): Socket {
