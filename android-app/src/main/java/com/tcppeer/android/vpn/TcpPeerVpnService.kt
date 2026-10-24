@@ -48,6 +48,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.selects.select
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.Closeable
 import java.io.BufferedInputStream
@@ -112,6 +114,7 @@ class TcpPeerVpnService : VpnService() {
     private val connectionGeneration = AtomicLong(0)
     private val pendingTppPings = ConcurrentHashMap<Long, Pair<String, Long>>()
     private val directListeners = mutableMapOf<DirectFamily, ServerSocket>()
+    private val directPunchMutex = Mutex()
     private var tunnel: ParcelFileDescriptor? = null
     private var tunnelInput: FileInputStream? = null
     private var tunnelOutput: FileOutputStream? = null
@@ -516,8 +519,9 @@ class TcpPeerVpnService : VpnService() {
                     throw ProtocolException("TCP4 is forbidden when both peers have usable IPv6")
                 }
 
+                val startAfterMillis = punch.field("Start-After-Ms")?.toLongOrNull()
                 val startMillis = punch.field("Start-Ms")?.toLongOrNull() ?: 0L
-                val waitMillis = startMillis - System.currentTimeMillis()
+                val waitMillis = startAfterMillis ?: (startMillis - System.currentTimeMillis())
                 if (waitMillis > 0)
                     kotlinx.coroutines.delay(waitMillis)
 
@@ -531,7 +535,13 @@ class TcpPeerVpnService : VpnService() {
                 try {
                     direct = publishDirectSocket(
                         generation,
-                        openDirect(address, peerPort, config.directPort, family),
+                        openDirect(
+                            address,
+                            peerPort,
+                            config.directPort,
+                            family,
+                            bindToUnderlying = punch.field("Path") != "Local",
+                        ),
                     )
 
                     break
@@ -853,24 +863,31 @@ class TcpPeerVpnService : VpnService() {
         val address = InetAddress.getByName(punch.field("Address") ?: return)
         val port = punch.field("Port")?.toIntOrNull() ?: return
         val traversal = "Simultaneous-Open"
-        val waitMillis = (punch.field("Start-Ms")?.toLongOrNull() ?: 0L) - System.currentTimeMillis()
+        val bindToUnderlying = punch.field("Path") != "Local"
+        val startAfterMillis = punch.field("Start-After-Ms")?.toLongOrNull()
+        val waitMillis = startAfterMillis
+            ?: ((punch.field("Start-Ms")?.toLongOrNull() ?: 0L) - System.currentTimeMillis())
         if (waitMillis > 0) delay(waitMillis)
         val activeLocalPort = config.directPort
-        closeDirectListener(family)
-        Log.i(
-            TAG,
-            "Mesh attempt peer_id=$peerId family=${familyLabel(family)} traversal=$traversal " +
-                "initiated=true local_port=$activeLocalPort remote=${formatEndpoint(address, port)}",
-        )
         val socket = try {
-            openActiveDirect(address, port, activeLocalPort, family, peerId)
+            directPunchMutex.withLock {
+                closeDirectListener(family)
+                Log.i(
+                    TAG,
+                    "Mesh attempt peer_id=$peerId family=${familyLabel(family)} traversal=$traversal " +
+                        "initiated=true local_port=$activeLocalPort remote=${formatEndpoint(address, port)}",
+                )
+                try {
+                    openActiveDirect(address, port, activeLocalPort, family, peerId, bindToUnderlying)
+                } finally {
+                    prepareDirectListener(config.directPort, family)
+                }
+            }
         } catch (error: Exception) {
             Log.w(TAG, "Direct mesh connection to $peerId failed", error)
             meshConnecting.remove(peerId)
-            prepareDirectListener(config.directPort, family)
             return
         }
-        prepareDirectListener(config.directPort, family)
         try {
             val input = BufferedInputStream(socket.getInputStream(), DIRECT_STREAM_BUFFER_BYTES)
             val output = socket.getOutputStream()
@@ -894,9 +911,21 @@ class TcpPeerVpnService : VpnService() {
                 while (true) {
                     delay(1_000)
                     if (System.nanoTime() - lastRx.get() >= 45_000_000_000L) {
-                        Log.w(TAG, "Mesh data-plane TPCP keepalive timeout peer_id=$peerId")
-                        closeQuietly(socket)
-                        return@launch
+                        val beforeProbe = lastRx.get()
+                        Log.w(TAG, "Mesh data-plane idle peer_id=$peerId; sending final liveness probe")
+                        try {
+                            synchronized(output) { TcpPeerProtocol.writeDataPlaneControl(output, "KEEPALIVE") }
+                        } catch (error: Exception) {
+                            Log.w(TAG, "Mesh final liveness probe failed peer_id=$peerId", error)
+                            closeQuietly(socket)
+                            return@launch
+                        }
+                        delay(10_000)
+                        if (lastRx.get() <= beforeProbe) {
+                            Log.w(TAG, "Mesh data-plane TPCP keepalive timeout peer_id=$peerId after final probe")
+                            closeQuietly(socket)
+                            return@launch
+                        }
                     }
                 }
             }
@@ -1006,9 +1035,21 @@ class TcpPeerVpnService : VpnService() {
                 while (true) {
                     delay(1_000)
                     if (System.nanoTime() - lastRx.get() >= 45_000_000_000L) {
-                        Log.w(TAG, "Accepted mesh data-plane TPCP keepalive timeout peer_id=$peerId")
-                        closeQuietly(socket)
-                        return@launch
+                        val beforeProbe = lastRx.get()
+                        Log.w(TAG, "Accepted mesh data-plane idle peer_id=$peerId; sending final liveness probe")
+                        try {
+                            synchronized(output) { TcpPeerProtocol.writeDataPlaneControl(output, "KEEPALIVE") }
+                        } catch (error: Exception) {
+                            Log.w(TAG, "Accepted mesh final liveness probe failed peer_id=$peerId", error)
+                            closeQuietly(socket)
+                            return@launch
+                        }
+                        delay(10_000)
+                        if (lastRx.get() <= beforeProbe) {
+                            Log.w(TAG, "Accepted mesh data-plane TPCP keepalive timeout peer_id=$peerId after final probe")
+                            closeQuietly(socket)
+                            return@launch
+                        }
                     }
                 }
             }
@@ -1379,21 +1420,25 @@ class TcpPeerVpnService : VpnService() {
         return null
     }
 
-    private suspend fun openDirect(address: InetAddress, port: Int, localPort: Int, family: DirectFamily): Socket =
+    private suspend fun openDirect(
+        address: InetAddress,
+        port: Int,
+        localPort: Int,
+        family: DirectFamily,
+        bindToUnderlying: Boolean,
+    ): Socket =
         withContext(Dispatchers.IO) {
-            // Both peers must emit their SYN from :7444 at the coordinator's
-            // shared start time. A primary listener here races with the active
-            // socket: the remote SYN can enter its accept queue immediately
-            // before the listener is closed, which resets the winning stream
-            // before PEER-INFO. Primary setup is therefore active-active only;
-            // the passive listener is prepared later for established mesh.
-            closeDirectListener(family)
-            openActiveDirect(address, port, localPort, family)
+            directPunchMutex.withLock {
+                // Both peers must emit their SYN from :7444 at the coordinator's
+                // shared start time. A primary listener here races with the active
+                // socket: the remote SYN can enter its accept queue immediately
+                // before the listener is closed, which resets the winning stream
+                // before PEER-INFO. Primary setup is therefore active-active only;
+                // the passive listener is prepared later for established mesh.
+                closeDirectListener(family)
+                openActiveDirect(address, port, localPort, family, "primary", bindToUnderlying)
+            }
         }
-
-    private suspend fun openActiveDirect(address: InetAddress, port: Int, localPort: Int, family: DirectFamily): Socket {
-        return openActiveDirect(address, port, localPort, family, "primary")
-    }
 
     private suspend fun openActiveDirect(
         address: InetAddress,
@@ -1401,6 +1446,7 @@ class TcpPeerVpnService : VpnService() {
         localPort: Int,
         family: DirectFamily,
         peerId: String,
+        bindToUnderlying: Boolean,
     ): Socket {
         val deadline = android.os.SystemClock.elapsedRealtime() + 12_000L
         var attempt = 0
@@ -1412,7 +1458,7 @@ class TcpPeerVpnService : VpnService() {
             inFlightSockets.add(socket)
             try {
             socket.reuseAddress = true
-            underlyingNetwork?.bindSocket(socket)
+            if (bindToUnderlying) underlyingNetwork?.bindSocket(socket)
             val wildcard = if (family == DirectFamily.IPV6) InetAddress.getByName("::") else InetAddress.getByName("0.0.0.0")
             // TCP simultaneous-open requires the same local endpoint that was
             // used for public mapping discovery. An ephemeral source port makes
@@ -1428,7 +1474,10 @@ class TcpPeerVpnService : VpnService() {
             socket.sendBufferSize = DIRECT_SOCKET_BUFFER_BYTES
             socket.receiveBufferSize = DIRECT_SOCKET_BUFFER_BYTES
             val remaining = (deadline - android.os.SystemClock.elapsedRealtime()).coerceAtLeast(1L)
-            socket.connect(InetSocketAddress(address, port), minOf(1_000L, remaining).toInt())
+            // Keep the same four-tuple alive long enough for the peer's SYN to
+            // cross this socket. Replacing it every second made simultaneous
+            // open intermittent when control delivery or scheduling differed.
+            socket.connect(InetSocketAddress(address, port), minOf(4_000L, remaining).toInt())
             socket.tcpNoDelay = false
             socket.soTimeout = 15_000
             inFlightSockets.remove(socket)
@@ -1794,9 +1843,23 @@ class TcpPeerVpnService : VpnService() {
             while (true) {
                 delay(1_000)
                 if (System.nanoTime() - lastDataPlaneRx.get() >= 45_000_000_000L) {
-                    Log.w(TAG, "Primary data-plane TPCP keepalive timeout; closing direct stream")
-                    closeQuietly(directInput)
-                    return@launch
+                    val beforeProbe = lastDataPlaneRx.get()
+                    Log.w(TAG, "Primary data-plane idle; sending final liveness probe")
+                    try {
+                        synchronized(directOutput) {
+                            TcpPeerProtocol.writeDataPlaneControl(directOutput, "KEEPALIVE")
+                        }
+                    } catch (error: Exception) {
+                        Log.w(TAG, "Primary final liveness probe failed; closing direct stream", error)
+                        closeQuietly(directInput)
+                        return@launch
+                    }
+                    delay(10_000)
+                    if (lastDataPlaneRx.get() <= beforeProbe) {
+                        Log.w(TAG, "Primary data-plane TPCP keepalive timeout after final probe; closing direct stream")
+                        closeQuietly(directInput)
+                        return@launch
+                    }
                 }
             }
         }

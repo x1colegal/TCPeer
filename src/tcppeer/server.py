@@ -687,8 +687,9 @@ class Server:
         remote = Endpoint(message.get("Address") or "", int(message.get("Port") or 0), family)
         self._prepare_remote_route(remote.address, family)
         local = Endpoint(local_address, self.config.direct_port, family)
+        start_after_ms = int(message.get("Start-After-Ms") or 0)
         start_ms = int(message.get("Start-Ms") or 0)
-        delay = start_ms / 1000 - time.time()
+        delay = start_after_ms / 1000 if start_after_ms else start_ms / 1000 - time.time()
         if delay > 0:
             await asyncio.sleep(delay)
         peer_id = message.get("Peer-ID") or "unknown"
@@ -909,9 +910,31 @@ class Server:
             while True:
                 await asyncio.sleep(1)
                 if time.monotonic() - last_data_plane_rx >= 45:
-                    LOG.warning("data-plane liveness timeout peer_id=%s; closing direct stream", peer_id)
-                    writer.close()
-                    return
+                    probe_started_after = last_data_plane_rx
+                    LOG.warning(
+                        "data-plane idle peer_id=%s; sending final liveness probe",
+                        peer_id,
+                    )
+                    try:
+                        writer.write(encode_data_plane_control("KEEPALIVE"))
+                        await writer.drain()
+                    except (ConnectionError, OSError) as exc:
+                        LOG.warning(
+                            "data-plane final liveness probe failed peer_id=%s reason=%s; closing direct stream",
+                            peer_id,
+                            exc,
+                        )
+                        writer.close()
+                        return
+                    await asyncio.sleep(10)
+                    if last_data_plane_rx <= probe_started_after:
+                        LOG.warning(
+                            "data-plane liveness timeout after final probe peer_id=%s; closing direct stream",
+                            peer_id,
+                        )
+                        writer.close()
+                        return
+                    LOG.info("data-plane liveness recovered peer_id=%s", peer_id)
 
         async def data_plane_keepalive() -> None:
             while True:

@@ -85,6 +85,13 @@ class Coordinator:
         self._active_direct_sessions: dict[
             tuple[str, str, str], tuple[float, float]
         ] = {}
+        self._last_local_punch: dict[
+            tuple[str, str, str], tuple[tuple[float, float], float]
+        ] = {}
+        self._punch_busy_until: dict[tuple[str, str], float] = {}
+        self._deferred_punch_tasks: dict[
+            tuple[str, str, str], asyncio.Task[None]
+        ] = {}
 
     async def start(self) -> None:
         await self._start_admin_listener()
@@ -473,6 +480,25 @@ class Coordinator:
                 left.peer_id, right.peer_id,
             )
             return
+        now = time.monotonic()
+        left_key = (left.network, left.peer_id)
+        right_key = (right.network, right.peer_id)
+        left_busy = self._punch_busy_until.get(left_key, 0.0)
+        right_busy = self._punch_busy_until.get(right_key, 0.0)
+        if left_busy > now or right_busy > now:
+            LOG.info(
+                "Deferring punch between %s and %s because a peer is in another simultaneous-open window",
+                left.peer_id, right.peer_id,
+            )
+            task = self._deferred_punch_tasks.get(pair)
+            if task is None or task.done():
+                delay = max(left_busy, right_busy) - now + 0.05
+                self._deferred_punch_tasks[pair] = asyncio.create_task(
+                    self._retry_deferred_punch(
+                        pair, sessions, max(0.05, delay),
+                    )
+                )
+            return
         same_public_origin = left.observed_address == right.observed_address
         # A shared GUA /64 is globally unambiguous even when the two control
         # sockets reached the coordinator through different address families.
@@ -507,9 +533,17 @@ class Coordinator:
             right_port = right.mapped_ipv4_port or (right.observed_port if right_observed_version == 4 else right.listen_port)
         local_left = left.local_ipv6 if both_ipv6 else left.local_ipv4
         local_right = right.local_ipv6 if both_ipv6 else right.local_ipv4
-        if self._can_use_local_candidates(
+        local_candidates_available = self._can_use_local_candidates(
             local_left, local_right, 6 if both_ipv6 else 4, same_public_origin,
-        ):
+        )
+        previous_local = self._last_local_punch.get(pair)
+        repeated_local_attempt = (
+            previous_local is not None
+            and previous_local[0] == sessions
+            and time.monotonic() - previous_local[1] < 30.0
+        )
+        use_local_candidates = local_candidates_available and not repeated_local_attempt
+        if use_local_candidates:
             left_address = local_left
             right_address = local_right
             left_port = left.listen_port
@@ -517,6 +551,12 @@ class Coordinator:
             LOG.info(
                 "Using local TCP%s candidates for peers %s and %s",
                 6 if both_ipv6 else 4, left.peer_id, right.peer_id,
+            )
+            self._last_local_punch[pair] = (sessions, time.monotonic())
+        elif local_candidates_available:
+            LOG.info(
+                "Retrying peers %s and %s with public TCP%s candidates after local path did not establish",
+                left.peer_id, right.peer_id, 6 if both_ipv6 else 4,
             )
         if not left_address or not right_address or not left_port or not right_port:
             await self.send(left.writer, "ERROR", Reason="no endpoint for the required address family")
@@ -535,11 +575,22 @@ class Coordinator:
         right.ready_for.discard(left.peer_id)
         left.last_punch_peer = right.peer_id
         right.last_punch_peer = left.peer_id
-        start = str(int(time.time() * 1000) + 500)
+        start_delay_ms = 500
+        start = str(int(time.time() * 1000) + start_delay_ms)
+        # A local TCP port can participate in only one opening four-tuple at a
+        # time on Android.  Coordinating overlapping pairs made each device
+        # serialize them in a different order, so matching SYN windows never
+        # overlapped.  Lease both peers to this pair until the 12-second client
+        # attempt (plus the coordinated start margin) has finished.
+        lease_until = time.monotonic() + 13.0
+        self._punch_busy_until[left_key] = lease_until
+        self._punch_busy_until[right_key] = lease_until
         await self.send(left.writer, "PUNCH-GO", **{
             "Peer-ID": right.peer_id, "Address": str(right_address),
             "Port": str(right_port), "Family": family, "Start-Ms": start,
+            "Start-After-Ms": str(start_delay_ms),
             "Traversal": traversal,
+            "Path": "Local" if use_local_candidates else "Public",
             # Identifies the remote control-plane incarnation.  A peer can
             # reconnect from a new physical network while its previous TCP
             # data stream remains half-open on the other side.  Consumers use
@@ -550,9 +601,44 @@ class Coordinator:
         await self.send(right.writer, "PUNCH-GO", **{
             "Peer-ID": left.peer_id, "Address": str(left_address),
             "Port": str(left_port), "Family": family, "Start-Ms": start,
+            "Start-After-Ms": str(start_delay_ms),
             "Traversal": traversal,
+            "Path": "Local" if use_local_candidates else "Public",
             "Peer-Session": repr(left.connected_at),
         })
+
+    async def _retry_deferred_punch(
+        self,
+        pair: tuple[str, str, str],
+        sessions: tuple[float, float],
+        delay: float,
+    ) -> None:
+        """Retry a ready pair after another simultaneous-open window ends."""
+        task = asyncio.current_task()
+        try:
+            await asyncio.sleep(delay)
+            async with self._punch_lock:
+                network, left_id, right_id = pair
+                left = self.peers.get((network, left_id))
+                right = self.peers.get((network, right_id))
+                if left is None or right is None:
+                    return
+                if self._pair_sessions(left, right) != sessions:
+                    return
+                if right.peer_id not in left.ready_for or left.peer_id not in right.ready_for:
+                    return
+                # Remove this task before retrying so _punch_go can schedule a
+                # replacement if a different peer extended either lease.
+                if self._deferred_punch_tasks.get(pair) is task:
+                    self._deferred_punch_tasks.pop(pair, None)
+                LOG.info(
+                    "Retrying deferred punch between %s and %s after busy window",
+                    left.peer_id, right.peer_id,
+                )
+                await self._punch_go(left, right)
+        finally:
+            if self._deferred_punch_tasks.get(pair) is task:
+                self._deferred_punch_tasks.pop(pair, None)
 
     @staticmethod
     def _pair_key(left: RegisteredPeer, right: RegisteredPeer) -> tuple[str, str, str]:

@@ -369,6 +369,7 @@ object TcpPeerProtocol {
                     val complete = ByteArray(totalLength)
                     header.copyInto(complete, endIndex = 20)
                     input.readIntoExactly(complete, 20, totalLength - 20)
+                    activity?.invoke()
                     return complete
                 }
                 6 -> {
@@ -383,6 +384,7 @@ object TcpPeerProtocol {
                     val complete = ByteArray(totalLength)
                     header.copyInto(complete, endIndex = 40)
                     input.readIntoExactly(complete, 40, payloadLength)
+                    activity?.invoke()
                     return complete
                 }
                 else -> {
@@ -443,6 +445,7 @@ object TcpPeerProtocol {
                     if (ihl !in 20..60 || totalLength < ihl || totalLength > MAX_PACKET_SIZE)
                         throw ProtocolException("Invalid IPv4 packet length")
                     input.readIntoExactly(destination, 20, totalLength - 20)
+                    activity?.invoke()
                     return totalLength
                 }
                 6 -> {
@@ -454,6 +457,7 @@ object TcpPeerProtocol {
                     if (totalLength > MAX_PACKET_SIZE)
                         throw ProtocolException("IPv6 packet exceeds maximum size")
                     input.readIntoExactly(destination, 40, payloadLength)
+                    activity?.invoke()
                     return totalLength
                 }
                 else -> {
