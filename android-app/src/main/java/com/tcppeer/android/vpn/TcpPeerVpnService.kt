@@ -51,6 +51,7 @@ import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import java.io.Closeable
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
@@ -189,15 +190,15 @@ class TcpPeerVpnService : VpnService() {
         TcpPeerRuntime.setServiceActive(true)
         createNotificationChannel()
         connectivityManager = getSystemService(ConnectivityManager::class.java)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            connectivityManager.registerDefaultNetworkCallback(networkCallback)
-        } else {
-            val request = NetworkRequest.Builder()
-                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
-                .build()
-            connectivityManager.registerNetworkCallback(request, networkCallback)
-        }
+        // Request a concrete non-VPN underlay instead of observing only the
+        // current default network.  During a handover from another VPN, the
+        // default is still that VPN and allNetworks can contain stale physical
+        // handles which netd no longer permits this UID to select.
+        val request = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+            .build()
+        connectivityManager.requestNetwork(request, networkCallback)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -383,21 +384,19 @@ class TcpPeerVpnService : VpnService() {
         generation: Long,
     ) = withContext(Dispatchers.IO) {
         updateConnecting("Resolving the coordinator DNS name.")
-        val defaultNetwork = connectivityManager.activeNetwork
-        val physicalNetwork = (
-            listOfNotNull(defaultNetwork) +
-                connectivityManager.allNetworks.filter { it != defaultNetwork }
-            ).firstOrNull { network ->
-                connectivityManager.getNetworkCapabilities(network)?.let { capabilities ->
-                    !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
-                        capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                } == true
+        val physicalNetwork = withTimeout(10_000) {
+            var selected: Network? = null
+            while (selected == null) {
+                selected = synchronized(this@TcpPeerVpnService) { underlyingNetwork }
+                    ?.takeIf { network ->
+                        connectivityManager.getNetworkCapabilities(network)?.let { capabilities ->
+                            !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
+                                capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                        } == true
+                    }
+                if (selected == null) delay(50)
             }
-        if (physicalNetwork != null) {
-            synchronized(this@TcpPeerVpnService) {
-                underlyingNetwork = physicalNetwork
-                underlyingNetworkSignature = physicalNetwork.toString()
-            }
+            selected
         }
         val activeLinkProperties = physicalNetwork?.let(connectivityManager::getLinkProperties)
         val activeAddresses = activeLinkProperties?.linkAddresses?.map { it.address }.orEmpty() +
@@ -938,7 +937,7 @@ class TcpPeerVpnService : VpnService() {
             try {
                 while (true) {
                     val packet = TcpPeerProtocol.readData(
-                        input, null, { lastRx.set(System.nanoTime()) },
+                        input, output, { lastRx.set(System.nanoTime()) },
                     ) { command, identifier, timestamp ->
                         handleTppControl(peerId, command, identifier, timestamp, output)
                     }
@@ -1062,7 +1061,7 @@ class TcpPeerVpnService : VpnService() {
             try {
                 while (true) {
                     val packet = TcpPeerProtocol.readData(
-                        input, null, { lastRx.set(System.nanoTime()) },
+                        input, output, { lastRx.set(System.nanoTime()) },
                     ) { command, identifier, timestamp ->
                         handleTppControl(peerId, command, identifier, timestamp, output)
                     }
@@ -1879,7 +1878,7 @@ class TcpPeerVpnService : VpnService() {
                 val packetLength = TcpPeerProtocol.readDataInto(
                     directInput,
                     packet,
-                    null,
+                    directOutput,
                     { lastDataPlaneRx.set(System.nanoTime()) },
                 ) { command, identifier, timestamp ->
                     handleTppControl(
