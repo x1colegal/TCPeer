@@ -17,6 +17,7 @@ import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.os.PowerManager
 import android.system.Os
 import android.system.OsConstants
 import android.system.StructPollfd
@@ -122,6 +123,7 @@ class TcpPeerVpnService : VpnService() {
     private val disconnectRequested = AtomicBoolean(false)
     private val restartRequested = AtomicBoolean(false)
     private val stopRefreshStarted = AtomicBoolean(false)
+    private var connectionWakeLock: PowerManager.WakeLock? = null
     private lateinit var connectivityManager: ConnectivityManager
     @Volatile private var underlyingNetworkSignature: String? = null
     @Volatile private var underlyingNetwork: Network? = null
@@ -214,7 +216,7 @@ class TcpPeerVpnService : VpnService() {
                 if (connectionJob?.isActive != true) connect()
             }
         }
-        return Service.START_NOT_STICKY
+        return Service.START_STICKY
     }
 
     private fun renameDevice(displayName: String) {
@@ -239,12 +241,14 @@ class TcpPeerVpnService : VpnService() {
         runCatching { connectivityManager.unregisterNetworkCallback(networkCallback) }
         connectionGeneration.incrementAndGet()
         closeResources()
+        releaseConnectionWakeLock()
         TcpPeerRuntime.setServiceActive(false)
         serviceScope.cancel()
         super.onDestroy()
     }
 
     private fun connect() {
+        acquireConnectionWakeLock()
         val generation = connectionGeneration.incrementAndGet()
         disconnectRequested.set(false)
         stopRefreshStarted.set(false)
@@ -1999,6 +2003,7 @@ class TcpPeerVpnService : VpnService() {
         connectionJob = null
         stoppedJob?.cancel()
         closeResources()
+        releaseConnectionWakeLock()
         TcpPeerRuntime.replace(VpnRuntimeState())
         TcpPeerRuntime.setServiceActive(false)
         removeForegroundNotification()
@@ -2013,6 +2018,36 @@ class TcpPeerVpnService : VpnService() {
         if (stopRefreshStarted.compareAndSet(false, true)) {
             refreshConnectivityThenStop()
         }
+    }
+
+    /**
+     * Old Android builds may suspend the application CPU while leaving the
+     * VPN service and its TCP sockets registered. The coordinator then sends
+     * its liveness probe to a socket whose userspace reader cannot run, marks
+     * the peer offline, and the client only observes EOF after the device is
+     * woken. Keep the CPU available for the lifetime of an explicitly active
+     * VPN session; this does not keep the display on.
+     */
+    @Synchronized
+    private fun acquireConnectionWakeLock() {
+        val existing = connectionWakeLock
+        if (existing?.isHeld == true) return
+        connectionWakeLock = (getSystemService(POWER_SERVICE) as PowerManager)
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$packageName:TcpPeerConnection")
+            .apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        Log.i(TAG, "Connection wake lock acquired")
+    }
+
+    @Synchronized
+    private fun releaseConnectionWakeLock() {
+        connectionWakeLock?.let { wakeLock ->
+            if (wakeLock.isHeld) wakeLock.release()
+        }
+        connectionWakeLock = null
+        Log.i(TAG, "Connection wake lock released")
     }
 
     /**
