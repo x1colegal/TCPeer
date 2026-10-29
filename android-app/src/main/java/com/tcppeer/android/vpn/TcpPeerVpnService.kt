@@ -1639,10 +1639,20 @@ class TcpPeerVpnService : VpnService() {
                 .addRoute(ipv6.prefix, ipv6.prefixLength)
         }
         preserveLocalNetworkAccess(builder, ipv4.address, ipv6.address, config.useExitNode)
+        excludeAndroidAuto(builder)
         if (config.useExitNode) {
             (ipv4.dns + ipv6.dns).distinctBy { it.hostAddress }.forEach(builder::addDnsServer)
         }
         return builder.establish()
+    }
+
+    private fun excludeAndroidAuto(builder: Builder) {
+        try {
+            builder.addDisallowedApplication(ANDROID_AUTO_PACKAGE)
+            Log.i(TAG, "Android Auto excluded from the TCPeer VPN")
+        } catch (_: PackageManager.NameNotFoundException) {
+            Log.i(TAG, "Android Auto is not installed; no VPN exclusion is needed")
+        }
     }
 
     private fun preserveLocalNetworkAccess(
@@ -2245,6 +2255,7 @@ class TcpPeerVpnService : VpnService() {
         private const val DATA_PLANE_ACCOUNTING_BATCH = 64
         private const val DEVICE_REFRESH_INTERVAL_MS = 5_000L
         private const val MESH_PUNCH_RETRY_MS = 5_000L
+        private const val ANDROID_AUTO_PACKAGE = "com.google.android.projection.gearhead"
         private const val TAG = "TCPeerVpnService"
     }
 }
