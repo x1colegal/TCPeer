@@ -175,7 +175,7 @@ def test_new_peer_session_cancels_stale_connect_attempt() -> None:
     asyncio.run(scenario())
 
 
-def test_same_peer_session_keeps_inflight_connect_attempt() -> None:
+def test_same_peer_session_keeps_inflight_connect_attempt_within_punch_round() -> None:
     async def scenario() -> None:
         server = Server.__new__(Server)
         current = asyncio.create_task(asyncio.Event().wait())

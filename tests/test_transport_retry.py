@@ -3,6 +3,10 @@ import errno
 from tcppeer.transport import DirectConnector
 
 
+def test_retry_window_ends_before_next_coordinator_punch_round() -> None:
+    assert DirectConnector().retry_window == 12.0
+
+
 def test_prebound_eaddrnotavail_is_retryable() -> None:
     error = OSError(errno.EADDRNOTAVAIL, "Cannot assign requested address")
 

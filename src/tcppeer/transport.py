@@ -70,8 +70,9 @@ class Endpoint:
 class DirectConnector:
     """Attempt exactly one policy-approved direct TCP family."""
 
-    def __init__(self, timeout: float = 10.0):
+    def __init__(self, timeout: float = 10.0, retry_window: float = 12.0):
         self.timeout = timeout
+        self.retry_window = retry_window
 
     @staticmethod
     def _retry_without_prebound(exc: Exception) -> bool:
@@ -95,7 +96,13 @@ class DirectConnector:
         if local.family != required_family or remote.family != required_family:
             raise DirectConnectionError("endpoint family violates transport policy")
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + 60.0
+        # The coordinator leases a simultaneous-open pair for 13 seconds and
+        # Android attempts it for 12 seconds.  Keeping a Python connector alive
+        # for the old 60-second window made it reject subsequent coordinated
+        # rounds as attempt-already-active after the remote side had already
+        # stopped punching.  End just before the lease expires so the next
+        # PUNCH-GO can create a fresh, synchronized attempt.
+        deadline = loop.time() + self.retry_window
         last_exc = None
 
         while loop.time() < deadline:
