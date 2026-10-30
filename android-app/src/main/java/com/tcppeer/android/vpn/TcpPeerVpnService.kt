@@ -1363,7 +1363,7 @@ class TcpPeerVpnService : VpnService() {
                 // The coordinator still observes the public IP; REGISTER explicitly
                 // advertises the direct listener port.
                 socket.bind(InetSocketAddress(wildcard, 0))
-                if (!protect(socket)) throw IllegalStateException("Cannot protect the coordinator socket from the VPN")
+                requireProtectedOrBound(socket, physicalNetwork, "coordinator")
                 socket.connect(InetSocketAddress(address, config.coordinatorPort), 10_000)
                 socket.tcpNoDelay = false
                 socket.soTimeout = COORDINATOR_TIMEOUT_MS
@@ -1396,7 +1396,7 @@ class TcpPeerVpnService : VpnService() {
                 physicalNetwork?.bindSocket(socket)
                 val wildcard = if (family == DirectFamily.IPV6) InetAddress.getByName("::") else InetAddress.getByName("0.0.0.0")
                 socket.bind(InetSocketAddress(wildcard, config.directPort))
-                if (!protect(socket)) throw IllegalStateException("Cannot protect the endpoint query socket")
+                requireProtectedOrBound(socket, physicalNetwork, "endpoint query")
                 socket.connect(InetSocketAddress(address, config.coordinatorPort), 5_000)
                 socket.soTimeout = 5_000
                 TcpPeerProtocol.writeControl(socket.getOutputStream(), ControlMessage("ENDPOINT-QUERY"))
@@ -1461,7 +1461,13 @@ class TcpPeerVpnService : VpnService() {
             inFlightSockets.add(socket)
             try {
             socket.reuseAddress = true
-            if (bindToUnderlying) underlyingNetwork?.bindSocket(socket)
+            val boundNetwork = if (bindToUnderlying) {
+                synchronized(this@TcpPeerVpnService) { underlyingNetwork }
+                    ?: throw IllegalStateException("No physical network is available for the direct socket")
+            } else {
+                null
+            }
+            boundNetwork?.bindSocket(socket)
             val wildcard = if (family == DirectFamily.IPV6) InetAddress.getByName("::") else InetAddress.getByName("0.0.0.0")
             // TCP simultaneous-open requires the same local endpoint that was
             // used for public mapping discovery. An ephemeral source port makes
@@ -1473,7 +1479,7 @@ class TcpPeerVpnService : VpnService() {
                     "socket=${socketToken(socket)} initiated=true local=${socket.localSocketAddress} " +
                     "remote=${formatEndpoint(address, port)}",
             )
-            if (!protect(socket)) throw IllegalStateException("Cannot protect the direct socket from the VPN")
+            requireProtectedOrBound(socket, boundNetwork, "direct")
             socket.sendBufferSize = DIRECT_SOCKET_BUFFER_BYTES
             socket.receiveBufferSize = DIRECT_SOCKET_BUFFER_BYTES
             val remaining = (deadline - android.os.SystemClock.elapsedRealtime()).coerceAtLeast(1L)
@@ -1510,6 +1516,21 @@ class TcpPeerVpnService : VpnService() {
         }
         val label = if (family == DirectFamily.IPV6) "TCP6" else "TCP4"
         throw IllegalStateException("$label direct connection failed after retry window; no fallback is allowed", lastError)
+    }
+
+    private fun requireProtectedOrBound(socket: Socket, network: Network?, purpose: String) {
+        if (protect(socket)) return
+        if (network != null) {
+            // During handover from another VpnService, Android can keep the old
+            // VPN prepared until this service establishes its tunnel. In that
+            // interval protect() returns false even though Network.bindSocket()
+            // has already pinned this socket to a concrete physical network.
+            // Reject only unbound sockets: a network-bound socket cannot loop
+            // back through either the old VPN or the tunnel established later.
+            Log.w(TAG, "VPN protect was unavailable for $purpose socket; using explicit network=$network binding")
+            return
+        }
+        throw IllegalStateException("Cannot protect the $purpose socket from the VPN")
     }
 
     private fun acceptPassiveDirect(family: DirectFamily): Socket {
