@@ -675,11 +675,13 @@ class TcpPeerVpnService : VpnService() {
             val coordinatorControlJob = launch(Dispatchers.IO) {
                 val devices = mutableListOf<NetworkDevice>()
                 var listInProgress = false
+                var listRequestedAt = 0L
 
                 while (true) {
                     if (!listInProgress) {
                         devices.clear()
                         listInProgress = true
+                        listRequestedAt = android.os.SystemClock.elapsedRealtime()
                         writeCoordinatorControl(
                             controlOutput,
                             ControlMessage("PEER-INFO", mapOf("Action" to "List")),
@@ -735,6 +737,7 @@ class TcpPeerVpnService : VpnService() {
                                         )
                                     }
                                     listInProgress = false
+                                    listRequestedAt = 0L
                                     delay(DEVICE_REFRESH_INTERVAL_MS)
                                 }
 
@@ -802,8 +805,29 @@ class TcpPeerVpnService : VpnService() {
                             }
                         }
                     } catch (_: SocketTimeoutException) {
-                        // Keep waiting for the current list. Do not start
-                        // another List request until List-End arrives.
+                        // A partial directory response used to leave
+                        // listInProgress set forever.  From that point this
+                        // worker only performed timed reads and sent no more
+                        // control traffic, so the coordinator expired an
+                        // otherwise open session and the UI/data plane became
+                        // half-alive.  Prove bidirectional liveness on every
+                        // idle interval and abandon only the stale directory
+                        // transaction, allowing the next loop to request a
+                        // complete snapshot again.
+                        writeCoordinatorControl(
+                            controlOutput,
+                            ControlMessage("KEEPALIVE"),
+                        )
+                        if (
+                            listInProgress &&
+                            android.os.SystemClock.elapsedRealtime() - listRequestedAt >=
+                                COORDINATOR_LIST_STALE_MS
+                        ) {
+                            Log.w(TAG, "Coordinator peer list did not finish; requesting a fresh snapshot")
+                            listInProgress = false
+                            listRequestedAt = 0L
+                            devices.clear()
+                        }
                     }
                 }
             }
@@ -2275,6 +2299,7 @@ class TcpPeerVpnService : VpnService() {
         private const val NETWORK_REFRESH_TIMEOUT_MS = 1_000
         private const val DATA_PLANE_ACCOUNTING_BATCH = 64
         private const val DEVICE_REFRESH_INTERVAL_MS = 5_000L
+        private const val COORDINATOR_LIST_STALE_MS = 15_000L
         private const val MESH_PUNCH_RETRY_MS = 5_000L
         private const val ANDROID_AUTO_PACKAGE = "com.google.android.projection.gearhead"
         private const val TAG = "TCPeerVpnService"
