@@ -8,6 +8,9 @@ import android.content.Intent
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
+import android.net.Uri
 import android.view.Window
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -118,6 +121,12 @@ class MainActivity : ComponentActivity() {
         if (result.resultCode == RESULT_OK) startVpn()
     }
 
+    private val batteryOptimization = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) {
+        prepareAndStartVpn()
+    }
+
     private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -164,13 +173,29 @@ class MainActivity : ComponentActivity() {
             configuration.validate()
             ConfigurationStore(this).save(configuration)
             pendingConfiguration = configuration
-            val intent = VpnService.prepare(this)
-            if (intent == null) startVpn() else vpnPermission.launch(intent)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                val power = getSystemService(POWER_SERVICE) as PowerManager
+                if (!power.isIgnoringBatteryOptimizations(packageName)) {
+                    batteryOptimization.launch(
+                        Intent(
+                            Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                            Uri.parse("package:$packageName"),
+                        ),
+                    )
+                    return
+                }
+            }
+            prepareAndStartVpn()
         } catch (error: IllegalArgumentException) {
             TcpPeerRuntime.update {
                 it.copy(status = ConnectionStatus.NO_DIRECT_CONNECTION, detail = error.message ?: "Invalid configuration")
             }
         }
+    }
+
+    private fun prepareAndStartVpn() {
+        val intent = VpnService.prepare(this)
+        if (intent == null) startVpn() else vpnPermission.launch(intent)
     }
 
     private fun startVpn() {

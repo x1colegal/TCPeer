@@ -860,6 +860,7 @@ class TcpPeerVpnService : VpnService() {
             try {
                 exchangePackets(
                     tunStreams.input,
+                    direct,
                     BufferedInputStream(directInput, DIRECT_STREAM_BUFFER_BYTES),
                     primaryDataOutput,
                     addresses.second.address,
@@ -950,26 +951,36 @@ class TcpPeerVpnService : VpnService() {
                     if (System.nanoTime() - lastRx.get() >= 45_000_000_000L) {
                         val beforeProbe = lastRx.get()
                         Log.w(TAG, "Mesh data-plane idle peer_id=$peerId; sending final liveness probe")
-                        try {
-                            synchronized(output) { TcpPeerProtocol.writeDataPlaneControl(output, "KEEPALIVE") }
-                        } catch (error: Exception) {
-                            Log.w(TAG, "Mesh final liveness probe failed peer_id=$peerId", error)
-                            closeQuietly(socket)
-                            return@launch
+                        val probe = serviceScope.launch(Dispatchers.IO) {
+                            try {
+                                synchronized(output) { TcpPeerProtocol.writeDataPlaneControl(output, "KEEPALIVE") }
+                            } catch (error: Exception) {
+                                if (error is CancellationException) throw error
+                                Log.w(TAG, "Mesh final liveness probe failed peer_id=$peerId", error)
+                                closeQuietly(socket)
+                            }
                         }
                         delay(10_000)
                         if (lastRx.get() <= beforeProbe) {
                             Log.w(TAG, "Mesh data-plane TPCP keepalive timeout peer_id=$peerId after final probe")
                             closeQuietly(socket)
+                            probe.cancel()
                             return@launch
                         }
+                        probe.cancel()
                     }
                 }
             }
             val keepalive = serviceScope.launch(Dispatchers.IO) {
-                while (true) {
-                    delay(15_000)
-                    synchronized(output) { TcpPeerProtocol.writeDataPlaneControl(output, "KEEPALIVE") }
+                try {
+                    while (true) {
+                        delay(15_000)
+                        synchronized(output) { TcpPeerProtocol.writeDataPlaneControl(output, "KEEPALIVE") }
+                    }
+                } catch (error: Exception) {
+                    if (error is CancellationException) throw error
+                    Log.w(TAG, "Mesh keepalive writer failed peer_id=$peerId; closing stale socket", error)
+                    closeQuietly(socket)
                 }
             }
             try {
@@ -1074,26 +1085,36 @@ class TcpPeerVpnService : VpnService() {
                     if (System.nanoTime() - lastRx.get() >= 45_000_000_000L) {
                         val beforeProbe = lastRx.get()
                         Log.w(TAG, "Accepted mesh data-plane idle peer_id=$peerId; sending final liveness probe")
-                        try {
-                            synchronized(output) { TcpPeerProtocol.writeDataPlaneControl(output, "KEEPALIVE") }
-                        } catch (error: Exception) {
-                            Log.w(TAG, "Accepted mesh final liveness probe failed peer_id=$peerId", error)
-                            closeQuietly(socket)
-                            return@launch
+                        val probe = serviceScope.launch(Dispatchers.IO) {
+                            try {
+                                synchronized(output) { TcpPeerProtocol.writeDataPlaneControl(output, "KEEPALIVE") }
+                            } catch (error: Exception) {
+                                if (error is CancellationException) throw error
+                                Log.w(TAG, "Accepted mesh final liveness probe failed peer_id=$peerId", error)
+                                closeQuietly(socket)
+                            }
                         }
                         delay(10_000)
                         if (lastRx.get() <= beforeProbe) {
                             Log.w(TAG, "Accepted mesh data-plane TPCP keepalive timeout peer_id=$peerId after final probe")
                             closeQuietly(socket)
+                            probe.cancel()
                             return@launch
                         }
+                        probe.cancel()
                     }
                 }
             }
             val keepalive = serviceScope.launch(Dispatchers.IO) {
-                while (true) {
-                    delay(15_000)
-                    synchronized(output) { TcpPeerProtocol.writeDataPlaneControl(output, "KEEPALIVE") }
+                try {
+                    while (true) {
+                        delay(15_000)
+                        synchronized(output) { TcpPeerProtocol.writeDataPlaneControl(output, "KEEPALIVE") }
+                    }
+                } catch (error: Exception) {
+                    if (error is CancellationException) throw error
+                    Log.w(TAG, "Accepted mesh keepalive writer failed peer_id=$peerId; closing stale socket", error)
+                    closeQuietly(socket)
                 }
             }
             try {
@@ -1782,6 +1803,7 @@ class TcpPeerVpnService : VpnService() {
 
     private suspend fun exchangePackets(
         tunInput: FileInputStream,
+        directSocket: Socket,
         directInput: java.io.InputStream,
         directOutput: java.io.OutputStream,
         overlayIpv6: Inet6Address,
@@ -1795,11 +1817,18 @@ class TcpPeerVpnService : VpnService() {
         val pendingRxBytes = AtomicLong(0)
         val outputPending = AtomicBoolean(false)
         val outputFlusher = launch(Dispatchers.IO) {
-            while (true) {
-                delay(DIRECT_FLUSH_INTERVAL_MS)
-                if (outputPending.getAndSet(false)) {
-                    synchronized(directOutput) { directOutput.flush() }
+            try {
+                while (true) {
+                    delay(DIRECT_FLUSH_INTERVAL_MS)
+                    if (outputPending.getAndSet(false)) {
+                        synchronized(directOutput) { directOutput.flush() }
+                    }
                 }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                Log.w(TAG, "Primary data-plane output flusher failed; closing direct socket", error)
+                closeQuietly(directSocket)
+                throw error
             }
         }
         val statistics = launch {
@@ -1856,16 +1885,23 @@ class TcpPeerVpnService : VpnService() {
                 }
                 val output = selectedOutput ?: directOutput
                 val flushImmediately = output === directOutput && isTcpControlPacket(buffer, count)
-                synchronized(output) {
-                    // Raw IP uses the packet's own IPv4/IPv6 length as its
-                    // boundary in the TCP byte stream.  A TUN read may carry
-                    // trailing kernel/offload bytes, so sending `count`
-                    // directly can desynchronise every subsequent packet and
-                    // leave the receiver blocked while TCP stays ESTABLISHED.
-                    TcpPeerProtocol.writeData(output, buffer, 0, count)
-                    if (flushImmediately) {
-                        output.flush()
+                try {
+                    synchronized(output) {
+                        // Raw IP uses the packet's own IPv4/IPv6 length as its
+                        // boundary in the TCP byte stream.  A TUN read may carry
+                        // trailing kernel/offload bytes, so sending `count`
+                        // directly can desynchronise every subsequent packet and
+                        // leave the receiver blocked while TCP stays ESTABLISHED.
+                        TcpPeerProtocol.writeData(output, buffer, 0, count)
+                        if (flushImmediately) {
+                            output.flush()
+                        }
                     }
+                } catch (error: Exception) {
+                    if (output === directOutput || directPeer == null) throw error
+                    Log.w(TAG, "Mesh DATA writer failed peer_id=$directPeer; closing stale socket", error)
+                    meshSockets[directPeer]?.let(::closeQuietly)
+                    continue
                 }
                 if (output === directOutput && !flushImmediately) {
                     outputPending.set(true)
@@ -1919,24 +1955,31 @@ class TcpPeerVpnService : VpnService() {
                         }
                     } catch (error: Exception) {
                         Log.w(TAG, "Primary final liveness probe failed; closing direct stream", error)
-                        closeQuietly(directInput)
+                        closeQuietly(directSocket)
                         return@launch
                     }
                     delay(10_000)
                     if (lastDataPlaneRx.get() <= beforeProbe) {
                         Log.w(TAG, "Primary data-plane TPCP keepalive timeout after final probe; closing direct stream")
-                        closeQuietly(directInput)
+                        closeQuietly(directSocket)
                         return@launch
                     }
                 }
             }
         }
         val dataPlaneKeepalive = launch(Dispatchers.IO) {
-            while (true) {
-                delay(15_000)
-                synchronized(directOutput) {
-                    TcpPeerProtocol.writeDataPlaneControl(directOutput, "KEEPALIVE")
+            try {
+                while (true) {
+                    delay(15_000)
+                    synchronized(directOutput) {
+                        TcpPeerProtocol.writeDataPlaneControl(directOutput, "KEEPALIVE")
+                    }
                 }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                Log.w(TAG, "Primary data-plane keepalive writer failed; closing direct socket", error)
+                closeQuietly(directSocket)
+                throw error
             }
         }
         val peerToTun = launch(Dispatchers.IO) {
@@ -1979,6 +2022,14 @@ class TcpPeerVpnService : VpnService() {
             select<Unit> {
                 tunToPeer.onJoin { }
                 peerToTun.onJoin { }
+                // A failed writer means the stream is already unusable even
+                // if the blocking reader has not observed EOF yet.
+                outputFlusher.onJoin { }
+                dataPlaneKeepalive.onJoin { }
+                // The watchdog ends only after declaring this stream dead.
+                // Selecting it explicitly prevents a platform-specific blocked
+                // BufferedInputStream close from leaving the VPN half-alive.
+                dataPlaneLiveness.onJoin { }
             }
         } finally {
             tunToPeer.cancel()
@@ -1989,9 +2040,10 @@ class TcpPeerVpnService : VpnService() {
             statistics.cancel()
             outputFlusher.cancel()
             pendingTppPings.clear()
-            synchronized(directOutput) {
-                runCatching { directOutput.flush() }
-            }
+            // Never flush while tearing a failed stream down: flush() is the
+            // operation most likely to be blocked behind a dead underlay.
+            // Closing the socket first also wakes both blocked read and write.
+            closeQuietly(directSocket)
             closeQuietly(tunInput)
         }
     }
