@@ -161,14 +161,24 @@ class TcpPeerVpnService : VpnService() {
             if (!capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) return
             val addresses = linkProperties.linkAddresses.map { it.address }
             val (ipv4, ipv6) = TransportPolicy.localAddresses(addresses)
-            // A Network handle identifies the physical underlay. LinkProperties
-            // can change on the same Wi-Fi/LTE network whenever Android rotates
-            // an IPv6 privacy address, renews DHCP, or updates DNS. Including
-            // every address in this signature made those harmless updates tear
-            // down the primary direct socket and, through its cleanup scope,
-            // every mesh socket as well. A real Wi-Fi/LTE handover produces a
-            // new Network handle (or onLost), which still triggers immediately.
-            val signature = network.toString()
+            // Track reachability changes without treating an IPv6 privacy-IID
+            // rotation as a new underlay.  Using only the Network handle left
+            // a session permanently IPv4-only when Android delivered the
+            // handle before SLAAC had installed its GUA.  Include exact IPv4
+            // addresses and IPv6 network prefixes: a family/prefix appearing,
+            // disappearing, or changing now forces endpoint rediscovery, while
+            // a temporary address rotating inside the same prefix does not.
+            val ipv4Signature = ipv4
+                .map { it.hostAddress.orEmpty() }
+                .sorted()
+                .joinToString(",")
+            val ipv6PrefixSignature = linkProperties.linkAddresses
+                .filter { link -> ipv6.any { it == link.address } }
+                .map { link -> networkPrefixSignature(link.address, link.prefixLength) }
+                .distinct()
+                .sorted()
+                .joinToString(",")
+            val signature = "$network|v4=$ipv4Signature|v6=$ipv6PrefixSignature"
             val changed = synchronized(this) {
                 val previous = underlyingNetworkSignature
                 underlyingNetwork = network
@@ -2049,6 +2059,16 @@ class TcpPeerVpnService : VpnService() {
             bytes[index] = (bytes[index].toInt() and mask).toByte()
         }
         return InetAddress.getByAddress(bytes)
+    }
+
+    private fun networkPrefixSignature(address: InetAddress, prefixLength: Int): String {
+        val bytes = address.address.copyOf()
+        for (index in bytes.indices) {
+            val bits = (prefixLength - index * 8).coerceIn(0, 8)
+            val mask = if (bits == 0) 0 else (0xFF shl (8 - bits)) and 0xFF
+            bytes[index] = (bytes[index].toInt() and mask).toByte()
+        }
+        return "${InetAddress.getByAddress(bytes).hostAddress}/$prefixLength"
     }
 
     private fun disconnect() {
