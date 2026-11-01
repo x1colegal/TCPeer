@@ -448,9 +448,10 @@ class Coordinator:
             (known for known in self.known_peers.values() if known.network == peer.network),
             key=lambda known: (not known.online, (known.display_name or known.peer_id).casefold(), known.peer_id),
         )
+        snapshot: list[bytes] = []
         for known in devices:
             online = known.online
-            await self.send(peer.writer, "PEER-INFO", **{
+            snapshot.append(ControlMessage("PEER-INFO", {
                 "Action": "Device",
                 "Peer-ID": known.peer_id,
                 "Device-Name": known.display_name or known.peer_id,
@@ -466,8 +467,19 @@ class Coordinator:
                 "Overlay-IPv6": known.overlay_ipv6 if online else "",
                 "Endpoint": known.endpoint,
                 "Last-Seen": str(known.last_seen),
-            })
-        await self.send(peer.writer, "PEER-INFO", Action="List-End")
+            }).encode())
+        snapshot.append(ControlMessage("PEER-INFO", {"Action": "List-End"}).encode())
+
+        # Queue one immutable directory snapshot in a single event-loop turn.
+        # The previous per-device await/drain sequence allowed unrelated
+        # PING/PUNCH traffic to be inserted between Device and List-End, and a
+        # failure in one of those intervening handlers could strand the client
+        # in an unfinished list transaction.  A broken TCP connection may
+        # still deliver a prefix (TCP cannot provide message transactions),
+        # but the coordinator itself no longer emits a partial application
+        # response or interleaves another TPCP command inside it.
+        peer.writer.write(b"".join(snapshot))
+        await peer.writer.drain()
 
     async def _punch_go(self, left: RegisteredPeer, right: RegisteredPeer) -> None:
         pair = self._pair_key(left, right)

@@ -33,8 +33,10 @@ def test_offline_device_list_hides_physical_addresses_and_transport(tmp_path: Pa
     class Writer:
         def __init__(self) -> None:
             self.data = bytearray()
+            self.write_calls = 0
 
         def write(self, data: bytes) -> None:
+            self.write_calls += 1
             self.data.extend(data)
 
         async def drain(self) -> None:
@@ -63,6 +65,8 @@ def test_offline_device_list_hides_physical_addresses_and_transport(tmp_path: Pa
     asyncio.run(coordinator._send_device_list(SimpleNamespace(network="home", writer=writer)))
     message = bytes(writer.data)
 
+    assert writer.write_calls == 1
+    assert message.endswith(b"TPCP/2 PEER-INFO\r\nAction: List-End\r\n\r\n")
     assert b"Online: no\r\n" in message
     assert b"Transport: -\r\n" in message
     assert b"IPv4: \r\n" in message
