@@ -929,17 +929,11 @@ class Server:
                     await asyncio.sleep(10)
                     if last_data_plane_rx <= probe_started_after:
                         LOG.warning(
-                            "data-plane peer temporarily unresponsive peer_id=%s; retaining established TCP stream",
+                            "data-plane liveness timeout after final probe peer_id=%s; closing direct stream",
                             peer_id,
                         )
-                        # A sleeping mobile peer can pause its userspace
-                        # reader/writer while the kernel TCP connection and NAT
-                        # mapping remain valid.  Closing here turned screen-off
-                        # suspension into a guaranteed disconnect.  The
-                        # independent periodic writer still keeps the mapping
-                        # alive and an actual socket error/EOF owns teardown.
-                        await asyncio.sleep(35)
-                        continue
+                        writer.close()
+                        return
                     LOG.info("data-plane liveness recovered peer_id=%s", peer_id)
 
         async def data_plane_keepalive() -> None:
