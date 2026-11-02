@@ -988,7 +988,7 @@ class TcpPeerVpnService : VpnService() {
                     val packet = TcpPeerProtocol.readData(
                         input, output, { lastRx.set(System.nanoTime()) },
                     ) { command, identifier, timestamp ->
-                        handleTppControl(peerId, command, identifier, timestamp, output)
+                        handleTppControl(peerId, command, identifier)
                     }
                     commitMeshSocket(peerId, socket)
                     processInboundPacket(packet, peerId, overlayIpv6, output, tunPackets)
@@ -1122,7 +1122,7 @@ class TcpPeerVpnService : VpnService() {
                     val packet = TcpPeerProtocol.readData(
                         input, output, { lastRx.set(System.nanoTime()) },
                     ) { command, identifier, timestamp ->
-                        handleTppControl(peerId, command, identifier, timestamp, output)
+                        handleTppControl(peerId, command, identifier)
                     }
                     commitMeshSocket(peerId, socket)
                     processInboundPacket(packet, peerId, overlayIpv6, output, tunPackets)
@@ -1249,22 +1249,13 @@ class TcpPeerVpnService : VpnService() {
         peerId: String,
         command: String,
         identifier: Long,
-        timestamp: Long = 0,
-        output: java.io.OutputStream? = null,
     ) {
-        if (command == "TPP-PING" && output != null) {
-            // Never make the socket reader wait behind a blocked bulk-data
-            // flush. The independent liveness watchdog can still close the
-            // socket if this queued reply cannot be written.
-            serviceScope.launch(Dispatchers.IO) {
-                synchronized(output) {
-                    TcpPeerProtocol.writeTppControl(
-                        output, "TPP-PONG", identifier, timestamp,
-                    )
-                }
-            }
-            return
-        }
+        // readData()/readDataInto() already write exactly one TPP-PONG while
+        // consuming TPP-PING.  Queuing a second reply here leaked one blocked
+        // Dispatchers.IO worker per probe whenever the socket writer stalled;
+        // enough stalled peers could eventually starve unrelated control and
+        // DATA workers while every TCP socket still looked ESTABLISHED.
+        if (command == "TPP-PING") return
         if (command != "TPP-PONG") return
         pendingTppPings.remove(identifier)?.let { (pingPeerId, sentAt) ->
             val latencyMillis = (System.nanoTime() - sentAt) / 1_000_000.0
@@ -1993,9 +1984,7 @@ class TcpPeerVpnService : VpnService() {
                     directOutput,
                     { lastDataPlaneRx.set(System.nanoTime()) },
                 ) { command, identifier, timestamp ->
-                    handleTppControl(
-                        primaryPeerId, command, identifier, timestamp, directOutput,
-                    )
+                    handleTppControl(primaryPeerId, command, identifier)
                 }
                 byteBatch += packetLength
                 packetBatch++
