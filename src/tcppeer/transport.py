@@ -7,6 +7,7 @@ import asyncio
 import errno
 import ipaddress
 import logging
+import random
 import socket
 from typing import Iterable
 
@@ -82,6 +83,13 @@ class DirectConnector:
         # candidate and keep retrying from the same local port with fresh
         # sockets during the existing retry window.
         return isinstance(exc, (OSError, asyncio.TimeoutError))
+
+    @staticmethod
+    def _retry_delay(exc: Exception) -> float:
+        """De-phase simultaneous-open retries after an immediate TCP RST."""
+        if isinstance(exc, OSError) and exc.errno == errno.ECONNREFUSED:
+            return random.uniform(0.015, 0.075)
+        return 0.1
 
     async def connect(
         self,
@@ -243,11 +251,11 @@ class DirectConnector:
                             exc,
                         )
                         prebound_socket = None
-                        await asyncio.sleep(0.1)
+                        await asyncio.sleep(self._retry_delay(exc))
                         continue
                     break
 
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(self._retry_delay(exc))
 
         family_name = "TCP6" if required_family == socket.AF_INET6 else "TCP4"
         raise DirectConnectionError(

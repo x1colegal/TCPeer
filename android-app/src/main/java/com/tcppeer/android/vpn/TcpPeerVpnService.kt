@@ -62,6 +62,7 @@ import java.net.Inet4Address
 import java.net.Inet6Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.ConnectException
 import java.net.Socket
 import java.net.ServerSocket
 import java.net.SocketTimeoutException
@@ -69,6 +70,7 @@ import java.util.Collections
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.random.Random
 
 private data class PublicEndpoint(val address: String, val port: Int)
 private data class RoutePrefix(val address: ByteArray, val prefixLength: Int)
@@ -215,19 +217,49 @@ class TcpPeerVpnService : VpnService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_DISCONNECT -> disconnect()
-            ACTION_RENAME_DEVICE -> renameDevice(intent.getStringExtra(EXTRA_DEVICE_NAME).orEmpty())
+            ACTION_DISCONNECT -> {
+                setConnectionDesired(false)
+                disconnect()
+                return Service.START_NOT_STICKY
+            }
+            ACTION_CONNECT -> {
+                setConnectionDesired(true)
+                TcpPeerRuntime.setServiceActive(true)
+                if (connectionJob?.isActive != true) connect()
+            }
+            ACTION_RENAME_DEVICE -> {
+                renameDevice(intent.getStringExtra(EXTRA_DEVICE_NAME).orEmpty())
+                if (!isConnectionDesired()) {
+                    stopSelf(startId)
+                    return Service.START_NOT_STICKY
+                }
+            }
             else -> {
-                // API 28 commonly delivers a new CONNECT to the service
-                // instance that handled DISCONNECT before onDestroy() runs.
-                // onCreate() is therefore not a reliable indication that a
-                // newly requested VPN session is active.
+                // START_STICKY restarts arrive with a null Intent. Reconnect
+                // only when the user explicitly left TCPeer enabled.
+                if (!isConnectionDesired()) {
+                    TcpPeerRuntime.setServiceActive(false)
+                    stopSelf(startId)
+                    return Service.START_NOT_STICKY
+                }
                 TcpPeerRuntime.setServiceActive(true)
                 if (connectionJob?.isActive != true) connect()
             }
         }
         return Service.START_STICKY
     }
+
+    private fun setConnectionDesired(desired: Boolean) {
+        val saved = getSharedPreferences(SERVICE_STATE_PREFERENCES, MODE_PRIVATE)
+            .edit()
+            .putBoolean(CONNECTION_DESIRED_KEY, desired)
+            .commit()
+        if (!saved) Log.w(TAG, "Could not persist requested VPN state=$desired")
+    }
+
+    private fun isConnectionDesired(): Boolean =
+        getSharedPreferences(SERVICE_STATE_PREFERENCES, MODE_PRIVATE)
+            .getBoolean(CONNECTION_DESIRED_KEY, false)
 
     private fun renameDevice(displayName: String) {
         if (displayName.length !in 1..64 || displayName.any { it.code !in 32..126 }) return
@@ -1557,7 +1589,12 @@ class TcpPeerVpnService : VpnService() {
                 )
                 inFlightSockets.remove(socket)
                 socket.close()
-                if (android.os.SystemClock.elapsedRealtime() < deadline) delay(100)
+                if (android.os.SystemClock.elapsedRealtime() < deadline) {
+                    // A fixed delay on both peers can phase-lock fast RST/
+                    // ECONNREFUSED retries, leaving neither socket in SYN-SENT
+                    // when the other SYN arrives. Jitter breaks that cycle.
+                    delay(if (error is ConnectException) Random.nextLong(15, 76) else 100)
+                }
             }
         }
         val label = if (family == DirectFamily.IPV6) "TCP6" else "TCP4"
@@ -2113,6 +2150,7 @@ class TcpPeerVpnService : VpnService() {
     }
 
     private fun disconnect() {
+        setConnectionDesired(false)
         disconnectRequested.set(true)
         connectionGeneration.incrementAndGet()
         val stoppedJob = connectionJob
@@ -2362,6 +2400,8 @@ class TcpPeerVpnService : VpnService() {
         private const val DEVICE_REFRESH_INTERVAL_MS = 5_000L
         private const val COORDINATOR_LIST_STALE_MS = 15_000L
         private const val MESH_PUNCH_RETRY_MS = 5_000L
+        private const val SERVICE_STATE_PREFERENCES = "tcppeer_service_state"
+        private const val CONNECTION_DESIRED_KEY = "connection_desired"
         private const val ANDROID_AUTO_PACKAGE = "com.google.android.projection.gearhead"
         private const val TAG = "TCPeerVpnService"
     }
