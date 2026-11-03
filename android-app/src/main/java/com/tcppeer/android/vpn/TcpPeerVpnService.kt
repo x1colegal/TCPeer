@@ -114,6 +114,7 @@ class TcpPeerVpnService : VpnService() {
     private val meshReadySentAt = ConcurrentHashMap<String, Long>()
     private val inFlightSockets: MutableSet<Socket> =
         Collections.newSetFromMap(ConcurrentHashMap<Socket, Boolean>())
+    private val endpointMappingSockets = ConcurrentHashMap<DirectFamily, Socket>()
     private val nextTppPingId = AtomicLong(System.nanoTime())
     private val connectionGeneration = AtomicLong(0)
     private val pendingTppPings = ConcurrentHashMap<Long, Pair<String, Long>>()
@@ -478,13 +479,25 @@ class TcpPeerVpnService : VpnService() {
         }
         val observed = TcpPeerProtocol.readControl(controlInput)
         if (observed.command != "ENDPOINT-INFO") throw ProtocolException("Coordinator did not report the TCP mapping")
-
-        var endpointIpv4 = if (localIpv4.isNotEmpty()) {
-            queryPublicEndpoint(config, DirectFamily.IPV4, physicalNetwork)
-        } else null
-        var endpointIpv6 = if (localIpv6.isNotEmpty()) {
-            queryPublicEndpoint(config, DirectFamily.IPV6, physicalNetwork)
-        } else null
+        val coordinatorFamily = if (coordinator.inetAddress is Inet6Address) {
+            DirectFamily.IPV6
+        } else {
+            DirectFamily.IPV4
+        }
+        val observedEndpoint = PublicEndpoint(
+            normalizeEndpointAddress(observed.field("Address").orEmpty()),
+            observed.field("Port")?.toIntOrNull() ?: config.directPort,
+        )
+        var endpointIpv4 = when {
+            localIpv4.isEmpty() -> null
+            coordinatorFamily == DirectFamily.IPV4 -> observedEndpoint
+            else -> queryPublicEndpoint(config, DirectFamily.IPV4, physicalNetwork)
+        }
+        var endpointIpv6 = when {
+            localIpv6.isEmpty() -> null
+            coordinatorFamily == DirectFamily.IPV6 -> observedEndpoint
+            else -> queryPublicEndpoint(config, DirectFamily.IPV6, physicalNetwork)
+        }
         val directPublicIpv4 = localIpv4.firstOrNull(TransportPolicy::isPublicIpv4)?.hostAddress
         val directPublicIpv6 = localIpv6.firstOrNull(TransportPolicy::isPublicIpv6)?.hostAddress?.substringBefore('%')
         var advertisedIpv4 = ""
@@ -606,10 +619,14 @@ class TcpPeerVpnService : VpnService() {
                 // The failed active socket may have replaced the NAPT mapping
                 // that was discovered before REGISTER. Refresh both mapped
                 // endpoints before requesting another coordinated punch.
-                endpointIpv4 = if (localIpv4.isNotEmpty()) {
+                endpointIpv4 = if (coordinatorFamily == DirectFamily.IPV4) {
+                    endpointIpv4
+                } else if (localIpv4.isNotEmpty()) {
                     queryPublicEndpoint(config, DirectFamily.IPV4, physicalNetwork)
                 } else null
-                endpointIpv6 = if (localIpv6.isNotEmpty()) {
+                endpointIpv6 = if (coordinatorFamily == DirectFamily.IPV6) {
+                    endpointIpv6
+                } else if (localIpv6.isNotEmpty()) {
                     queryPublicEndpoint(config, DirectFamily.IPV6, physicalNetwork)
                 } else null
                 registerCurrentEndpoints()
@@ -625,6 +642,11 @@ class TcpPeerVpnService : VpnService() {
         } finally {
             preDirectControlLiveness.cancel()
         }
+        // The winning direct socket now owns the NAT state for :7444. The
+        // endpoint-query sockets were intentionally kept open only through
+        // simultaneous-open so the advertised TCP4 mapping could not point at
+        // a recently closed socket while the new punch socket was SYN-SENT.
+        closeEndpointMappingSockets()
         val directInput = direct.getInputStream()
         val directOutput = direct.getOutputStream()
         TcpPeerProtocol.writeControl(directOutput, ControlMessage("PEER-INFO", linkedMapOf(
@@ -1434,13 +1456,14 @@ class TcpPeerVpnService : VpnService() {
             inFlightSockets.add(socket)
             try {
                 socket.reuseAddress = true
+                if (family == DirectFamily.IPV6) NativeSocketOptions.enableIpv6Only(socket)
                 physicalNetwork?.bindSocket(socket)
                 val wildcard = if (address is Inet6Address) InetAddress.getByName("::") else InetAddress.getByName("0.0.0.0")
-                // The coordinator is control-plane traffic. Binding it to the direct
-                // port conflicts with the passive TCP listener on Android kernels.
-                // The coordinator still observes the public IP; REGISTER explicitly
-                // advertises the direct listener port.
-                socket.bind(InetSocketAddress(wildcard, 0))
+                // Match the Linux transport: the long-lived coordinator socket
+                // owns the NAT mapping for its address family. SO_REUSEADDR lets
+                // listener and simultaneous-open sockets share :7444 while their
+                // remote tuples remain distinct.
+                socket.bind(InetSocketAddress(wildcard, config.directPort))
                 requireProtectedOrBound(socket, physicalNetwork, "coordinator")
                 socket.connect(InetSocketAddress(address, config.coordinatorPort), 10_000)
                 socket.tcpNoDelay = false
@@ -1460,6 +1483,7 @@ class TcpPeerVpnService : VpnService() {
         family: DirectFamily,
         physicalNetwork: Network?,
     ): PublicEndpoint? {
+        endpointMappingSockets.remove(family)?.let(::closeQuietly)
         val addresses = resolveCoordinatorAddresses(
             config.coordinatorAddress, physicalNetwork,
         ).filter {
@@ -1468,9 +1492,11 @@ class TcpPeerVpnService : VpnService() {
         }
         addresses.forEach { address ->
             val socket = Socket()
+            var retained = false
             inFlightSockets.add(socket)
             try {
                 socket.reuseAddress = true
+                if (family == DirectFamily.IPV6) NativeSocketOptions.enableIpv6Only(socket)
                 physicalNetwork?.bindSocket(socket)
                 val wildcard = if (family == DirectFamily.IPV6) InetAddress.getByName("::") else InetAddress.getByName("0.0.0.0")
                 socket.bind(InetSocketAddress(wildcard, config.directPort))
@@ -1483,7 +1509,16 @@ class TcpPeerVpnService : VpnService() {
                     val endpointAddress = response.field("Address")
                     val endpointPort = response.field("Port")?.toIntOrNull()
                     if (!endpointAddress.isNullOrBlank() && endpointPort != null) {
-                        return PublicEndpoint(endpointAddress, endpointPort)
+                        inFlightSockets.remove(socket)
+                        endpointMappingSockets[family] = socket
+                        retained = true
+                        Log.i(
+                            TAG,
+                            "Keeping ${familyLabel(family)} endpoint mapping alive " +
+                                "socket=${socketToken(socket)} local=${socket.localSocketAddress} " +
+                                "public=${formatEndpoint(InetAddress.getByName(endpointAddress), endpointPort)}",
+                        )
+                        return PublicEndpoint(normalizeEndpointAddress(endpointAddress), endpointPort)
                     }
                 }
             } catch (error: Exception) {
@@ -1495,10 +1530,15 @@ class TcpPeerVpnService : VpnService() {
                 )
             } finally {
                 inFlightSockets.remove(socket)
-                socket.close()
+                if (!retained) socket.close()
             }
         }
         return null
+    }
+
+    private fun closeEndpointMappingSockets() {
+        endpointMappingSockets.values.forEach(::closeQuietly)
+        endpointMappingSockets.clear()
     }
 
     private suspend fun openDirect(
@@ -1539,6 +1579,7 @@ class TcpPeerVpnService : VpnService() {
             inFlightSockets.add(socket)
             try {
             socket.reuseAddress = true
+            if (family == DirectFamily.IPV6) NativeSocketOptions.enableIpv6Only(socket)
             val boundNetwork = if (bindToUnderlying) {
                 synchronized(this@TcpPeerVpnService) { underlyingNetwork }
                     ?: throw IllegalStateException("No physical network is available for the direct socket")
@@ -1641,9 +1682,13 @@ class TcpPeerVpnService : VpnService() {
     private fun prepareDirectListener(localPort: Int, family: DirectFamily) {
         synchronized(directListeners) {
             if (directListeners[family]?.isClosed == false) return
+            if (family == DirectFamily.IPV6) NativeSocketOptions.beginServerSocketCreation()
             val listener = ServerSocket()
             try {
                 listener.reuseAddress = true
+                if (family == DirectFamily.IPV6) {
+                    NativeSocketOptions.enableIpv6OnlyOnCreatedServerSocket()
+                }
                 val wildcard = if (family == DirectFamily.IPV6) InetAddress.getByName("::") else InetAddress.getByName("0.0.0.0")
                 listener.bind(InetSocketAddress(wildcard, localPort), 32)
                 directListeners[family] = listener
@@ -2316,6 +2361,7 @@ class TcpPeerVpnService : VpnService() {
         meshReadySentAt.clear()
         inFlightSockets.forEach(::closeQuietly)
         inFlightSockets.clear()
+        closeEndpointMappingSockets()
         closeDirectListeners()
         closeQuietly(coordinatorSocket)
         coordinatorSocket = null
@@ -2378,6 +2424,20 @@ class TcpPeerVpnService : VpnService() {
 
     private fun formatEndpoint(address: InetAddress, port: Int): String =
         if (address is Inet6Address) "[${address.hostAddress?.substringBefore('%')}]:$port" else "${address.hostAddress}:$port"
+
+    private fun normalizeEndpointAddress(value: String): String {
+        val parsed = runCatching { InetAddress.getByName(value.substringBefore('%')) }.getOrNull()
+        if (parsed is Inet6Address) {
+            val bytes = parsed.address
+            val mapped = bytes.size == 16 &&
+                bytes.take(10).all { it == 0.toByte() } &&
+                bytes[10] == 0xff.toByte() && bytes[11] == 0xff.toByte()
+            if (mapped) {
+                return InetAddress.getByAddress(bytes.copyOfRange(12, 16)).hostAddress.orEmpty()
+            }
+        }
+        return value.substringBefore('%')
+    }
 
     private fun closeQuietly(value: Closeable?) {
         runCatching { value?.close() }

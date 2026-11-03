@@ -181,6 +181,11 @@ class Server:
         self._direct_attempt_counter = 0
         self._byte_counters: dict[tuple[str, str], int] = {}
         self._coordinator_writer = None
+        # A coordinator connection for the preferred family owns that family's
+        # observed NAT mapping.  The auxiliary ENDPOINT-QUERY connection must
+        # likewise stay open: closing a TCP flow can make a NAPT immediately
+        # discard the advertised public port before simultaneous-open starts.
+        self._endpoint_mapping_writers: dict[socket.AddressFamily, object] = {}
         self._registration_complete = asyncio.Event()
         self._pending_tpp_pings: dict[int, asyncio.Future] = {}
         self.exit_node = ExitNodeFirewall(config, config.tun_name)
@@ -260,6 +265,7 @@ class Server:
             self._direct_owner_keys.clear()
             self._direct_owner_peer_sessions.clear()
             self._direct_owner_committed.clear()
+            await self._close_endpoint_mapping_writers()
             await asyncio.gather(*(listener.wait_closed() for listener in self._listeners), return_exceptions=True)
             self.tun.close()
             self.exit_node.close()
@@ -374,6 +380,7 @@ class Server:
                 if writer is not None:
                     writer.close()
                     await asyncio.gather(writer.wait_closed(), return_exceptions=True)
+                await self._close_endpoint_mapping_writers()
             await asyncio.sleep(1)
 
     async def _control_session(self) -> None:
@@ -580,6 +587,10 @@ class Server:
                 LOG.warning("Ignoring invalid overlay address peer_id=%s address=%s", peer_id, value)
 
     async def _query_observed_endpoint(self, family: socket.AddressFamily) -> tuple[str, int] | None:
+        previous_writer = self._endpoint_mapping_writers.pop(family, None)
+        if previous_writer is not None:
+            previous_writer.close()
+            await asyncio.gather(previous_writer.wait_closed(), return_exceptions=True)
         local_address = self._direct_bind_ipv6 if family == socket.AF_INET6 else self._direct_bind_ipv4
         local_address = local_address or ("::" if family == socket.AF_INET6 else "0.0.0.0")
         results = await resolve_tcp_endpoints(self.config.coordinator_address, self.config.coordinator_port)
@@ -594,6 +605,7 @@ class Server:
                 if hasattr(socket, "SO_REUSEPORT"):
                     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
                 writer = None
+                retained = False
                 try:
                     sock.bind((local_address, self.config.direct_port))
                     await asyncio.wait_for(loop.sock_connect(sock, address), timeout=5)
@@ -613,9 +625,11 @@ class Server:
                         address_value = response.get("Address") or ""
                         port_value = int(response.get("Port") or 0)
                         if public_address(address_value) and port_value:
+                            self._endpoint_mapping_writers[family] = writer
+                            retained = True
                             LOG.info(
-                                "Discovered %s direct endpoint %s:%s on attempt %s",
-                                family_name, address_value, port_value, attempt,
+                                "Keeping %s endpoint mapping alive local=%s public=%s:%s attempt=%s",
+                                family_name, sock.getsockname(), address_value, port_value, attempt,
                             )
                             return address_value, port_value
                 except (OSError, TimeoutError, ProtocolError, asyncio.IncompleteReadError) as exc:
@@ -624,16 +638,27 @@ class Server:
                         family_name, attempt, exc,
                     )
                 finally:
-                    if writer is not None:
+                    if writer is not None and not retained:
                         writer.close()
                         await asyncio.gather(writer.wait_closed(), return_exceptions=True)
-                    else:
+                    elif writer is None:
                         sock.close()
             if attempt < 3:
                 await asyncio.sleep(0.25)
         if not family_results:
             LOG.warning("Coordinator DNS has no %s address; that family cannot be advertised", family_name)
         return None
+
+    async def _close_endpoint_mapping_writers(self) -> None:
+        writers = list(self._endpoint_mapping_writers.values())
+        self._endpoint_mapping_writers.clear()
+        for writer in writers:
+            writer.close()
+        if writers:
+            await asyncio.gather(
+                *(writer.wait_closed() for writer in writers),
+                return_exceptions=True,
+            )
 
     async def _open_coordinator_connection(self):
         """Use the direct local TCP port so the observed mapping is relevant."""

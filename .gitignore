@@ -13,5 +13,6 @@ dist/
 .kotlin/
 local.properties
 android-app/build/
+android-app/.cxx/
 captures/
 *.apk

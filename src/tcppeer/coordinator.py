@@ -146,9 +146,20 @@ class Coordinator:
         endpoint = writer.get_extra_info("peername") or ("unknown", 0)
         observed_address, observed_port = str(endpoint[0]), int(endpoint[1])
         try:
+            parsed_observed = ipaddress.ip_address(observed_address.split("%", 1)[0])
+            if isinstance(parsed_observed, ipaddress.IPv6Address) and parsed_observed.ipv4_mapped is not None:
+                observed_address = str(parsed_observed.ipv4_mapped)
+        except ValueError:
+            pass
+        try:
             auth = await read_control(reader, self.config.max_message_size)
             if auth.command == "ENDPOINT-QUERY":
                 await self.send(writer, "ENDPOINT-INFO", Address=observed_address, Port=str(observed_port))
+                # Keep the direct-port TCP mapping alive until the client has
+                # completed its simultaneous-open attempt. Closing immediately
+                # left Android's advertised TCP4 endpoint attached to a dead
+                # flow while its replacement socket was still SYN-SENT.
+                await reader.read()
                 return
             if auth.command != "AUTH":
                 raise ProtocolError("AUTH must be the first command")
