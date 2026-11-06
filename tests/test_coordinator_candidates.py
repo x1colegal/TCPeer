@@ -52,8 +52,8 @@ def test_private_ipv4_uses_matching_reported_interface_prefix() -> None:
     )
 
 
-def test_asymmetric_ipv4_prefixes_require_bidirectional_on_link_routes() -> None:
-    assert Coordinator._can_use_local_candidates(
+def test_mismatched_ipv4_prefixes_use_public_candidates_even_in_same_octets() -> None:
+    assert not Coordinator._can_use_local_candidates(
         "192.168.83.10",
         16,
         "192.168.83.20",

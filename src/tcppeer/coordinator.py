@@ -722,10 +722,10 @@ class Coordinator:
             right_network = ipaddress.IPv4Network((right_address, right_prefix), strict=False)
         except (ipaddress.AddressValueError, ipaddress.NetmaskValueError):
             return False
-        # The route must be on-link from both peers. A /16 peer and a /24 peer
-        # therefore use the LAN path only when each address belongs to the
-        # other peer's actual connected prefix.
-        return right_address in left_network and left_address in right_network
+        # Both peers must report the exact same IPv4 subnet and prefix length.
+        # A /16 peer and a /24 peer are on different networks even if their
+        # octets overlap, so they must use the public path.
+        return left_network == right_network
 
     @staticmethod
     def _parse_ipv4_prefix(value: str | None) -> int | None:
