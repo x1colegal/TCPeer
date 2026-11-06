@@ -5,7 +5,9 @@
 #include <dirent.h>
 #include <cstring>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <unistd.h>
 #include <unordered_set>
 
 namespace {
@@ -79,6 +81,44 @@ void enable_ipv6_only(JNIEnv* env, int fd) {
     }
 }
 
+bool replace_with_ipv4(JNIEnv* env, int candidate) {
+    const int ipv4_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (ipv4_fd < 0) {
+        char message[160];
+        snprintf(message, sizeof(message), "Cannot create AF_INET socket: %s", strerror(errno));
+        throw_socket_exception(env, message);
+        return false;
+    }
+    const int enabled = 1;
+    if (setsockopt(ipv4_fd, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled)) != 0) {
+        const int saved_errno = errno;
+        close(ipv4_fd);
+        char message[160];
+        snprintf(message, sizeof(message), "Cannot configure AF_INET socket: %s", strerror(saved_errno));
+        throw_socket_exception(env, message);
+        return false;
+    }
+    if (setsockopt(ipv4_fd, SOL_SOCKET, SO_REUSEPORT, &enabled, sizeof(enabled)) != 0 &&
+            errno != ENOPROTOOPT && errno != EOPNOTSUPP) {
+        const int saved_errno = errno;
+        close(ipv4_fd);
+        char message[160];
+        snprintf(message, sizeof(message), "Cannot configure AF_INET port reuse: %s", strerror(saved_errno));
+        throw_socket_exception(env, message);
+        return false;
+    }
+    if (dup2(ipv4_fd, candidate) < 0) {
+        const int saved_errno = errno;
+        close(ipv4_fd);
+        char message[160];
+        snprintf(message, sizeof(message), "Cannot install AF_INET socket: %s", strerror(saved_errno));
+        throw_socket_exception(env, message);
+        return false;
+    }
+    close(ipv4_fd);
+    return true;
+}
+
 }  // namespace
 
 extern "C" JNIEXPORT void JNICALL
@@ -92,6 +132,60 @@ Java_com_tcppeer_android_vpn_NativeSocketOptions_setIpv6Only(
     }
 
     enable_ipv6_only(env, fd);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_tcppeer_android_vpn_NativeSocketOptions_setMappingKeepAlive(
+        JNIEnv* env, jobject, jobject socket) {
+    const int fd = socket_fd(env, socket);
+    if (env->ExceptionCheck()) return;
+    if (fd < 0) {
+        throw_socket_exception(env, "TCP socket has no file descriptor");
+        return;
+    }
+    const int enabled = 1;
+    const int idle = 15;
+    const int interval = 5;
+    const int count = 3;
+    if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled)) != 0 ||
+            setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle)) != 0 ||
+            setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval)) != 0 ||
+            setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count)) != 0) {
+        char message[160];
+        snprintf(message, sizeof(message), "Cannot configure endpoint keepalive: %s", strerror(errno));
+        throw_socket_exception(env, message);
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_tcppeer_android_vpn_NativeSocketOptions_useIpv4Socket(
+        JNIEnv* env, jobject, jobject socket) {
+    const int fd = socket_fd(env, socket);
+    if (env->ExceptionCheck()) return;
+    if (fd < 0) {
+        throw_socket_exception(env, "TCP socket has no file descriptor");
+        return;
+    }
+    replace_with_ipv4(env, fd);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_tcppeer_android_vpn_NativeSocketOptions_bindIpv4Socket(
+        JNIEnv* env, jobject, jobject socket, jint port, jboolean listener) {
+    const int fd = socket_fd(env, socket);
+    if (env->ExceptionCheck()) return;
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_ANY);
+    address.sin_port = htons(static_cast<uint16_t>(port));
+    if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
+            (listener == JNI_TRUE && listen(fd, 32) != 0)) {
+        char message[160];
+        snprintf(message, sizeof(message), "Cannot bind AF_INET socket: %s", strerror(errno));
+        throw_socket_exception(env, message);
+        return;
+    }
+
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -120,4 +214,27 @@ Java_com_tcppeer_android_vpn_NativeSocketOptions_enableIpv6OnlyOnCreatedServerSo
         return;
     }
     enable_ipv6_only(env, candidate);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_tcppeer_android_vpn_NativeSocketOptions_useIpv4OnCreatedServerSocket(
+        JNIEnv* env, jobject) {
+    const auto current = open_file_descriptors();
+    int candidate = -1;
+    for (const int fd : current) {
+        if (server_socket_snapshot.count(fd) != 0 || !is_unbound_ipv6_stream_socket(fd)) continue;
+        if (candidate != -1) {
+            server_socket_snapshot.clear();
+            throw_socket_exception(env, "Multiple new server sockets were created");
+            return;
+        }
+        candidate = fd;
+    }
+    server_socket_snapshot.clear();
+    if (candidate == -1) {
+        throw_socket_exception(env, "Cannot locate the new server socket");
+        return;
+    }
+
+    replace_with_ipv4(env, candidate);
 }

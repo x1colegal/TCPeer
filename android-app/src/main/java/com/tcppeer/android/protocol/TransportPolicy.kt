@@ -8,6 +8,15 @@ import java.net.NetworkInterface
 enum class DirectFamily { IPV4, IPV6 }
 
 object TransportPolicy {
+    fun prefixLength(address: InetAddress?): Int? {
+        if (address !is Inet4Address) return null
+        return NetworkInterface.getNetworkInterfaces()?.toList().orEmpty()
+            .flatMap { it.interfaceAddresses.orEmpty() }
+            .firstOrNull { it.address == address }
+            ?.networkPrefixLength
+            ?.toInt()
+    }
+
     fun clatIpv4Addresses(): List<Inet4Address> =
         NetworkInterface.getNetworkInterfaces()?.toList().orEmpty()
             .filter { networkInterface ->

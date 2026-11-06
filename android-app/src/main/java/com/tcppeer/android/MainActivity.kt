@@ -1114,7 +1114,8 @@ private fun DeviceCard(
                 )
             }
             Text(
-                "Transport: ${device.transport}. PeerNet IPv6: ${device.overlayIpv6}",
+                if (isSelf) "PeerNet IPv6: ${device.overlayIpv6}"
+                else "Transport: ${device.transport}. PeerNet IPv6: ${device.overlayIpv6}",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.bodySmall,
             )
@@ -1130,8 +1131,8 @@ private fun DeviceCard(
                     DetailRow("Peer ID", device.peerId)
                     DetailRow("Role", device.role)
                     DetailRow("Platform", device.platform)
-                    DetailRow("Transport", device.transport)
                     if (!isSelf) {
+                        DetailRow("Transport", device.transport)
                         DetailRow("Direct connection endpoint", device.connectedUsing)
                     }
                     DetailRow("Public IPv4", device.ipv4)

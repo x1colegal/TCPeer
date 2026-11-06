@@ -58,6 +58,7 @@ import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.FileDescriptor
 import java.net.Inet4Address
 import java.net.Inet6Address
 import java.net.InetAddress
@@ -342,14 +343,12 @@ class TcpPeerVpnService : VpnService() {
                         Log.i(TAG, "Superseded connection generation=$generation stopped; starting the replacement session")
                         connectionJob = null
                         restartRequested.set(false)
-                        TcpPeerRuntime.update {
-                            it.copy(
+                        TcpPeerRuntime.replace(
+                            VpnRuntimeState(
                                 status = ConnectionStatus.CONNECTING,
                                 detail = "Underlying network changed. Reconnecting.",
-                                connectedAtMillis = null,
-                                devices = emptyList(),
-                            )
-                        }
+                            ),
+                        )
                         updateNotification(ConnectionStatus.CONNECTING)
                         serviceScope.launch {
                             delay(250)
@@ -370,18 +369,16 @@ class TcpPeerVpnService : VpnService() {
                 } else {
                     connectionJob = null
 
-                    TcpPeerRuntime.update {
-                        it.copy(
+                    TcpPeerRuntime.replace(
+                        VpnRuntimeState(
                             status = ConnectionStatus.CONNECTING,
                             detail = if (networkRestart) {
                                 "Underlying network changed. Reconnecting."
                             } else {
                                 "Connection lost. Reconnecting."
                             },
-                            connectedAtMillis = null,
-                            devices = emptyList(),
-                        )
-                    }
+                        ),
+                    )
                     updateNotification(ConnectionStatus.CONNECTING)
 
                     serviceScope.launch {
@@ -399,16 +396,27 @@ class TcpPeerVpnService : VpnService() {
 
     private fun restartForNetworkChange() {
         if (!restartRequested.compareAndSet(false, true)) return
-        connectionGeneration.incrementAndGet()
-        TcpPeerRuntime.update {
-            it.copy(
+        val newGeneration = connectionGeneration.incrementAndGet()
+        TcpPeerRuntime.replace(
+            VpnRuntimeState(
                 status = ConnectionStatus.CONNECTING,
                 detail = "Underlying network changed. Rediscovering public endpoints.",
-                devices = emptyList(),
-            )
-        }
+            ),
+        )
+        updateNotification(ConnectionStatus.CONNECTING)
         connectionJob?.cancel()
         closeResources()
+        serviceScope.launch {
+            delay(500)
+            if (
+                !disconnectRequested.get() &&
+                connectionGeneration.get() == newGeneration &&
+                connectionJob?.isActive != true
+            ) {
+                restartRequested.set(false)
+                connect()
+            }
+        }
     }
 
     private fun reportClientError(error: Exception) {
@@ -504,6 +512,7 @@ class TcpPeerVpnService : VpnService() {
         var advertisedIpv6 = ""
 
         fun registerCurrentEndpoints() {
+            val localIpv4Address = localIpv4.firstOrNull()
             advertisedIpv4 = endpointIpv4?.address ?: directPublicIpv4.orEmpty()
             advertisedIpv6 = endpointIpv6?.address ?: directPublicIpv6.orEmpty()
             val mappedIpv4Port = endpointIpv4?.port ?: if (directPublicIpv4 != null) config.directPort else null
@@ -515,7 +524,8 @@ class TcpPeerVpnService : VpnService() {
                 "IPv6" to advertisedIpv6,
                 "Mapped-IPv4-Port" to (mappedIpv4Port?.toString() ?: ""),
                 "Mapped-IPv6-Port" to (mappedIpv6Port?.toString() ?: ""),
-                "Local-IPv4" to (localIpv4.firstOrNull()?.hostAddress ?: ""),
+                "Local-IPv4" to (localIpv4Address?.hostAddress ?: ""),
+                "Local-IPv4-Prefix" to (TransportPolicy.prefixLength(localIpv4Address)?.toString() ?: ""),
                 "Local-IPv6" to (localIpv6.firstOrNull()?.hostAddress?.substringBefore('%') ?: ""),
                 "Port" to config.directPort.toString(),
                 "Role" to "Client",
@@ -728,10 +738,21 @@ class TcpPeerVpnService : VpnService() {
                     closeQuietly(direct)
                 }
             }
-            prepareDirectListener(config.directPort, family)
-            val passiveAcceptJob = launch(Dispatchers.IO) {
+            // Mesh peers may use either family independently of the primary
+            // Exit Node connection. Keep one V6-only listener and one native
+            // IPv4 listener available at the direct port.
+            prepareDirectListener(config.directPort, DirectFamily.IPV4)
+            prepareDirectListener(config.directPort, DirectFamily.IPV6)
+            val passiveIpv4AcceptJob = launch(Dispatchers.IO) {
                 acceptMeshConnections(
-                    family,
+                    DirectFamily.IPV4,
+                    config, advertisedIpv4, advertisedIpv6,
+                    addresses.second.address, peerOutputs, tunPackets,
+                )
+            }
+            val passiveIpv6AcceptJob = launch(Dispatchers.IO) {
+                acceptMeshConnections(
+                    DirectFamily.IPV6,
                     config, advertisedIpv4, advertisedIpv6,
                     addresses.second.address, peerOutputs, tunPackets,
                 )
@@ -768,8 +789,7 @@ class TcpPeerVpnService : VpnService() {
                                     platform = message.field("Platform") ?: "Unknown",
                                     transport = message.field("Peer-ID")?.let(meshSockets::get)
                                         ?.let(::socketFamily)
-                                        ?: message.field("Transport")
-                                        ?: "None",
+                                        ?: "-",
                                     ipv4 = message.field("IPv4").orEmpty().ifBlank { "-" },
                                     ipv6 = message.field("IPv6").orEmpty().ifBlank { "-" },
                                     overlayIpv4 = message.field("Overlay-IPv4").orEmpty().ifBlank { "-" },
@@ -926,7 +946,8 @@ class TcpPeerVpnService : VpnService() {
                 closeDirectListeners()
                 meshSockets.values.forEach(::closeQuietly)
                 coordinatorControlJob.cancel()
-                passiveAcceptJob.cancel()
+                passiveIpv4AcceptJob.cancel()
+                passiveIpv6AcceptJob.cancel()
                 tunPackets.close()
                 tunWriterJob.cancel()
                 closeQuietly(tunStreams.input)
@@ -1401,7 +1422,9 @@ class TcpPeerVpnService : VpnService() {
                         message.field("Peer-ID")?.let(meshSockets::containsKey) == true,
                     role = message.field("Role") ?: "Client",
                     platform = message.field("Platform") ?: "Unknown",
-                    transport = message.field("Transport") ?: "None",
+                    transport = message.field("Peer-ID")?.let(meshSockets::get)
+                        ?.let(::socketFamily)
+                        ?: "-",
                     ipv4 = message.field("IPv4").orEmpty().ifBlank { "-" },
                     ipv6 = message.field("IPv6").orEmpty().ifBlank { "-" },
                     overlayIpv4 = message.field("Overlay-IPv4").orEmpty().ifBlank { "-" },
@@ -1452,17 +1475,16 @@ class TcpPeerVpnService : VpnService() {
         var lastError: Exception? = null
         addresses.forEach { address ->
             val family = if (address is Inet6Address) DirectFamily.IPV6 else DirectFamily.IPV4
-            val socket = Socket()
+            val socket = OsTcpSocket(if (family == DirectFamily.IPV6) OsConstants.AF_INET6 else OsConstants.AF_INET)
             inFlightSockets.add(socket)
             try {
                 socket.reuseAddress = true
-                if (family == DirectFamily.IPV6) NativeSocketOptions.enableIpv6Only(socket)
-                physicalNetwork?.bindSocket(socket)
                 val wildcard = if (address is Inet6Address) InetAddress.getByName("::") else InetAddress.getByName("0.0.0.0")
                 // Match the Linux transport: the long-lived coordinator socket
                 // owns the NAT mapping for its address family. SO_REUSEADDR lets
                 // listener and simultaneous-open sockets share :7444 while their
                 // remote tuples remain distinct.
+                socket.bindNetwork(physicalNetwork)
                 socket.bind(InetSocketAddress(wildcard, config.directPort))
                 requireProtectedOrBound(socket, physicalNetwork, "coordinator")
                 socket.connect(InetSocketAddress(address, config.coordinatorPort), 10_000)
@@ -1491,17 +1513,17 @@ class TcpPeerVpnService : VpnService() {
                 (family == DirectFamily.IPV4 && it is Inet4Address)
         }
         addresses.forEach { address ->
-            val socket = Socket()
+            val socket = OsTcpSocket(if (family == DirectFamily.IPV6) OsConstants.AF_INET6 else OsConstants.AF_INET)
             var retained = false
             inFlightSockets.add(socket)
             try {
                 socket.reuseAddress = true
-                if (family == DirectFamily.IPV6) NativeSocketOptions.enableIpv6Only(socket)
-                physicalNetwork?.bindSocket(socket)
                 val wildcard = if (family == DirectFamily.IPV6) InetAddress.getByName("::") else InetAddress.getByName("0.0.0.0")
+                socket.bindNetwork(physicalNetwork)
                 socket.bind(InetSocketAddress(wildcard, config.directPort))
                 requireProtectedOrBound(socket, physicalNetwork, "endpoint query")
                 socket.connect(InetSocketAddress(address, config.coordinatorPort), 5_000)
+                socket.enableMappingKeepAlive()
                 socket.soTimeout = 5_000
                 TcpPeerProtocol.writeControl(socket.getOutputStream(), ControlMessage("ENDPOINT-QUERY"))
                 val response = TcpPeerProtocol.readControl(socket.getInputStream())
@@ -1575,22 +1597,21 @@ class TcpPeerVpnService : VpnService() {
         while (android.os.SystemClock.elapsedRealtime() < deadline) {
             currentCoroutineContext().ensureActive()
             attempt += 1
-            val socket = Socket()
+            val socket = OsTcpSocket(if (family == DirectFamily.IPV6) OsConstants.AF_INET6 else OsConstants.AF_INET)
             inFlightSockets.add(socket)
             try {
             socket.reuseAddress = true
-            if (family == DirectFamily.IPV6) NativeSocketOptions.enableIpv6Only(socket)
             val boundNetwork = if (bindToUnderlying) {
                 synchronized(this@TcpPeerVpnService) { underlyingNetwork }
                     ?: throw IllegalStateException("No physical network is available for the direct socket")
             } else {
                 null
             }
-            boundNetwork?.bindSocket(socket)
             val wildcard = if (family == DirectFamily.IPV6) InetAddress.getByName("::") else InetAddress.getByName("0.0.0.0")
             // TCP simultaneous-open requires the same local endpoint that was
             // used for public mapping discovery. An ephemeral source port makes
             // two-NAT hole punching impossible.
+            socket.bindNetwork(boundNetwork)
             socket.bind(InetSocketAddress(wildcard, localPort))
             Log.i(
                 TAG,
@@ -1643,7 +1664,8 @@ class TcpPeerVpnService : VpnService() {
     }
 
     private fun requireProtectedOrBound(socket: Socket, network: Network?, purpose: String) {
-        if (protect(socket)) return
+        if (socket is OsTcpSocket && protectDescriptor(socket.fileDescriptor)) return
+        if (socket !is OsTcpSocket && protect(socket)) return
         if (network != null) {
             // During handover from another VpnService, Android can keep the old
             // VPN prepared until this service establishes its tunnel. In that
@@ -1657,12 +1679,22 @@ class TcpPeerVpnService : VpnService() {
         throw IllegalStateException("Cannot protect the $purpose socket from the VPN")
     }
 
+    private fun protectDescriptor(descriptor: FileDescriptor): Boolean {
+        val duplicate = ParcelFileDescriptor.dup(descriptor)
+        return try {
+            protect(duplicate.fd)
+        } finally {
+            duplicate.close()
+        }
+    }
+
     private fun acceptPassiveDirect(family: DirectFamily): Socket {
         val listener = synchronized(directListeners) { directListeners[family] }
             ?: throw IllegalStateException("No passive direct listener is available")
         listener.soTimeout = 1_000
         return listener.accept().also {
-            if (!protect(it)) {
+            val protected = if (it is OsTcpSocket) protectDescriptor(it.fileDescriptor) else protect(it)
+            if (!protected) {
                 it.close()
                 throw IllegalStateException("Cannot protect the accepted direct socket from the VPN")
             }
@@ -1682,15 +1714,13 @@ class TcpPeerVpnService : VpnService() {
     private fun prepareDirectListener(localPort: Int, family: DirectFamily) {
         synchronized(directListeners) {
             if (directListeners[family]?.isClosed == false) return
-            if (family == DirectFamily.IPV6) NativeSocketOptions.beginServerSocketCreation()
-            val listener = ServerSocket()
+            val listener = OsTcpServerSocket(
+                if (family == DirectFamily.IPV6) OsConstants.AF_INET6 else OsConstants.AF_INET,
+            )
             try {
                 listener.reuseAddress = true
-                if (family == DirectFamily.IPV6) {
-                    NativeSocketOptions.enableIpv6OnlyOnCreatedServerSocket()
-                }
-                val wildcard = if (family == DirectFamily.IPV6) InetAddress.getByName("::") else InetAddress.getByName("0.0.0.0")
-                listener.bind(InetSocketAddress(wildcard, localPort), 32)
+                val wildcard = if (family == DirectFamily.IPV6) "::" else "0.0.0.0"
+                listener.bind(InetSocketAddress(InetAddress.getByName(wildcard), localPort), 32)
                 directListeners[family] = listener
                 Log.i(
                     TAG,

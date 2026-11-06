@@ -42,6 +42,7 @@ class RegisteredPeer:
     mapped_ipv6_port: int | None = None
     local_ipv4: str | None = None
     local_ipv6: str | None = None
+    local_ipv4_prefix: int | None = None
     listen_port: int | None = None
     role: str = "Client"
     platform: str = "Unknown"
@@ -266,6 +267,7 @@ class Coordinator:
             peer.mapped_ipv6_port = int(mapped_ipv6_port) if mapped_ipv6_port else None
             peer.local_ipv4 = message.get("Local-IPv4")
             peer.local_ipv6 = message.get("Local-IPv6")
+            peer.local_ipv4_prefix = self._parse_ipv4_prefix(message.get("Local-IPv4-Prefix"))
             port = message.get("Port")
             peer.listen_port = int(port) if port else peer.observed_port
             peer.role = message.get("Role") or "Client"
@@ -522,13 +524,12 @@ class Coordinator:
                     )
                 )
             return
-        same_public_origin = left.observed_address == right.observed_address
         # A shared GUA /64 is globally unambiguous even when the two control
         # sockets reached the coordinator through different address families.
         # Requiring identical observed control endpoints here incorrectly sent
         # same-LAN peers through their NAPT66 mappings, which may not hairpin.
         local_ipv6_path = self._can_use_local_candidates(
-            left.local_ipv6, right.local_ipv6, 6, same_public_origin,
+            left.local_ipv6, None, right.local_ipv6, None, 6,
         )
         both_ipv6 = (
             is_usable_ipv6(left.declared_ipv6) and is_usable_ipv6(right.declared_ipv6)
@@ -557,7 +558,11 @@ class Coordinator:
         local_left = left.local_ipv6 if both_ipv6 else left.local_ipv4
         local_right = right.local_ipv6 if both_ipv6 else right.local_ipv4
         local_candidates_available = self._can_use_local_candidates(
-            local_left, local_right, 6 if both_ipv6 else 4, same_public_origin,
+            local_left,
+            None if both_ipv6 else left.local_ipv4_prefix,
+            local_right,
+            None if both_ipv6 else right.local_ipv4_prefix,
+            6 if both_ipv6 else 4,
         )
         previous_local = self._last_local_punch.get(pair)
         repeated_local_attempt = (
@@ -697,9 +702,10 @@ class Coordinator:
     def _can_use_local_candidates(
         cls,
         left: str | None,
+        left_prefix: int | None,
         right: str | None,
+        right_prefix: int | None,
         version: int,
-        same_public_origin: bool,
     ) -> bool:
         if version == 6:
             return (
@@ -707,7 +713,27 @@ class Coordinator:
                 and is_usable_ipv6(right)
                 and cls._same_local_network(left, right, version)
             )
-        return same_public_origin and cls._same_local_network(left, right, version)
+        if not left or not right or left_prefix is None or right_prefix is None:
+            return False
+        try:
+            left_address = ipaddress.IPv4Address(left)
+            right_address = ipaddress.IPv4Address(right)
+            left_network = ipaddress.IPv4Network((left_address, left_prefix), strict=False)
+            right_network = ipaddress.IPv4Network((right_address, right_prefix), strict=False)
+        except (ipaddress.AddressValueError, ipaddress.NetmaskValueError):
+            return False
+        # The route must be on-link from both peers. A /16 peer and a /24 peer
+        # therefore use the LAN path only when each address belongs to the
+        # other peer's actual connected prefix.
+        return right_address in left_network and left_address in right_network
+
+    @staticmethod
+    def _parse_ipv4_prefix(value: str | None) -> int | None:
+        try:
+            prefix = int(value or "")
+        except ValueError:
+            return None
+        return prefix if 0 <= prefix <= 32 else None
 
 
 def build_parser() -> argparse.ArgumentParser:

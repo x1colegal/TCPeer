@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import errno
 import fcntl
 import ipaddress
 import logging
@@ -137,6 +138,35 @@ def discover_direct_ipv6(excluded_interfaces: set[str] | None = None) -> str | N
             continue
         if name in interfaces.values():
             return address
+    return None
+
+
+def discover_ipv4_prefix(address: str | None) -> int | None:
+    """Return the kernel prefix length for one local IPv4 address."""
+    if not address:
+        return None
+    try:
+        parsed = ipaddress.IPv4Address(address)
+    except ValueError:
+        return None
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        for _index, name in socket.if_nameindex():
+            request = struct.pack("256s", name.encode("ascii", "ignore")[:15])
+            try:
+                candidate = socket.inet_ntoa(
+                    fcntl.ioctl(probe.fileno(), 0x8915, request)[20:24],
+                )
+                if ipaddress.IPv4Address(candidate) != parsed:
+                    continue
+                mask = socket.inet_ntoa(
+                    fcntl.ioctl(probe.fileno(), 0x891B, request)[20:24],
+                )
+                return ipaddress.IPv4Network(f"0.0.0.0/{mask}").prefixlen
+            except (OSError, ValueError):
+                continue
+    finally:
+        probe.close()
     return None
 
 
@@ -440,6 +470,7 @@ class Server:
             "Mapped-IPv4-Port": str(self._registered_port_ipv4 or ""),
             "Mapped-IPv6-Port": str(self._registered_port_ipv6 or ""),
             "Local-IPv4": self._direct_bind_ipv4 or "",
+            "Local-IPv4-Prefix": str(discover_ipv4_prefix(self._direct_bind_ipv4) or ""),
             "Local-IPv6": self._direct_bind_ipv6 or "",
             "Port": str(self.config.direct_port),
             "Role": self._registration_role(),
@@ -597,7 +628,12 @@ class Server:
         loop = asyncio.get_running_loop()
         family_name = "IPv6" if family == socket.AF_INET6 else "IPv4"
         family_results = [item for item in results if item[0] == family]
-        for attempt in range(1, 4):
+        # A service restart can briefly leave the previous mapping's identical
+        # four-tuple in FIN-WAIT.  Keep retrying EADDRNOTAVAIL long enough for
+        # kernel cleanup instead of permanently dropping this address family.
+        max_attempts = 15
+        for attempt in range(1, max_attempts + 1):
+            retry_delay = 0.25
             for candidate_family, socktype, protocol, _name, address in family_results:
                 sock = socket.socket(candidate_family, socktype, protocol)
                 sock.setblocking(False)
@@ -618,6 +654,10 @@ class Server:
                     transport_socket = writer.get_extra_info("socket")
                     if transport_socket is not None:
                         transport_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 0)
+                        transport_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                        transport_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 15)
+                        transport_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
+                        transport_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
                     writer.write(ControlMessage("ENDPOINT-QUERY", {}).encode())
                     await writer.drain()
                     response = await asyncio.wait_for(read_control(reader), timeout=5)
@@ -633,6 +673,8 @@ class Server:
                             )
                             return address_value, port_value
                 except (OSError, TimeoutError, ProtocolError, asyncio.IncompleteReadError) as exc:
+                    if isinstance(exc, OSError) and exc.errno == errno.EADDRNOTAVAIL:
+                        retry_delay = 1.0
                     LOG.warning(
                         "%s endpoint discovery attempt %s failed: %s",
                         family_name, attempt, exc,
@@ -643,8 +685,8 @@ class Server:
                         await asyncio.gather(writer.wait_closed(), return_exceptions=True)
                     elif writer is None:
                         sock.close()
-            if attempt < 3:
-                await asyncio.sleep(0.25)
+            if attempt < max_attempts:
+                await asyncio.sleep(retry_delay)
         if not family_results:
             LOG.warning("Coordinator DNS has no %s address; that family cannot be advertised", family_name)
         return None
@@ -653,6 +695,19 @@ class Server:
         writers = list(self._endpoint_mapping_writers.values())
         self._endpoint_mapping_writers.clear()
         for writer in writers:
+            transport_socket = writer.get_extra_info("socket")
+            if transport_socket is not None:
+                try:
+                    # The mapping is protocol state, not application data.  A
+                    # reset prevents a restarted process from inheriting an
+                    # unusable FIN-WAIT four-tuple on direct_port.
+                    transport_socket.setsockopt(
+                        socket.SOL_SOCKET,
+                        socket.SO_LINGER,
+                        struct.pack("ii", 1, 0),
+                    )
+                except OSError:
+                    pass
             writer.close()
         if writers:
             await asyncio.gather(
