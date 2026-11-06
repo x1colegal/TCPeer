@@ -315,8 +315,14 @@ class TcpPeerVpnService : VpnService() {
                     TcpPeerRuntime.update {
                         it.copy(
                             status = ConnectionStatus.NO_DIRECT_CONNECTION,
+                            endpoint = "-",
+                            overlayIpv4 = "-",
+                            overlayIpv6 = "-",
                             detail = error.message ?: "The direct connection failed.",
                             connectedAtMillis = null,
+                            devices = it.devices.map { device ->
+                                device.copy(connectedUsing = "-", transport = "-")
+                            },
                         )
                     }
                     updateNotification(ConnectionStatus.NO_DIRECT_CONNECTION)
@@ -779,35 +785,67 @@ class TcpPeerVpnService : VpnService() {
 
                         when (message.command) {
                             "PEER-INFO" -> when (message.field("Action")) {
-                                "Device" -> devices += NetworkDevice(
-                                    peerId = message.field("Peer-ID") ?: "unknown",
-                                    displayName = message.field("Device-Name")
-                                        ?: message.field("Peer-ID") ?: "Unknown device",
-                                    online = message.field("Online") == "yes" ||
-                                        message.field("Peer-ID")?.let(meshSockets::containsKey) == true,
-                                    role = message.field("Role") ?: "Client",
-                                    platform = message.field("Platform") ?: "Unknown",
-                                    transport = message.field("Peer-ID")?.let(meshSockets::get)
-                                        ?.let(::socketFamily)
-                                        ?: "-",
-                                    ipv4 = message.field("IPv4").orEmpty().ifBlank { "-" },
-                                    ipv6 = message.field("IPv6").orEmpty().ifBlank { "-" },
-                                    overlayIpv4 = message.field("Overlay-IPv4").orEmpty().ifBlank { "-" },
-                                    overlayIpv6 = message.field("Overlay-IPv6").orEmpty().ifBlank { "-" },
-                                    connectedUsing = message.field("Peer-ID")?.let(meshEndpoints::get) ?: "-",
-                                ).also { device ->
-                                    if (
-                                        device.online &&
-                                        device.peerId != config.peerId &&
-                                        device.peerId != targetPeerId &&
-                                        !meshSockets.containsKey(device.peerId) &&
-                                        shouldRequestMeshPunch(device.peerId)
-                                    ) {
-                                        Log.i(TAG, "Requesting mesh punch peer_id=${device.peerId} reason=no-direct-socket")
-                                        writeCoordinatorControl(
-                                            controlOutput,
-                                            ControlMessage("PUNCH-READY", mapOf("Peer-ID" to device.peerId)),
-                                        )
+                                "Device" -> {
+                                    val devicePeerId = message.field("Peer-ID") ?: "unknown"
+                                    val coordinatorOnline = message.field("Online") == "yes"
+                                    if (!coordinatorOnline && devicePeerId != targetPeerId) {
+                                        val staleSocket = synchronized(meshAdoptionLock) {
+                                            meshSocketKeys.remove(devicePeerId)
+                                            meshEndpoints.remove(devicePeerId)
+                                            meshCommitted.remove(devicePeerId)
+                                            meshSockets.remove(devicePeerId)
+                                        }
+                                        staleSocket?.let {
+                                            peerOutputs.remove(devicePeerId)
+                                            closeQuietly(it)
+                                        }
+                                    }
+                                    val activeSocket = synchronized(meshAdoptionLock) {
+                                        val current = meshSockets[devicePeerId]
+                                        if (current != null && current.isClosed) {
+                                            if (meshSockets.remove(devicePeerId, current)) {
+                                                meshSocketKeys.remove(devicePeerId)
+                                                meshEndpoints.remove(devicePeerId)
+                                                meshCommitted.remove(devicePeerId)
+                                            }
+                                            peerOutputs.remove(devicePeerId)
+                                            null
+                                        } else {
+                                            current
+                                        }
+                                    }
+                                    val activeEndpoint = if (activeSocket != null) {
+                                        meshEndpoints[devicePeerId] ?: formatSocketEndpoint(activeSocket)
+                                    } else {
+                                        "-"
+                                    }
+                                    devices += NetworkDevice(
+                                        peerId = devicePeerId,
+                                        displayName = message.field("Device-Name")
+                                            ?: message.field("Peer-ID") ?: "Unknown device",
+                                        online = coordinatorOnline || activeSocket != null,
+                                        role = message.field("Role") ?: "Client",
+                                        platform = message.field("Platform") ?: "Unknown",
+                                        transport = activeSocket?.let(::socketFamily) ?: "-",
+                                        ipv4 = message.field("IPv4").orEmpty().ifBlank { "-" },
+                                        ipv6 = message.field("IPv6").orEmpty().ifBlank { "-" },
+                                        overlayIpv4 = message.field("Overlay-IPv4").orEmpty().ifBlank { "-" },
+                                        overlayIpv6 = message.field("Overlay-IPv6").orEmpty().ifBlank { "-" },
+                                        connectedUsing = activeEndpoint,
+                                    ).also { device ->
+                                        if (
+                                            device.online &&
+                                            device.peerId != config.peerId &&
+                                            device.peerId != targetPeerId &&
+                                            activeSocket == null &&
+                                            shouldRequestMeshPunch(device.peerId)
+                                        ) {
+                                            Log.i(TAG, "Requesting mesh punch peer_id=${device.peerId} reason=no-direct-socket")
+                                            writeCoordinatorControl(
+                                                controlOutput,
+                                                ControlMessage("PUNCH-READY", mapOf("Peer-ID" to device.peerId)),
+                                            )
+                                        }
                                     }
                                 }
 
@@ -1072,11 +1110,18 @@ class TcpPeerVpnService : VpnService() {
                 liveness.cancel()
                 keepalive.cancel()
                 peerOutputs.remove(peerId, output)
-                if (meshSockets.remove(peerId, socket)) {
-                    meshSocketKeys.remove(peerId, connectionKey(socket))
-                    meshEndpoints.remove(peerId)
-                    meshCommitted.remove(peerId)
-                    updateConnectedUsing(peerId, "-", null)
+                val removed = synchronized(meshAdoptionLock) {
+                    if (meshSockets.remove(peerId, socket)) {
+                        meshSocketKeys.remove(peerId)
+                        meshEndpoints.remove(peerId)
+                        meshCommitted.remove(peerId)
+                        true
+                    } else {
+                        false
+                    }
+                }
+                if (removed) {
+                    updateConnectedUsing(peerId, "-", "-")
                 }
             }
         } catch (error: Exception) {
@@ -1216,11 +1261,18 @@ class TcpPeerVpnService : VpnService() {
             )
         } finally {
             output?.let { peerOutputs.remove(peerId, it) }
-            if (meshSockets.remove(peerId, socket)) {
-                meshSocketKeys.remove(peerId, connectionKey(socket))
-                meshEndpoints.remove(peerId)
-                meshCommitted.remove(peerId)
-                updateConnectedUsing(peerId, "-", null)
+            val removed = synchronized(meshAdoptionLock) {
+                if (meshSockets.remove(peerId, socket)) {
+                    meshSocketKeys.remove(peerId)
+                    meshEndpoints.remove(peerId)
+                    meshCommitted.remove(peerId)
+                    true
+                } else {
+                    false
+                }
+            }
+            if (removed) {
+                updateConnectedUsing(peerId, "-", "-")
             }
             meshConnecting.remove(peerId)
             meshReadySentAt.remove(peerId)
@@ -1414,23 +1466,32 @@ class TcpPeerVpnService : VpnService() {
                     )) }
                     return
                 }
-                "Device" -> devices += NetworkDevice(
-                    peerId = message.field("Peer-ID") ?: "unknown",
-                    displayName = message.field("Device-Name")
-                        ?: message.field("Peer-ID") ?: "Unknown device",
-                    online = message.field("Online") == "yes" ||
-                        message.field("Peer-ID")?.let(meshSockets::containsKey) == true,
-                    role = message.field("Role") ?: "Client",
-                    platform = message.field("Platform") ?: "Unknown",
-                    transport = message.field("Peer-ID")?.let(meshSockets::get)
-                        ?.let(::socketFamily)
-                        ?: "-",
-                    ipv4 = message.field("IPv4").orEmpty().ifBlank { "-" },
-                    ipv6 = message.field("IPv6").orEmpty().ifBlank { "-" },
-                    overlayIpv4 = message.field("Overlay-IPv4").orEmpty().ifBlank { "-" },
-                    overlayIpv6 = message.field("Overlay-IPv6").orEmpty().ifBlank { "-" },
-                    connectedUsing = message.field("Peer-ID")?.let(meshEndpoints::get) ?: "-",
-                )
+                "Device" -> {
+                    val devicePeerId = message.field("Peer-ID") ?: "unknown"
+                    val coordinatorOnline = message.field("Online") == "yes"
+                    val activeSocket = synchronized(meshAdoptionLock) {
+                        meshSockets[devicePeerId]?.takeUnless { it.isClosed }
+                    }
+                    val activeEndpoint = if (activeSocket != null) {
+                        meshEndpoints[devicePeerId] ?: formatSocketEndpoint(activeSocket)
+                    } else {
+                        "-"
+                    }
+                    devices += NetworkDevice(
+                        peerId = devicePeerId,
+                        displayName = message.field("Device-Name")
+                            ?: message.field("Peer-ID") ?: "Unknown device",
+                        online = coordinatorOnline || activeSocket != null,
+                        role = message.field("Role") ?: "Client",
+                        platform = message.field("Platform") ?: "Unknown",
+                        transport = activeSocket?.let(::socketFamily) ?: "-",
+                        ipv4 = message.field("IPv4").orEmpty().ifBlank { "-" },
+                        ipv6 = message.field("IPv6").orEmpty().ifBlank { "-" },
+                        overlayIpv4 = message.field("Overlay-IPv4").orEmpty().ifBlank { "-" },
+                        overlayIpv6 = message.field("Overlay-IPv6").orEmpty().ifBlank { "-" },
+                        connectedUsing = activeEndpoint,
+                    )
+                }
             }
         }
     }

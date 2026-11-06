@@ -35,6 +35,10 @@ internal class OsTcpSocket internal constructor(
     @Volatile private var bound = accepted
     @Volatile private var connected = accepted
     @Volatile private var timeoutMillis = 0
+    @Volatile private var cachedLocalAddress: SocketAddress? =
+        if (accepted) runCatching { Os.getsockname(fileDescriptor) }.getOrNull() else null
+    @Volatile private var cachedRemoteAddress: SocketAddress? =
+        if (accepted) runCatching { Os.getpeername(fileDescriptor) }.getOrNull() else null
     private var reuseAddressEnabled = false
     private var tcpNoDelayEnabled = false
     private var sendBufferBytes = 0
@@ -162,6 +166,7 @@ internal class OsTcpSocket internal constructor(
         require(addressFamily(address) == family) { "Socket bind address has the wrong family" }
         Os.bind(fileDescriptor, address, endpoint.port)
         bound = true
+        cachedLocalAddress = runCatching { Os.getsockname(fileDescriptor) }.getOrNull() ?: endpoint
     }
 
     override fun connect(endpoint: SocketAddress?, timeout: Int) {
@@ -184,14 +189,35 @@ internal class OsTcpSocket internal constructor(
         }
         connected = true
         bound = true
+        cachedLocalAddress = runCatching { Os.getsockname(fileDescriptor) }.getOrNull() ?: cachedLocalAddress
+        cachedRemoteAddress = runCatching { Os.getpeername(fileDescriptor) }.getOrNull() ?: remote
     }
 
     override fun connect(endpoint: SocketAddress?) = connect(endpoint, 0)
 
     override fun getInputStream(): InputStream = inputStream
     override fun getOutputStream(): OutputStream = outputStream
-    override fun getLocalSocketAddress(): SocketAddress? = if (bound) Os.getsockname(fileDescriptor) else null
-    override fun getRemoteSocketAddress(): SocketAddress? = if (connected) Os.getpeername(fileDescriptor) else null
+    override fun getLocalSocketAddress(): SocketAddress? {
+        if (!bound) return null
+        if (!closed) {
+            runCatching { Os.getsockname(fileDescriptor) }.getOrNull()?.let {
+                cachedLocalAddress = it
+                return it
+            }
+        }
+        return cachedLocalAddress
+    }
+
+    override fun getRemoteSocketAddress(): SocketAddress? {
+        if (!connected) return null
+        if (!closed) {
+            runCatching { Os.getpeername(fileDescriptor) }.getOrNull()?.let {
+                cachedRemoteAddress = it
+                return it
+            }
+        }
+        return cachedRemoteAddress
+    }
     override fun getInetAddress(): InetAddress? = (remoteSocketAddress as? InetSocketAddress)?.address
     override fun getPort(): Int = (remoteSocketAddress as? InetSocketAddress)?.port ?: 0
     override fun isBound(): Boolean = bound
@@ -278,6 +304,7 @@ internal class OsTcpServerSocket(private val family: Int) : ServerSocket() {
     @Volatile private var closed = false
     @Volatile private var bound = false
     @Volatile private var timeoutMillis = 0
+    @Volatile private var cachedLocalAddress: SocketAddress? = null
     private var reuseAddressEnabled = false
 
     init {
@@ -296,6 +323,7 @@ internal class OsTcpServerSocket(private val family: Int) : ServerSocket() {
         Os.bind(fileDescriptor, address, local.port)
         Os.listen(fileDescriptor, if (backlog > 0) backlog else 50)
         bound = true
+        cachedLocalAddress = runCatching { Os.getsockname(fileDescriptor) }.getOrNull() ?: local
     }
 
     override fun bind(endpoint: SocketAddress?) = bind(endpoint, 50)
@@ -320,7 +348,16 @@ internal class OsTcpServerSocket(private val family: Int) : ServerSocket() {
         )
     }
 
-    override fun getLocalSocketAddress(): SocketAddress? = if (bound) Os.getsockname(fileDescriptor) else null
+    override fun getLocalSocketAddress(): SocketAddress? {
+        if (!bound) return null
+        if (!closed) {
+            runCatching { Os.getsockname(fileDescriptor) }.getOrNull()?.let {
+                cachedLocalAddress = it
+                return it
+            }
+        }
+        return cachedLocalAddress
+    }
     override fun isBound(): Boolean = bound
     override fun isClosed(): Boolean = closed
     override fun setReuseAddress(on: Boolean) {
