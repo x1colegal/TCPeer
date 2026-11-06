@@ -1896,9 +1896,9 @@ The Coordinator never relays this data plane. No TCPeer DATA framing is used.
 
 # Development and AI assistance
 
-TCPeer was developed with the assistance of **OpenAI Codex**.
+TCPeer is primarily developed with the assistance of **OpenAI Codex**, with **Google Antigravity** also assisting in development at times.
 
-TCPeer itself is an independent project; Codex was used as a development assistant.
+TCPeer itself is an independent project; Codex and Antigravity were used as development assistants.
 
 ---
 
