@@ -398,7 +398,7 @@ TPCP is responsible for:
 
 - Issuing authentication challenges and validating HMAC-SHA256 proofs
 - Associating a Peer ID with an authenticated PeerNet
-- Registering platform, role, transport, address, and endpoint information
+- Registering device name, platform, role, local and mapped address candidates, and overlay address information
 - Reporting observed public IPv4 and IPv6 endpoints
 - Distributing local and public connection candidates
 - Coordinating TCP simultaneous-open and TCP hole punching
@@ -421,14 +421,20 @@ traffic. Losing the TPCP connection affects discovery, state synchronization,
 and future connection coordination; it does not turn the Coordinator into a
 data-plane path.
 
-TPCP primarily operates on the Coordinator control connection. The direct
-data-plane connection additionally carries `KEEPALIVE`, `PONG`, `TPP-PING`, and
-`TPP-PONG` as top-level ASCII messages. Liveness messages detect expired NAT
-state and half-open connections; TPP messages measure the direct peer path.
+TPCP primarily operates on the Coordinator control connection (`:7443`).
+
+When a direct peer connection is established on the direct TCP port (`:7444`), both peers first perform a mutual challenge-response authentication handshake directly over that TCP socket:
+
+1. Each peer sends an `AUTH` message containing a locally generated cryptographic random `Nonce` (32 bytes hex).
+2. Each peer verifies that the remote nonce is not empty and does not equal its own nonce (preventing reflection and echo attacks).
+3. Each peer sends an `AUTH-PROOF` message with the HMAC-SHA256 computed over the remote peer's nonce.
+4. Each peer verifies the remote `AUTH-PROOF`. If authentication succeeds, the direct TCP socket is adopted as the active Layer 3 tunnel.
+
+Once adopted, the direct data-plane connection additionally carries `KEEPALIVE`, `PONG`, `TPP-PING`, and `TPP-PONG` as top-level ASCII messages. Liveness messages detect expired NAT state and half-open connections; TPP messages measure the direct peer path.
 
 ## Data plane
 
-After direct connectivity is established, the peer-to-peer data stream carries:
+After direct connectivity and mutual authentication are established, the peer-to-peer data stream carries:
 
 ```text
 raw binary IPv4/IPv6 packets, interleaved with top-level TPCP liveness and TPP messages
@@ -468,9 +474,13 @@ Peers belonging to the same TCPeer network share a Secret Key.
 
 The Secret Key itself is not transmitted as the authentication proof.
 
-TCPeer uses HMAC-SHA256 challenge/response authentication on both the coordinator control connection and direct peer-to-peer connections.
+TCPeer uses HMAC-SHA256 challenge/response authentication on both the coordinator control connection and direct peer-to-peer connections:
 
-A fresh nonce is used in authentication on both the coordinator and direct P2P connections.
+- **Coordinator control connection (`:7443`)**: The coordinator issues an `AUTH-CHALLENGE` with a cryptographically random 32-byte hex `Nonce`. The connecting peer responds with an `AUTH-PROOF` containing the HMAC-SHA256 digest bound to the protocol identifier, network name, peer ID, and nonce:
+  $$\text{HMAC-SHA256}(\text{Secret}, \texttt{"TPCP/2\\n" } \parallel \text{Network} \parallel \texttt{"\\n"} \parallel \text{Peer-ID} \parallel \texttt{"\\n"} \parallel \text{Nonce})$$
+- **Direct peer-to-peer connections (`:7444`)**: Once the direct TCP socket connects, both peers perform a mutual authentication handshake. Each peer sends an `AUTH` message containing its random `Nonce`, verifies that the peer's nonce does not match its own (preventing loopback/reflection attacks), and replies with an `AUTH-PROOF` computed over the remote peer's nonce. Only after both peers verify each other's proof is the socket adopted for VPN traffic.
+
+A fresh nonce is used in authentication on every connection attempt on both the coordinator and direct P2P connections.
 
 This proves possession of the shared Secret Key.
 
@@ -911,12 +921,13 @@ The default state database is:
 
 Persistent information can include:
 
-- Peers
-- Sessions
+- Peers and device display names
+- Historical sessions
 - Byte counters
 - DHCP leases
-- Address information
-- Transport information
+- Overlay address assignments
+
+Direct connection transport and endpoint states are ephemeral: on daemon startup or restart, direct connection state is reset to `-` / `NULL` until a direct P2P session is actively established and authenticated.
 
 Live TCP connections naturally do not survive a process restart.
 
@@ -928,8 +939,8 @@ The coordinator separately persists its known-device directory in:
 /var/lib/tcppeer/coordinator/state.db
 ```
 
-Peer ID, role, platform, transport, last public IPv4/IPv6 candidates, overlay
-addresses, endpoint, and last-seen time survive a coordinator restart. Loaded
+Peer ID, display name, role, platform, last public IPv4/IPv6 candidates, overlay
+addresses, and last-seen time survive a coordinator restart. Loaded
 entries start offline and become online only after authentication and
 registration complete again.
 
@@ -1389,6 +1400,8 @@ device name.
 The `tcppeer` CLI displays and accepts device names by default. Pass
 `--peer-id` when you explicitly need stable Peer IDs, including when two
 devices have the same visible name.
+
+In `tcppeer peers`, the `TRANSPORT` and `ENDPOINT` columns reflect active, authenticated direct peer-to-peer connections (such as `TCP6 Direct` or `TCP4 Direct`). For peers that are offline or have not established an active direct tunnel yet, both fields are displayed as `-`.
 
 An explicit Client configuration is also accepted:
 

@@ -105,6 +105,8 @@ class TcpPeerVpnService : VpnService() {
     private val meshSockets = ConcurrentHashMap<String, Socket>()
     private val meshSocketKeys = ConcurrentHashMap<String, String>()
     private val meshEndpoints = ConcurrentHashMap<String, String>()
+    private val meshPeerByHost = ConcurrentHashMap<String, String>()
+    private val meshPeerByEndpoint = ConcurrentHashMap<String, String>()
     private val meshCommitted: MutableSet<String> =
         Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
     private val meshAdoptionLock = Any()
@@ -666,24 +668,16 @@ class TcpPeerVpnService : VpnService() {
         val directInput = direct.getInputStream()
         val directOutput = direct.getOutputStream()
         val directNonce = AuthProof.generateNonce()
-        TcpPeerProtocol.writeControl(directOutput, ControlMessage("PEER-INFO", linkedMapOf(
-            "Network" to config.network,
-            "Peer-ID" to config.peerId,
-            "IPv4" to advertisedIpv4,
-            "IPv6" to advertisedIpv6,
+        TcpPeerProtocol.writeControl(directOutput, ControlMessage("AUTH", linkedMapOf(
             "Nonce" to directNonce,
         )))
         val peerInfo = TcpPeerProtocol.readControl(directInput)
-        if (peerInfo.command != "PEER-INFO" || peerInfo.field("Network") != config.network) {
+        if (peerInfo.command != "AUTH") {
             throw ProtocolException("Direct peer handshake failed")
         }
         val peerNonce = peerInfo.field("Nonce").orEmpty()
-        if (peerInfo.field("Peer-ID") != targetPeerId || peerNonce.isEmpty() || peerNonce == directNonce) {
+        if (peerNonce.isEmpty() || peerNonce == directNonce) {
             throw ProtocolException("Direct peer authentication challenge failed")
-        }
-        val requiredFamily = TransportPolicy.choosePublic(advertisedIpv6, peerInfo.field("IPv6"))
-        if (requiredFamily != family) {
-            throw ProtocolException("Direct family violates the IPv6-first policy")
         }
         TcpPeerProtocol.writeControl(directOutput, ControlMessage("AUTH-PROOF", linkedMapOf(
             "Proof" to AuthProof.create(config.secret, config.network, config.peerId, peerNonce),
@@ -835,6 +829,10 @@ class TcpPeerVpnService : VpnService() {
                                     } else {
                                         "-"
                                     }
+                                    val devIpv4 = message.field("IPv4").orEmpty()
+                                    val devIpv6 = message.field("IPv6")?.substringBefore('%').orEmpty()
+                                    if (devIpv4.isNotBlank() && devIpv4 != "-") meshPeerByHost[devIpv4] = devicePeerId
+                                    if (devIpv6.isNotBlank() && devIpv6 != "-") meshPeerByHost[devIpv6] = devicePeerId
                                     devices += NetworkDevice(
                                         peerId = devicePeerId,
                                         displayName = message.field("Device-Name")
@@ -901,6 +899,14 @@ class TcpPeerVpnService : VpnService() {
 
                             "PUNCH-GO" -> {
                                 val punchPeer = message.field("Peer-ID")
+                                val punchAddr = message.field("Address")?.substringBefore('%')
+                                val punchPort = message.field("Port")
+                                if (punchPeer != null && punchAddr != null) {
+                                    meshPeerByHost[punchAddr] = punchPeer
+                                    if (punchPort != null) {
+                                        meshPeerByEndpoint["$punchAddr:$punchPort"] = punchPeer
+                                    }
+                                }
                                 if (punchPeer != null && meshPunchActive.add(punchPeer)) {
                                     meshReadySentAt.remove(punchPeer)
                                     launch {
@@ -1059,19 +1065,15 @@ class TcpPeerVpnService : VpnService() {
             val input = BufferedInputStream(socket.getInputStream(), DIRECT_STREAM_BUFFER_BYTES)
             val output = socket.getOutputStream()
             val myNonce = AuthProof.generateNonce()
-            TcpPeerProtocol.writeControl(output, ControlMessage("PEER-INFO", linkedMapOf(
-                "Network" to config.network,
-                "Peer-ID" to config.peerId,
-                "IPv4" to advertisedIpv4,
-                "IPv6" to advertisedIpv6,
+            TcpPeerProtocol.writeControl(output, ControlMessage("AUTH", linkedMapOf(
                 "Nonce" to myNonce,
             )))
             val peerInfo = TcpPeerProtocol.readControl(input)
-            if (peerInfo.command != "PEER-INFO" || peerInfo.field("Network") != config.network) {
+            if (peerInfo.command != "AUTH") {
                 throw ProtocolException("Direct mesh peer handshake failed")
             }
             val peerNonce = peerInfo.field("Nonce").orEmpty()
-            if (peerInfo.field("Peer-ID") != peerId || peerNonce.isEmpty() || peerNonce == myNonce) {
+            if (peerNonce.isEmpty() || peerNonce == myNonce) {
                 throw ProtocolException("Direct mesh peer authentication challenge failed")
             }
             TcpPeerProtocol.writeControl(output, ControlMessage("AUTH-PROOF", linkedMapOf(
@@ -1215,9 +1217,16 @@ class TcpPeerVpnService : VpnService() {
         try {
             val input = BufferedInputStream(socket.getInputStream(), DIRECT_STREAM_BUFFER_BYTES)
             output = socket.getOutputStream()
+            val remoteHost = socket.inetAddress?.hostAddress?.substringBefore('%').orEmpty()
+            val remotePort = socket.port
+            peerId = meshPeerByEndpoint["$remoteHost:$remotePort"]
+                ?: meshPeerByHost[remoteHost]
+                ?: "unknown"
+            if (peerId == "unknown") {
+                throw ProtocolException("Accepted mesh peer from unrecognized endpoint: $remoteHost:$remotePort")
+            }
             val peerInfo = TcpPeerProtocol.readControl(input)
-            peerId = peerInfo.field("Peer-ID") ?: "unknown"
-            if (peerInfo.command != "PEER-INFO" || peerInfo.field("Network") != config.network) {
+            if (peerInfo.command != "AUTH") {
                 throw ProtocolException("Accepted mesh peer handshake failed")
             }
             val peerNonce = peerInfo.field("Nonce").orEmpty()
@@ -1225,11 +1234,7 @@ class TcpPeerVpnService : VpnService() {
             if (peerNonce.isEmpty() || peerNonce == myNonce) {
                 throw ProtocolException("Accepted mesh peer authentication challenge failed")
             }
-            TcpPeerProtocol.writeControl(output, ControlMessage("PEER-INFO", linkedMapOf(
-                "Network" to config.network,
-                "Peer-ID" to config.peerId,
-                "IPv4" to advertisedIpv4,
-                "IPv6" to advertisedIpv6,
+            TcpPeerProtocol.writeControl(output, ControlMessage("AUTH", linkedMapOf(
                 "Nonce" to myNonce,
             )))
             TcpPeerProtocol.writeControl(output, ControlMessage("AUTH-PROOF", linkedMapOf(
