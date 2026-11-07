@@ -12,7 +12,7 @@ def test_known_peer_survives_reopen(tmp_path: Path) -> None:
     store = CoordinatorStore(path)
     store.upsert({
         "network": "home", "peer_id": "phone", "display_name": "My phone", "role": "Client",
-        "platform": "Android", "transport": "TCP6", "ipv4": "198.51.100.2",
+        "platform": "Android", "ipv4": "198.51.100.2",
         "ipv6": "2001:db8::2", "overlay_ipv4": "10.50.0.10",
         "overlay_ipv6": "fd00::10", "endpoint": "[2001:db8::2]:7444",
         "last_seen": 123,
@@ -29,7 +29,7 @@ def test_known_peer_survives_reopen(tmp_path: Path) -> None:
     reopened.close()
 
 
-def test_offline_device_list_hides_physical_addresses_and_transport(tmp_path: Path) -> None:
+def test_offline_device_list_hides_physical_addresses(tmp_path: Path) -> None:
     class Writer:
         def __init__(self) -> None:
             self.data = bytearray()
@@ -54,7 +54,6 @@ def test_offline_device_list_hides_physical_addresses_and_transport(tmp_path: Pa
         network="home",
         peer_id="phone",
         online=False,
-        transport="TCP6",
         ipv4="198.51.100.2",
         ipv6="2001:db8::2",
         overlay_ipv4="10.50.0.10",
@@ -68,7 +67,7 @@ def test_offline_device_list_hides_physical_addresses_and_transport(tmp_path: Pa
     assert writer.write_calls == 1
     assert message.endswith(b"TPCP/2 PEER-INFO\r\nAction: List-End\r\n\r\n")
     assert b"Online: no\r\n" in message
-    assert b"Transport: -\r\n" in message
+    assert b"Transport:" not in message
     assert b"IPv4: \r\n" in message
     assert b"IPv6: \r\n" in message
     assert b"Overlay-IPv4: \r\n" in message

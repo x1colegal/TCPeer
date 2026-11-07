@@ -64,7 +64,6 @@ class KnownPeer:
     ipv6: str = ""
     overlay_ipv4: str = ""
     overlay_ipv6: str = ""
-    transport: str = "None"
     endpoint: str = ""
     last_seen: int = field(default_factory=lambda: int(time.time()))
 
@@ -192,7 +191,6 @@ class Coordinator:
             # Punch-Request into that registration exchange.
             known.online = False
             known.endpoint = f"[{observed_address}]:{observed_port}" if ":" in observed_address else f"{observed_address}:{observed_port}"
-            known.transport = "TCP6" if ipaddress.ip_address(observed_address).version == 6 else "TCP4"
             known.last_seen = int(time.time())
             self.known_peers[key] = known
             self._persist(known)
@@ -376,7 +374,7 @@ class Coordinator:
                     writer.write(("DEVICE\t" + "\t".join((
                         known.network, known.peer_id, known.display_name or known.peer_id,
                         "online" if known.online else "offline",
-                        known.role, known.platform, known.transport, known.ipv4 or "-",
+                        known.role, known.platform, known.ipv4 or "-",
                         known.ipv6 or "-", known.overlay_ipv4 or "-", known.overlay_ipv6 or "-",
                         known.endpoint or "-", str(known.last_seen),
                     )) + "\n").encode("ascii"))
@@ -473,7 +471,6 @@ class Coordinator:
                 "Platform": known.platform,
                 # Keep the last endpoint data persisted, but do not advertise
                 # stale physical addresses as usable while a peer is offline.
-                "Transport": known.transport if online else "-",
                 "IPv4": known.ipv4 if online else "",
                 "IPv6": known.ipv6 if online else "",
                 "Overlay-IPv4": known.overlay_ipv4 if online else "",
@@ -539,7 +536,6 @@ class Coordinator:
         for current in (left, right):
             known = self.known_peers.get((current.network, current.peer_id))
             if known is not None:
-                known.transport = transport
                 known.last_seen = int(time.time())
                 self._persist(known)
         left_observed_version = ipaddress.ip_address(left.observed_address).version

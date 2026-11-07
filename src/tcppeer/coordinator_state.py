@@ -13,7 +13,6 @@ CREATE TABLE IF NOT EXISTS known_peers (
     display_name TEXT NOT NULL DEFAULT '',
     role TEXT NOT NULL DEFAULT 'Client',
     platform TEXT NOT NULL DEFAULT 'Unknown',
-    transport TEXT NOT NULL DEFAULT 'None',
     ipv4 TEXT NOT NULL DEFAULT '',
     ipv6 TEXT NOT NULL DEFAULT '',
     overlay_ipv4 TEXT NOT NULL DEFAULT '',
@@ -29,7 +28,7 @@ class CoordinatorStore:
     """SQLite-backed inventory; online state intentionally remains ephemeral."""
 
     FIELDS = (
-        "network", "peer_id", "display_name", "role", "platform", "transport", "ipv4", "ipv6",
+        "network", "peer_id", "display_name", "role", "platform", "ipv4", "ipv6",
         "overlay_ipv4", "overlay_ipv6", "endpoint", "last_seen",
     )
 
@@ -46,7 +45,8 @@ class CoordinatorStore:
         self.connection.commit()
 
     def load(self) -> list[sqlite3.Row]:
-        return list(self.connection.execute("SELECT * FROM known_peers ORDER BY network, peer_id"))
+        columns = ", ".join(self.FIELDS)
+        return list(self.connection.execute(f"SELECT {columns} FROM known_peers ORDER BY network, peer_id"))
 
     def upsert(self, values: dict[str, object]) -> None:
         unknown = set(values) - set(self.FIELDS)
