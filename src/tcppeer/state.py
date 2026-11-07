@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS peers (
     online INTEGER NOT NULL DEFAULT 0,
     overlay_ipv4 TEXT,
     overlay_ipv6 TEXT,
-    transport TEXT NOT NULL DEFAULT 'Disconnected',
+    transport TEXT NOT NULL DEFAULT '-',
     endpoint TEXT,
     rx_bytes INTEGER NOT NULL DEFAULT 0,
     tx_bytes INTEGER NOT NULL DEFAULT 0,
@@ -177,6 +177,12 @@ class StateStore:
             self.connection.execute("DELETE FROM leases WHERE client_id = ?", (peer_id,))
             self.connection.execute("DELETE FROM sessions WHERE peer_id = ?", (peer_id,))
             self.connection.execute("DELETE FROM peers WHERE peer_id = ?", (peer_id,))
+
+    def reset_direct_connections(self) -> None:
+        with self.connection:
+            self.connection.execute(
+                "UPDATE peers SET transport = '-', endpoint = NULL",
+            )
 
     def list_table(self, table: str) -> list[sqlite3.Row]:
         if table not in {"peers", "sessions", "leases", "metadata"}:

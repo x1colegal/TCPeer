@@ -53,6 +53,7 @@ class Client(Server):
     def __init__(self, config: ClientConfig):
         self.config = config
         self.store = StateStore(config.state_db)
+        self.store.reset_direct_connections()
         if not self.store.metadata("device_name"):
             automatic_name = socket.gethostname().strip()[:64]
             if automatic_name and all(32 <= ord(char) <= 126 for char in automatic_name):

@@ -28,7 +28,7 @@ def _print_table(rows: list[sqlite3.Row], columns: list[str]) -> None:
     if not rows:
         print("No records.")
         return
-    values = [[str(row[column] if row[column] is not None else "-") for column in columns] for row in rows]
+    values = [[str(row[column] if row[column] not in {None, ""} else "-") for column in columns] for row in rows]
     widths = [max(len(column), *(len(row[index]) for row in values)) for index, column in enumerate(columns)]
     print("  ".join(column.upper().ljust(widths[index]) for index, column in enumerate(columns)))
     for row in values:
@@ -68,7 +68,11 @@ def run_command(config: LinuxConfig, command: str, use_peer_id: bool = False) ->
             peers = _rows(connection, "SELECT COALESCE(NULLIF(display_name, ''), peer_id) AS name, CASE WHEN online = 1 THEN 'Online' ELSE 'Offline' END AS status, * FROM peers ORDER BY name")
             identity = "peer_id" if use_peer_id else "name"
             if command == "status":
-                connected = sum(row["transport"] not in {"Disconnected", "No Direct Connection"} for row in peers)
+                connected = sum(
+                    row["transport"] not in {None, "", "-", "Disconnected", "No Direct Connection"}
+                    and row["endpoint"] not in {None, "", "-"}
+                    for row in peers
+                )
                 role = "Client" if isinstance(config, ClientConfig) else "Server"
                 name_row = connection.execute(
                     "SELECT value FROM metadata WHERE key='device_name'",

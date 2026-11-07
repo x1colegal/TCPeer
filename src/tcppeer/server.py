@@ -176,6 +176,7 @@ class Server:
     def __init__(self, config: ServerConfig):
         self.config = config
         self.store = StateStore(config.state_db)
+        self.store.reset_direct_connections()
         if not self.store.metadata("device_name"):
             automatic_name = socket.gethostname().strip()[:64]
             if automatic_name and all(32 <= ord(char) <= 126 for char in automatic_name):
@@ -586,13 +587,11 @@ class Server:
             "overlay_ipv4": overlay_ipv4,
             "overlay_ipv6": overlay_ipv6,
         }
-        # The coordinator directory reports the peer's observed control-plane
-        # endpoint. Once a direct socket exists, _adopt_direct() has a more
-        # accurate data-plane endpoint and transport. Do not replace those
-        # fields on every five-second directory refresh.
+        # Do not copy transport or endpoint from the coordinator directory;
+        # both fields must remain '-' until a direct socket is established.
         if peer_id not in self.direct_writers:
-            values["transport"] = message.get("Transport") or "Disconnected"
-            values["endpoint"] = message.get("Endpoint") or None
+            values["transport"] = "-"
+            values["endpoint"] = None
         self.store.update_peer(peer_id, **values)
         self._index_peer_overlays(peer_id, overlay_ipv4, overlay_ipv6)
 
@@ -832,7 +831,8 @@ class Server:
             )
             raise
         except DirectConnectionError:
-            self.store.update_peer(peer_id, transport="No Direct Connection")
+            if peer_id not in self.direct_writers:
+                self.store.update_peer(peer_id, transport="-", endpoint=None)
             # A failed path to one peer must not tear down the shared control
             # plane. Closing it here cancelled coordination for every other
             # peer and caused the failed peer's new control session to replace
@@ -891,6 +891,8 @@ class Server:
             self._direct_owner_keys.pop(peer_id, None)
             self._direct_owner_peer_sessions.pop(peer_id, None)
             self._direct_owner_committed.discard(peer_id)
+            if getattr(self, "store", None) is not None:
+                self.store.update_peer(peer_id, transport="-", endpoint=None)
         current_writer.close()
         return True
 
@@ -1091,7 +1093,7 @@ class Server:
                 self._direct_owner_keys.pop(peer_id, None)
                 self._direct_owner_peer_sessions.pop(peer_id, None)
                 self._direct_owner_committed.discard(peer_id)
-                self.store.update_peer(peer_id, transport="Disconnected")
+                self.store.update_peer(peer_id, transport="-", endpoint=None)
                 released_owner = True
             if released_owner:
                 await self._after_direct_data(peer_id)
@@ -1422,7 +1424,7 @@ class Server:
                 self._direct_owner_tokens.pop(peer_id, None)
                 self._direct_owner_keys.pop(peer_id, None)
                 self._direct_owner_committed.discard(peer_id)
-                self.store.update_peer(peer_id, transport="Disconnected")
+                self.store.update_peer(peer_id, transport="-", endpoint=None)
                 released_owner = True
         LOG.info(
             "direct-write close ts=%.6f peer_id=%s fd=%s local=%s remote=%s owner=%s reason=%s",
