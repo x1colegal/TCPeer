@@ -10,6 +10,7 @@ import ipaddress
 import logging
 import os
 from pathlib import Path
+import secrets
 import socket
 import struct
 import sys
@@ -20,7 +21,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tcppeer.config import ConfigurationError, ServerConfig
-from tcppeer.auth import authentication_proof
+from tcppeer.auth import authentication_proof, proof_matches
 from tcppeer.dhcp import DhcpServer
 from tcppeer.dns import discover_upstream_dns
 from tcppeer.exit_node import ExitNodeFirewall
@@ -362,10 +363,14 @@ class Server:
                 self._sockname_text(writer),
                 self._peername_text(writer),
             )
-            info = await read_control(reader)
+            info = await asyncio.wait_for(read_control(reader), timeout=CONTROL_REPLY_TIMEOUT_SECONDS)
             if info.command != "PEER-INFO" or info.get("Network") != self.config.network:
                 raise ProtocolError("invalid direct peer handshake")
             peer_id = info.get("Peer-ID") or "unknown"
+            peer_nonce = info.get("Nonce") or ""
+            my_nonce = secrets.token_hex(32)
+            if not peer_nonce or peer_nonce == my_nonce:
+                raise ProtocolError("invalid direct peer authentication challenge")
             required_family = choose_family(
                 [self._registered_ipv6 or ""], [info.get("IPv6") or ""],
             )
@@ -375,8 +380,19 @@ class Server:
             writer.write(ControlMessage("PEER-INFO", {
                 "Network": self.config.network, "Peer-ID": self.config.peer_id,
                 "IPv4": self._registered_ipv4 or "", "IPv6": self._registered_ipv6 or "",
+                "Nonce": my_nonce,
+            }).encode())
+            writer.write(ControlMessage("AUTH-PROOF", {
+                "Proof": authentication_proof(
+                    self.config.secret, self.config.network, self.config.peer_id, peer_nonce,
+                ),
             }).encode())
             await writer.drain()
+            peer_auth = await asyncio.wait_for(read_control(reader), timeout=CONTROL_REPLY_TIMEOUT_SECONDS)
+            if peer_auth.command != "AUTH-PROOF" or not proof_matches(
+                self.config.secret, self.config.network, peer_id, my_nonce, peer_auth.get("Proof") or "",
+            ):
+                raise ProtocolError("direct peer authentication failed")
             endpoint = writer.get_extra_info("peername") or ("unknown", 0)
             await self._adopt_direct(
                 reader,
@@ -387,7 +403,7 @@ class Server:
                 initiated=False,
                 attempt=attempt,
             )
-        except (ProtocolError, ConnectionError, asyncio.IncompleteReadError) as exc:
+        except (ProtocolError, ConnectionError, TimeoutError, asyncio.IncompleteReadError) as exc:
             LOG.warning("Rejected direct connection: %s", exc)
             writer.close()
 
@@ -797,19 +813,36 @@ class Server:
             reader, writer = await DirectConnector().connect(
                 local, remote, family, prebound_socket=candidate, peer_id=peer_id, attempt=attempt,
             )
+            my_nonce = secrets.token_hex(32)
             writer.write(ControlMessage("PEER-INFO", {
                 "Network": self.config.network, "Peer-ID": self.config.peer_id,
                 "IPv4": self._registered_ipv4 or "", "IPv6": self._registered_ipv6 or "",
+                "Nonce": my_nonce,
             }).encode())
             await writer.drain()
-            peer_info = await read_control(reader)
+            peer_info = await asyncio.wait_for(read_control(reader), timeout=CONTROL_REPLY_TIMEOUT_SECONDS)
             if peer_info.command != "PEER-INFO" or peer_info.get("Network") != self.config.network:
                 raise ProtocolError("invalid direct peer handshake")
+            remote_peer_id = peer_info.get("Peer-ID") or ""
+            peer_nonce = peer_info.get("Nonce") or ""
+            if remote_peer_id != peer_id or not peer_nonce or peer_nonce == my_nonce:
+                raise ProtocolError("invalid direct peer authentication challenge")
             required_family = choose_family(
                 [self._registered_ipv6 or ""], [peer_info.get("IPv6") or ""],
             )
             if required_family != family:
                 raise ProtocolError("coordinator selected a family that violates IPv6-first policy")
+            writer.write(ControlMessage("AUTH-PROOF", {
+                "Proof": authentication_proof(
+                    self.config.secret, self.config.network, self.config.peer_id, peer_nonce,
+                ),
+            }).encode())
+            await writer.drain()
+            peer_auth = await asyncio.wait_for(read_control(reader), timeout=CONTROL_REPLY_TIMEOUT_SECONDS)
+            if peer_auth.command != "AUTH-PROOF" or not proof_matches(
+                self.config.secret, self.config.network, peer_id, my_nonce, peer_auth.get("Proof") or "",
+            ):
+                raise ProtocolError("direct peer authentication failed")
             handed_off = True
             await self._adopt_direct(
                 reader,

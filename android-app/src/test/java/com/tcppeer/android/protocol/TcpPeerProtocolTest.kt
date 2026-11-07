@@ -37,6 +37,8 @@ class TcpPeerProtocolTest {
         assertEquals(64, proof.length)
         assertFalse(proof.contains("visible-secret"))
         assertEquals(proof, AuthProof.create("visible-secret", "home", "android", "abc123"))
+        assertTrue(AuthProof.verify("visible-secret", "home", "android", "abc123", proof))
+        assertFalse(AuthProof.verify("wrong-secret", "home", "android", "abc123", proof))
     }
 
     @Test

@@ -11,7 +11,7 @@ Once a direct connection is established, original IPv4 and IPv6 packets are tran
 > [!WARNING]
 > TCPeer is not an encrypted VPN.
 >
-> Authentication proves possession of the configured Secret Key using HMAC-SHA256, but the direct TCP stream itself is cleartext.
+> Authentication proves possession of the configured Secret Key using HMAC-SHA256 on both the coordinator and direct peer connections, while the direct TCP stream itself remains cleartext.
 >
 > Applications should use their own encryption, such as HTTPS or SSH, when confidentiality is required.
 
@@ -26,7 +26,7 @@ TCPeer currently provides:
 - Coordinator-assisted peer discovery
 - Separate IPv4 and IPv6 endpoint registration
 - TCP simultaneous-open / TCP hole punching
-- HMAC-SHA256 Secret Key authentication
+- HMAC-SHA256 Secret Key authentication (coordinator and direct P2P)
 - Raw IPv4 and IPv6 Layer 3 tunneling
 - In-band TPCP data-plane keepalive
 - Linux TUN interface
@@ -468,9 +468,9 @@ Peers belonging to the same TCPeer network share a Secret Key.
 
 The Secret Key itself is not transmitted as the authentication proof.
 
-TCPeer uses HMAC-SHA256 challenge/response authentication.
+TCPeer uses HMAC-SHA256 challenge/response authentication on both the coordinator control connection and direct peer-to-peer connections.
 
-A fresh coordinator nonce is used in authentication.
+A fresh nonce is used in authentication on both the coordinator and direct P2P connections.
 
 This proves possession of the shared Secret Key.
 
@@ -1856,7 +1856,7 @@ TCPeer currently provides authentication but not data-plane encryption.
 
 ```text
 Shared Secret Key
-HMAC-SHA256 authentication
+HMAC-SHA256 authentication (coordinator and direct P2P)
 Fresh authentication challenge/nonce
 Direct peer-to-peer transport
 ```
