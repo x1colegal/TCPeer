@@ -398,7 +398,8 @@ class Server:
                 pass
             else:
                 verified = None
-                for candidate_id in self._directory:
+                candidates = [row["peer_id"] for row in self.store.list_table("peers")]
+                for candidate_id in candidates:
                     if proof_matches(self.config.secret, self.config.network, candidate_id, my_nonce, peer_proof):
                         verified = candidate_id
                         break

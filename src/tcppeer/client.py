@@ -81,6 +81,8 @@ class Client(Server):
         self._direct_candidates = {}
         self._direct_connect_tasks = {}
         self._direct_connect_peer_sessions = {}
+        self._direct_target_endpoints: dict[tuple[str, int], str] = {}
+        self._peer_hosts: dict[str, str] = {}
         self._direct_adoption_lock = asyncio.Lock()
         self._direct_owner_tokens = {}
         self._direct_owner_keys = {}
