@@ -1222,9 +1222,6 @@ class TcpPeerVpnService : VpnService() {
             peerId = meshPeerByEndpoint["$remoteHost:$remotePort"]
                 ?: meshPeerByHost[remoteHost]
                 ?: "unknown"
-            if (peerId == "unknown") {
-                throw ProtocolException("Accepted mesh peer from unrecognized endpoint: $remoteHost:$remotePort")
-            }
             val peerInfo = TcpPeerProtocol.readControl(input)
             if (peerInfo.command != "AUTH") {
                 throw ProtocolException("Accepted mesh peer handshake failed")
@@ -1241,11 +1238,22 @@ class TcpPeerVpnService : VpnService() {
                 "Proof" to AuthProof.create(config.secret, config.network, config.peerId, peerNonce),
             )))
             val peerAuth = TcpPeerProtocol.readControl(input)
-            if (
-                peerAuth.command != "AUTH-PROOF" ||
-                !AuthProof.verify(config.secret, config.network, peerId, myNonce, peerAuth.field("Proof").orEmpty())
-            ) {
+            if (peerAuth.command != "AUTH-PROOF") {
                 throw ProtocolException("Accepted mesh peer authentication failed")
+            }
+            val peerProof = peerAuth.field("Proof").orEmpty()
+            if (peerId != "unknown" && AuthProof.verify(config.secret, config.network, peerId, myNonce, peerProof)) {
+                // verified known endpoint
+            } else {
+                val candidatePeers = (meshConnecting + meshReadySentAt.keys + meshSockets.keys + TcpPeerRuntime.state.value.devices.map { it.peerId }).distinct()
+                val matched = candidatePeers.firstOrNull { candidateId ->
+                    AuthProof.verify(config.secret, config.network, candidateId, myNonce, peerProof)
+                } ?: throw ProtocolException("Accepted mesh peer authentication failed: no matching peer proof")
+                peerId = matched
+                meshPeerByHost[remoteHost] = peerId
+                if (remotePort > 0) {
+                    meshPeerByEndpoint["$remoteHost:$remotePort"] = peerId
+                }
             }
             // Keep the established mesh stream blocking indefinitely after
             // the bounded handshake, matching the primary direct connection.

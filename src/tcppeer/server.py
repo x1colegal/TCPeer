@@ -373,8 +373,6 @@ class Server:
                 or self._peer_hosts.get(remote_addr)
                 or "unknown"
             )
-            if peer_id == "unknown":
-                raise ProtocolError(f"unrecognized direct peer endpoint: {remote_addr}:{remote_port}")
             info = await asyncio.wait_for(read_control(reader), timeout=CONTROL_REPLY_TIMEOUT_SECONDS)
             if info.command != "AUTH":
                 raise ProtocolError("invalid direct peer handshake")
@@ -393,10 +391,22 @@ class Server:
             }).encode())
             await writer.drain()
             peer_auth = await asyncio.wait_for(read_control(reader), timeout=CONTROL_REPLY_TIMEOUT_SECONDS)
-            if peer_auth.command != "AUTH-PROOF" or not proof_matches(
-                self.config.secret, self.config.network, peer_id, my_nonce, peer_auth.get("Proof") or "",
-            ):
+            if peer_auth.command != "AUTH-PROOF":
                 raise ProtocolError("direct peer authentication failed")
+            peer_proof = peer_auth.get("Proof") or ""
+            if peer_id != "unknown" and proof_matches(self.config.secret, self.config.network, peer_id, my_nonce, peer_proof):
+                pass
+            else:
+                verified = None
+                for candidate_id in self._directory:
+                    if proof_matches(self.config.secret, self.config.network, candidate_id, my_nonce, peer_proof):
+                        verified = candidate_id
+                        break
+                if not verified:
+                    raise ProtocolError("direct peer authentication failed")
+                peer_id = verified
+                self._direct_target_endpoints[(remote_addr, remote_port)] = peer_id
+                self._peer_hosts[remote_addr] = peer_id
             endpoint = writer.get_extra_info("peername") or ("unknown", 0)
             await self._adopt_direct(
                 reader,
