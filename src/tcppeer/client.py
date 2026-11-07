@@ -88,6 +88,7 @@ class Client(Server):
         self._direct_attempt_counter = 0
         self._byte_counters = {}
         self._coordinator_writer = None
+        self._endpoint_mapping_writers: dict[socket.AddressFamily, object] = {}
         self._registration_complete = asyncio.Event()
         self._pending_tpp_pings = {}
         self._active_server_ipv6 = ipaddress.IPv6Address("::")
@@ -177,6 +178,7 @@ class Client(Server):
                 writer.close()
             for task in self._peer_send_tasks.values():
                 task.cancel()
+            await self._close_endpoint_mapping_writers()
             await asyncio.gather(*(listener.wait_closed() for listener in self._listeners), return_exceptions=True)
             await asyncio.gather(*self._tasks, return_exceptions=True)
             await asyncio.gather(*self._peer_send_tasks.values(), return_exceptions=True)
