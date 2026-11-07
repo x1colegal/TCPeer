@@ -17,7 +17,6 @@ CREATE TABLE IF NOT EXISTS known_peers (
     ipv6 TEXT NOT NULL DEFAULT '',
     overlay_ipv4 TEXT NOT NULL DEFAULT '',
     overlay_ipv6 TEXT NOT NULL DEFAULT '',
-    endpoint TEXT NOT NULL DEFAULT '',
     last_seen INTEGER NOT NULL,
     PRIMARY KEY (network, peer_id)
 );
@@ -29,7 +28,7 @@ class CoordinatorStore:
 
     FIELDS = (
         "network", "peer_id", "display_name", "role", "platform", "ipv4", "ipv6",
-        "overlay_ipv4", "overlay_ipv6", "endpoint", "last_seen",
+        "overlay_ipv4", "overlay_ipv6", "last_seen",
     )
 
     def __init__(self, path: str | Path):
