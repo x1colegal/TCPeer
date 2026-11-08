@@ -15,6 +15,7 @@ import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.os.PowerManager
@@ -130,6 +131,7 @@ class TcpPeerVpnService : VpnService() {
     private val restartRequested = AtomicBoolean(false)
     private val stopRefreshStarted = AtomicBoolean(false)
     private var connectionWakeLock: PowerManager.WakeLock? = null
+    private var connectionWifiLock: WifiManager.WifiLock? = null
     private lateinit var connectivityManager: ConnectivityManager
     @Volatile private var underlyingNetworkSignature: String? = null
     @Volatile private var underlyingNetwork: Network? = null
@@ -515,16 +517,15 @@ class TcpPeerVpnService : VpnService() {
             else -> queryPublicEndpoint(config, DirectFamily.IPV6, physicalNetwork)
         }
         val directPublicIpv4 = localIpv4.firstOrNull(TransportPolicy::isPublicIpv4)?.hostAddress
-        val directPublicIpv6 = localIpv6.firstOrNull(TransportPolicy::isPublicIpv6)?.hostAddress?.substringBefore('%')
         var advertisedIpv4 = ""
         var advertisedIpv6 = ""
 
         fun registerCurrentEndpoints() {
             val localIpv4Address = localIpv4.firstOrNull()
             advertisedIpv4 = endpointIpv4?.address ?: directPublicIpv4.orEmpty()
-            advertisedIpv6 = endpointIpv6?.address ?: directPublicIpv6.orEmpty()
+            advertisedIpv6 = endpointIpv6?.address.orEmpty()
             val mappedIpv4Port = endpointIpv4?.port ?: if (directPublicIpv4 != null) config.directPort else null
-            val mappedIpv6Port = endpointIpv6?.port ?: if (directPublicIpv6 != null) config.directPort else null
+            val mappedIpv6Port = endpointIpv6?.port
             writeCoordinatorControl(controlOutput, ControlMessage("REGISTER", linkedMapOf(
                 "Peer-ID" to config.peerId,
                 "Device-Name" to config.deviceName,
@@ -2382,14 +2383,31 @@ class TcpPeerVpnService : VpnService() {
     @Synchronized
     private fun acquireConnectionWakeLock() {
         val existing = connectionWakeLock
-        if (existing?.isHeld == true) return
-        connectionWakeLock = (getSystemService(POWER_SERVICE) as PowerManager)
-            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$packageName:TcpPeerConnection")
-            .apply {
+        if (existing?.isHeld != true) {
+            connectionWakeLock = (getSystemService(POWER_SERVICE) as PowerManager)
+                .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$packageName:TcpPeerConnection")
+                .apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+            Log.i(TAG, "Connection wake lock acquired")
+        }
+        val existingWifi = connectionWifiLock
+        if (existingWifi?.isHeld != true) {
+            val wifiManager = applicationContext.getSystemService(WIFI_SERVICE) as? WifiManager
+            val lockType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                @Suppress("DEPRECATION")
+                WifiManager.WIFI_MODE_FULL_HIGH_PERF
+            } else {
+                @Suppress("DEPRECATION")
+                WifiManager.WIFI_MODE_FULL
+            }
+            connectionWifiLock = wifiManager?.createWifiLock(lockType, "$packageName:TcpPeerWifi")?.apply {
                 setReferenceCounted(false)
                 acquire()
             }
-        Log.i(TAG, "Connection wake lock acquired")
+            Log.i(TAG, "Connection wifi lock acquired")
+        }
     }
 
     @Synchronized
@@ -2398,7 +2416,11 @@ class TcpPeerVpnService : VpnService() {
             if (wakeLock.isHeld) wakeLock.release()
         }
         connectionWakeLock = null
-        Log.i(TAG, "Connection wake lock released")
+        connectionWifiLock?.let { wifiLock ->
+            if (wifiLock.isHeld) wifiLock.release()
+        }
+        connectionWifiLock = null
+        Log.i(TAG, "Connection wake and wifi locks released")
     }
 
     /**
