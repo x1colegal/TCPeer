@@ -52,7 +52,12 @@ def test_ipv6_isolation_only_blocks_the_exit_nodes_exact_lan_addresses() -> None
     assert (
         'ip6 saddr { 2001:db8:200::/64 } ip6 daddr fdfe:cafe:cafe::1 counter drop'
     ) in rules
+    assert (
+        'ip6 saddr { 2001:db8:200::/64 } ip6 daddr 2001:db8:100::/64 counter drop'
+    ) in rules
     assert 'iifname "tcppeer0" accept' in rules
+    assert 'oifname "tcppeer0" ct state established,related accept' in rules
+    assert 'oifname "tcppeer0" counter drop' in rules
     assert 'ip6 daddr 2001:db8:200::/64 counter drop' not in rules
 
 
@@ -102,6 +107,9 @@ def test_host_isolation_only_installs_exact_destination_drop() -> None:
     ) in rules
     assert (
         'ip6 saddr { 2001:db8:200::/64 } ip6 daddr 2001:db8:100::20 counter drop'
+    ) in rules
+    assert (
+        'ip6 saddr { 2001:db8:200::/64 } ip6 daddr 2001:db8:100::/64 counter drop'
     ) in rules
     assert "forward" not in rules
     assert "masquerade" not in rules

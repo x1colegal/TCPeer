@@ -97,6 +97,13 @@ class HostIpv6Isolation:
                     f"    ip6 saddr {{ {prefix_set} }} ip6 daddr {overlay_address} "
                     "counter drop\n"
                 )
+        if overlay_prefix is not None:
+            prefix_set = ", ".join(str(prefix) for prefix in prefixes)
+            if prefix_set:
+                drop += (
+                    f"    ip6 saddr {{ {prefix_set} }} ip6 daddr {overlay_prefix} "
+                    "counter drop\n"
+                )
         rules = f'''table inet tcppeer_input {{
   chain input {{
     type filter hook input priority filter; policy accept;
@@ -207,6 +214,11 @@ class ExitNodeFirewall:
                 f"    ip6 saddr {{ {prefixes} }} ip6 daddr "
                 f"{self.ipv6_overlay_address} counter drop\n"
             )
+            if self.ipv6_overlay_prefix is not None:
+                overlay_input_drop += (
+                    f"    ip6 saddr {{ {prefixes} }} ip6 daddr "
+                    f"{self.ipv6_overlay_prefix} counter drop\n"
+                )
         flowtable = ""
         flow_rules = ""
         if upstream:
@@ -235,6 +247,7 @@ class ExitNodeFirewall:
 {flow_rules}
     iifname "{tun}" accept
     oifname "{tun}" ct state established,related accept
+    oifname "{tun}" counter drop
   }}
 }}''')
         if self.config.nat44:
