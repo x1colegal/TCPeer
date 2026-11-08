@@ -135,6 +135,8 @@ class TcpPeerVpnService : VpnService() {
     private lateinit var connectivityManager: ConnectivityManager
     @Volatile private var underlyingNetworkSignature: String? = null
     @Volatile private var underlyingNetwork: Network? = null
+    @Volatile private var physicalLanAddresses: List<ByteArray> = emptyList()
+    @Volatile private var physicalLanPrefixes: List<RoutePrefix> = emptyList()
 
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
@@ -153,6 +155,8 @@ class TcpPeerVpnService : VpnService() {
                 } else {
                     underlyingNetwork = null
                     underlyingNetworkSignature = null
+                    physicalLanAddresses = emptyList()
+                    physicalLanPrefixes = emptyList()
                     true
                 }
             }
@@ -167,6 +171,18 @@ class TcpPeerVpnService : VpnService() {
             val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return
             if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return
             if (!capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) return
+            val lanAddrs = mutableListOf<ByteArray>()
+            val lanPrefixList = mutableListOf<RoutePrefix>()
+            for (link in linkProperties.linkAddresses) {
+                val addr = link.address
+                if (addr.isAnyLocalAddress || addr.isLoopbackAddress) continue
+                lanAddrs.add(addr.address)
+                if (link.prefixLength > 0 && link.prefixLength < addr.address.size * 8) {
+                    lanPrefixList.add(RoutePrefix(addr.address, link.prefixLength))
+                }
+            }
+            physicalLanAddresses = lanAddrs
+            physicalLanPrefixes = lanPrefixList
             val addresses = linkProperties.linkAddresses.map { it.address }
             val (ipv4, ipv6) = TransportPolicy.localAddresses(addresses)
             // Track reachability changes without treating an IPv6 privacy-IID
@@ -1429,9 +1445,66 @@ class TcpPeerVpnService : VpnService() {
         length: Int = packet.size,
     ): Int {
         if (AddressNegotiation.isRouterAdvertisement(packet)) return 0
+        if (isHostIsolated(packet, length, overlayIpv6)) return 0
         if (!tunPackets.offer(packet, length))
             Log.w(TAG, "TUN receive queue full; dropping packet from peer_id=$peerId")
         return 0
+    }
+
+    private fun isHostIsolated(packet: ByteArray, length: Int, overlayIpv6: Inet6Address): Boolean {
+        if (length < 20) return false
+        val version = packet[0].toInt().ushr(4)
+        val (srcBytes, dstBytes) = when (version) {
+            4 -> {
+                if (length < 20) return false
+                packet.copyOfRange(12, 16) to packet.copyOfRange(16, 20)
+            }
+            6 -> {
+                if (length < 40) return false
+                packet.copyOfRange(8, 24) to packet.copyOfRange(24, 40)
+            }
+            else -> return false
+        }
+
+        val lanAddrs = physicalLanAddresses
+        val lanPrefixes = physicalLanPrefixes
+        if (lanAddrs.isEmpty() && lanPrefixes.isEmpty()) return false
+
+        for (addr in lanAddrs) {
+            if (addr.contentEquals(dstBytes)) return true
+        }
+
+        for (prefix in lanPrefixes) {
+            if (contains(prefix, dstBytes)) return true
+        }
+
+        if (dstBytes.contentEquals(overlayIpv6.address)) {
+            for (addr in lanAddrs) {
+                if (addr.contentEquals(srcBytes)) return true
+            }
+            for (prefix in lanPrefixes) {
+                if (contains(prefix, srcBytes)) return true
+            }
+        }
+
+        return false
+    }
+
+    private fun isOutboundLanBlocked(packet: ByteArray, length: Int): Boolean {
+        if (length < 20) return false
+        val version = packet[0].toInt().ushr(4)
+        val dstBytes = when (version) {
+            4 -> if (length >= 20) packet.copyOfRange(16, 20) else return false
+            6 -> if (length >= 40) packet.copyOfRange(24, 40) else return false
+            else -> return false
+        }
+        for (addr in physicalLanAddresses) {
+            if (addr.contentEquals(dstBytes)) return true
+        }
+        for (prefix in physicalLanPrefixes) {
+            if (contains(prefix, dstBytes)) return true
+        }
+        return false
     }
 
     private fun handleTppControl(
@@ -2101,6 +2174,9 @@ class TcpPeerVpnService : VpnService() {
                 if (count == 0) continue
 
                 val destination = packetDestination(buffer, count)
+                if (isOutboundLanBlocked(buffer, count)) {
+                    continue
+                }
                 val directPeer = TcpPeerRuntime.state.value.devices.firstOrNull { device ->
                     device.overlayIpv4 == destination || device.overlayIpv6.substringBefore('%') == destination
                 }?.peerId
