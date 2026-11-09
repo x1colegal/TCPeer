@@ -106,7 +106,6 @@ class TcpPeerVpnService : VpnService() {
     private val meshSockets = ConcurrentHashMap<String, Socket>()
     private val meshSocketKeys = ConcurrentHashMap<String, String>()
     private val meshEndpoints = ConcurrentHashMap<String, String>()
-    private val meshPeerByHost = ConcurrentHashMap<String, String>()
     private val meshPeerByEndpoint = ConcurrentHashMap<String, String>()
     private val meshCommitted: MutableSet<String> =
         Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
@@ -480,7 +479,13 @@ class TcpPeerVpnService : VpnService() {
             selected
         }
         val activeLinkProperties = physicalNetwork?.let(connectivityManager::getLinkProperties)
-        val activeAddresses = activeLinkProperties?.linkAddresses?.map { it.address }.orEmpty() +
+        val sortedLinkAddresses = activeLinkProperties?.linkAddresses.orEmpty().sortedWith(
+            compareBy(
+                { (it.flags and 0x20) != 0 }, // Deprecated last (0x20 = IFA_F_DEPRECATED)
+                { (it.flags and 0x01) != 0 }, // Temporary privacy extensions after stable (0x01 = IFA_F_TEMPORARY)
+            )
+        )
+        val activeAddresses = sortedLinkAddresses.map { it.address } +
             TransportPolicy.clatIpv4Addresses()
         val (localIpv4, localIpv6) = TransportPolicy.localAddresses(activeAddresses)
         Log.i(
@@ -533,15 +538,19 @@ class TcpPeerVpnService : VpnService() {
             else -> queryPublicEndpoint(config, DirectFamily.IPV6, physicalNetwork)
         }
         val directPublicIpv4 = localIpv4.firstOrNull(TransportPolicy::isPublicIpv4)?.hostAddress
+        val directPublicIpv6 = localIpv6.firstOrNull(TransportPolicy::isUsableIpv6)?.hostAddress?.substringBefore('%')
         var advertisedIpv4 = ""
         var advertisedIpv6 = ""
 
         fun registerCurrentEndpoints() {
-            val localIpv4Address = localIpv4.firstOrNull()
             advertisedIpv4 = endpointIpv4?.address ?: directPublicIpv4.orEmpty()
-            advertisedIpv6 = endpointIpv6?.address.orEmpty()
+            advertisedIpv6 = endpointIpv6?.address ?: directPublicIpv6.orEmpty()
             val mappedIpv4Port = endpointIpv4?.port ?: if (directPublicIpv4 != null) config.directPort else null
-            val mappedIpv6Port = endpointIpv6?.port
+            val mappedIpv6Port = endpointIpv6?.port ?: if (directPublicIpv6 != null) config.directPort else null
+            val localIpv4Address = localIpv4.firstOrNull { it.hostAddress == advertisedIpv4 }
+                ?: localIpv4.firstOrNull()
+            val localIpv6Address = localIpv6.firstOrNull { it.hostAddress?.substringBefore('%') == advertisedIpv6 }
+                ?: localIpv6.firstOrNull()
             writeCoordinatorControl(controlOutput, ControlMessage("REGISTER", linkedMapOf(
                 "Peer-ID" to config.peerId,
                 "Device-Name" to config.deviceName,
@@ -551,7 +560,7 @@ class TcpPeerVpnService : VpnService() {
                 "Mapped-IPv6-Port" to (mappedIpv6Port?.toString() ?: ""),
                 "Local-IPv4" to (localIpv4Address?.hostAddress ?: ""),
                 "Local-IPv4-Prefix" to (TransportPolicy.prefixLength(localIpv4Address)?.toString() ?: ""),
-                "Local-IPv6" to (localIpv6.firstOrNull()?.hostAddress?.substringBefore('%') ?: ""),
+                "Local-IPv6" to (localIpv6Address?.hostAddress?.substringBefore('%') ?: ""),
                 "Port" to config.directPort.toString(),
                 "Role" to "Client",
                 "Platform" to "Android",
@@ -686,11 +695,16 @@ class TcpPeerVpnService : VpnService() {
         val directOutput = direct.getOutputStream()
         val directNonce = AuthProof.generateNonce()
         TcpPeerProtocol.writeControl(directOutput, ControlMessage("AUTH", linkedMapOf(
+            "Peer-ID" to config.peerId,
             "Nonce" to directNonce,
         )))
         val peerInfo = TcpPeerProtocol.readControl(directInput)
         if (peerInfo.command != "AUTH") {
             throw ProtocolException("Direct peer handshake failed")
+        }
+        val remotePeerId = peerInfo.field("Peer-ID")
+        if (remotePeerId != null && remotePeerId != targetPeerId) {
+            throw ProtocolException("Direct peer identity mismatch: expected $targetPeerId, got $remotePeerId")
         }
         val peerNonce = peerInfo.field("Nonce").orEmpty()
         if (peerNonce.isEmpty() || peerNonce == directNonce) {
@@ -846,10 +860,8 @@ class TcpPeerVpnService : VpnService() {
                                     } else {
                                         "-"
                                     }
-                                    val devIpv4 = message.field("IPv4").orEmpty()
-                                    val devIpv6 = message.field("IPv6")?.substringBefore('%').orEmpty()
-                                    if (devIpv4.isNotBlank() && devIpv4 != "-") meshPeerByHost[devIpv4] = devicePeerId
-                                    if (devIpv6.isNotBlank() && devIpv6 != "-") meshPeerByHost[devIpv6] = devicePeerId
+                                    val devIpv4Port = message.field("IPv4-Port")?.toIntOrNull() ?: message.field("Mapped-IPv4-Port")?.toIntOrNull()
+                                    val devIpv6Port = message.field("IPv6-Port")?.toIntOrNull() ?: message.field("Mapped-IPv6-Port")?.toIntOrNull() ?: message.field("Port")?.toIntOrNull()
                                     devices += NetworkDevice(
                                         peerId = devicePeerId,
                                         displayName = message.field("Device-Name")
@@ -864,6 +876,8 @@ class TcpPeerVpnService : VpnService() {
                                         overlayIpv6 = message.field("Overlay-IPv6").orEmpty().ifBlank { "-" },
                                         connectedUsing = activeEndpoint,
                                         port = message.field("Port")?.toIntOrNull() ?: 7444,
+                                        ipv4Port = devIpv4Port,
+                                        ipv6Port = devIpv6Port,
                                     ).also { device ->
                                         if (
                                             device.online &&
@@ -919,11 +933,8 @@ class TcpPeerVpnService : VpnService() {
                                 val punchPeer = message.field("Peer-ID")
                                 val punchAddr = message.field("Address")?.substringBefore('%')
                                 val punchPort = message.field("Port")
-                                if (punchPeer != null && punchAddr != null) {
-                                    meshPeerByHost[punchAddr] = punchPeer
-                                    if (punchPort != null) {
-                                        meshPeerByEndpoint["$punchAddr:$punchPort"] = punchPeer
-                                    }
+                                if (punchPeer != null && punchAddr != null && punchPort != null) {
+                                    meshPeerByEndpoint["$punchAddr:$punchPort"] = punchPeer
                                 }
                                 if (punchPeer != null && meshPunchActive.add(punchPeer)) {
                                     meshReadySentAt.remove(punchPeer)
@@ -1084,11 +1095,16 @@ class TcpPeerVpnService : VpnService() {
             val output = socket.getOutputStream()
             val myNonce = AuthProof.generateNonce()
             TcpPeerProtocol.writeControl(output, ControlMessage("AUTH", linkedMapOf(
+                "Peer-ID" to config.peerId,
                 "Nonce" to myNonce,
             )))
             val peerInfo = TcpPeerProtocol.readControl(input)
             if (peerInfo.command != "AUTH") {
                 throw ProtocolException("Direct mesh peer handshake failed")
+            }
+            val remotePeerId = peerInfo.field("Peer-ID")
+            if (remotePeerId != null && remotePeerId != peerId) {
+                throw ProtocolException("Direct mesh peer identity mismatch: expected $peerId, got $remotePeerId")
             }
             val peerNonce = peerInfo.field("Nonce").orEmpty()
             if (peerNonce.isEmpty() || peerNonce == myNonce) {
@@ -1237,19 +1253,22 @@ class TcpPeerVpnService : VpnService() {
             output = socket.getOutputStream()
             val remoteHost = socket.inetAddress?.hostAddress?.substringBefore('%').orEmpty()
             val remotePort = socket.port
-            peerId = meshPeerByEndpoint["$remoteHost:$remotePort"]
-                ?: meshPeerByHost[remoteHost]
-                ?: "unknown"
             val peerInfo = TcpPeerProtocol.readControl(input)
             if (peerInfo.command != "AUTH") {
                 throw ProtocolException("Accepted mesh peer handshake failed")
             }
+            val remotePeerId = peerInfo.field("Peer-ID").orEmpty()
+            if (remotePeerId.isEmpty()) {
+                throw ProtocolException("Accepted mesh peer did not provide Peer-ID")
+            }
+            peerId = remotePeerId
             val peerNonce = peerInfo.field("Nonce").orEmpty()
             val myNonce = AuthProof.generateNonce()
             if (peerNonce.isEmpty() || peerNonce == myNonce) {
                 throw ProtocolException("Accepted mesh peer authentication challenge failed")
             }
             TcpPeerProtocol.writeControl(output, ControlMessage("AUTH", linkedMapOf(
+                "Peer-ID" to config.peerId,
                 "Nonce" to myNonce,
             )))
             TcpPeerProtocol.writeControl(output, ControlMessage("AUTH-PROOF", linkedMapOf(
@@ -1260,18 +1279,11 @@ class TcpPeerVpnService : VpnService() {
                 throw ProtocolException("Accepted mesh peer authentication failed")
             }
             val peerProof = peerAuth.field("Proof").orEmpty()
-            if (peerId != "unknown" && AuthProof.verify(config.secret, config.network, peerId, myNonce, peerProof)) {
-                // verified known endpoint
-            } else {
-                val candidatePeers = (meshConnecting + meshReadySentAt.keys + meshSockets.keys + TcpPeerRuntime.state.value.devices.map { it.peerId }).distinct()
-                val matched = candidatePeers.firstOrNull { candidateId ->
-                    AuthProof.verify(config.secret, config.network, candidateId, myNonce, peerProof)
-                } ?: throw ProtocolException("Accepted mesh peer authentication failed: no matching peer proof")
-                peerId = matched
-                meshPeerByHost[remoteHost] = peerId
-                if (remotePort > 0) {
-                    meshPeerByEndpoint["$remoteHost:$remotePort"] = peerId
-                }
+            if (!AuthProof.verify(config.secret, config.network, peerId, myNonce, peerProof)) {
+                throw ProtocolException("Accepted mesh peer authentication failed: invalid proof for $peerId")
+            }
+            if (remotePort > 0) {
+                meshPeerByEndpoint["$remoteHost:$remotePort"] = peerId
             }
             // Keep the established mesh stream blocking indefinitely after
             // the bounded handshake, matching the primary direct connection.
@@ -1613,6 +1625,8 @@ class TcpPeerVpnService : VpnService() {
                     } else {
                         "-"
                     }
+                    val devIpv4Port = message.field("IPv4-Port")?.toIntOrNull() ?: message.field("Mapped-IPv4-Port")?.toIntOrNull()
+                    val devIpv6Port = message.field("IPv6-Port")?.toIntOrNull() ?: message.field("Mapped-IPv6-Port")?.toIntOrNull() ?: message.field("Port")?.toIntOrNull()
                     devices += NetworkDevice(
                         peerId = devicePeerId,
                         displayName = message.field("Device-Name")
@@ -1627,6 +1641,8 @@ class TcpPeerVpnService : VpnService() {
                         overlayIpv6 = message.field("Overlay-IPv6").orEmpty().ifBlank { "-" },
                         connectedUsing = activeEndpoint,
                         port = message.field("Port")?.toIntOrNull() ?: 7444,
+                        ipv4Port = devIpv4Port,
+                        ipv6Port = devIpv6Port,
                     )
                 }
             }

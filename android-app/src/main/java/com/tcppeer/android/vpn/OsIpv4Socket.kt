@@ -153,6 +153,14 @@ internal class OsTcpSocket internal constructor(
         if (configureIpv6Only && family == OsConstants.AF_INET6) {
             Os.setsockoptInt(fileDescriptor, OsConstants.IPPROTO_IPV6, OsConstants.IPV6_V6ONLY, 1)
         }
+        if (family == OsConstants.AF_INET6) {
+            runCatching {
+                // IPV6_ADDR_PREFERENCES = 72, IPV6_PREFER_SRC_PUBLIC = 0x0002 (RFC 5014)
+                // Instruct kernel source address selection to prefer public (stable) addresses
+                // over temporary Privacy Extension addresses that rotate and drop connections.
+                Os.setsockoptInt(fileDescriptor, OsConstants.IPPROTO_IPV6, 72, 2)
+            }
+        }
     }
 
     fun bindNetwork(network: Network?) {
@@ -310,6 +318,9 @@ internal class OsTcpServerSocket(private val family: Int) : ServerSocket() {
     init {
         if (family == OsConstants.AF_INET6) {
             Os.setsockoptInt(fileDescriptor, OsConstants.IPPROTO_IPV6, OsConstants.IPV6_V6ONLY, 1)
+            runCatching {
+                Os.setsockoptInt(fileDescriptor, OsConstants.IPPROTO_IPV6, 72, 2)
+            }
         }
     }
 

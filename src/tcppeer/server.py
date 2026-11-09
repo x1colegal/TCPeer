@@ -37,6 +37,7 @@ from tcppeer.transport import (
     choose_family,
     is_usable_ipv6,
     resolve_tcp_endpoints,
+    set_ipv6_prefer_public,
 )
 from tcppeer.tun import TunDevice
 
@@ -123,13 +124,14 @@ def discover_direct_ipv4(excluded_interfaces: set[str] | None = None) -> str | N
 
 
 def discover_direct_ipv6(excluded_interfaces: set[str] | None = None) -> str | None:
-    """Find a usable IPv6 address on an active physical interface."""
+    """Find a usable IPv6 address on an active physical interface, preferring non-temporary addresses."""
     excluded = excluded_interfaces or set()
     interfaces = dict(socket.if_nameindex())
     try:
         rows = Path("/proc/net/if_inet6").read_text(encoding="ascii").splitlines()
     except OSError:
         return None
+    candidates: list[tuple[int, str]] = []
     for row in rows:
         fields = row.split()
         if len(fields) != 6:
@@ -141,11 +143,22 @@ def discover_direct_ipv6(excluded_interfaces: set[str] | None = None) -> str | N
             address = str(ipaddress.IPv6Address(int(raw, 16)))
         except ValueError:
             continue
+        flags_int = int(flags, 16)
         # Tentative/DAD-failed addresses must not be advertised or bound.
-        if int(flags, 16) & 0x48 or not is_usable_ipv6(address):
+        if flags_int & 0x48 or not is_usable_ipv6(address):
             continue
         if name in interfaces.values():
-            return address
+            # Preference ranking:
+            # 0: non-temporary (stable SLAAC/static) and non-deprecated
+            # 1: temporary (privacy extension) and non-deprecated
+            # 2: deprecated
+            is_temp = bool(flags_int & 0x01)
+            is_dep = bool(flags_int & 0x20)
+            rank = (2 if is_dep else (1 if is_temp else 0))
+            candidates.append((rank, address))
+    if candidates:
+        candidates.sort(key=lambda x: x[0])
+        return candidates[0][1]
     return None
 
 
@@ -213,7 +226,6 @@ class Server:
         self._direct_connect_tasks: dict[str, asyncio.Task] = {}
         self._direct_connect_peer_sessions: dict[str, str] = {}
         self._direct_target_endpoints: dict[tuple[str, int], str] = {}
-        self._peer_hosts: dict[str, str] = {}
         self._direct_adoption_lock = asyncio.Lock()
         self._direct_owner_tokens: dict[str, str] = {}
         self._direct_owner_keys: dict[str, tuple[str, str]] = {}
@@ -327,6 +339,7 @@ class Server:
             if current is not None and current.fileno() >= 0:
                 continue
             candidate = socket.socket(family, socket.SOCK_STREAM, socket.IPPROTO_TCP)
+            set_ipv6_prefer_public(candidate)
             candidate.setblocking(False)
             candidate.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             if hasattr(socket, "SO_REUSEPORT"):
@@ -372,23 +385,19 @@ class Server:
                 self._sockname_text(writer),
                 self._peername_text(writer),
             )
-            endpoint = writer.get_extra_info("peername") or ("unknown", 0)
-            remote_addr = endpoint[0]
-            remote_port = endpoint[1]
-            peer_id = (
-                self._direct_target_endpoints.get((remote_addr, remote_port))
-                or self._peer_hosts.get(remote_addr)
-                or "unknown"
-            )
             info = await asyncio.wait_for(read_control(reader), timeout=CONTROL_REPLY_TIMEOUT_SECONDS)
             if info.command != "AUTH":
                 raise ProtocolError("invalid direct peer handshake")
+            peer_id = info.get("Peer-ID") or ""
             peer_nonce = info.get("Nonce") or ""
+            if not peer_id or not peer_nonce:
+                raise ProtocolError("invalid direct peer handshake fields")
             my_nonce = secrets.token_hex(32)
-            if not peer_nonce or peer_nonce == my_nonce:
+            if peer_nonce == my_nonce:
                 raise ProtocolError("invalid direct peer authentication challenge")
             actual_family = direct_socket.family
             writer.write(ControlMessage("AUTH", {
+                "Peer-ID": self.config.peer_id,
                 "Nonce": my_nonce,
             }).encode())
             writer.write(ControlMessage("AUTH-PROOF", {
@@ -401,20 +410,8 @@ class Server:
             if peer_auth.command != "AUTH-PROOF":
                 raise ProtocolError("direct peer authentication failed")
             peer_proof = peer_auth.get("Proof") or ""
-            if peer_id != "unknown" and proof_matches(self.config.secret, self.config.network, peer_id, my_nonce, peer_proof):
-                pass
-            else:
-                verified = None
-                candidates = [row["peer_id"] for row in self.store.list_table("peers")]
-                for candidate_id in candidates:
-                    if proof_matches(self.config.secret, self.config.network, candidate_id, my_nonce, peer_proof):
-                        verified = candidate_id
-                        break
-                if not verified:
-                    raise ProtocolError("direct peer authentication failed")
-                peer_id = verified
-                self._direct_target_endpoints[(remote_addr, remote_port)] = peer_id
-                self._peer_hosts[remote_addr] = peer_id
+            if not proof_matches(self.config.secret, self.config.network, peer_id, my_nonce, peer_proof):
+                raise ProtocolError("direct peer authentication failed")
             endpoint = writer.get_extra_info("peername") or ("unknown", 0)
             await self._adopt_direct(
                 reader,
@@ -617,12 +614,6 @@ class Server:
                     "coordinator control connection did not answer keepalive"
                 ) from exc
     def _update_peer_from_directory(self, peer_id: str, message: ControlMessage) -> None:
-        ipv4 = message.get("IPv4")
-        ipv6 = message.get("IPv6")
-        if ipv4 and ipv4 != "-":
-            self._peer_hosts[ipv4] = peer_id
-        if ipv6 and ipv6 != "-":
-            self._peer_hosts[ipv6] = peer_id
         overlay_ipv4 = message.get("Overlay-IPv4") or None
         overlay_ipv6 = message.get("Overlay-IPv6") or None
         values: dict[str, object] = {
@@ -679,6 +670,7 @@ class Server:
             retry_delay = 0.25
             for candidate_family, socktype, protocol, _name, address in family_results:
                 sock = socket.socket(candidate_family, socktype, protocol)
+                set_ipv6_prefer_public(sock)
                 sock.setblocking(False)
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 if hasattr(socket, "SO_REUSEPORT"):
@@ -777,6 +769,7 @@ class Server:
                 if candidate_family != family:
                     continue
                 sock = socket.socket(candidate_family, socktype, protocol)
+                set_ipv6_prefer_public(sock)
                 sock.setblocking(False)
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 if hasattr(socket, "SO_REUSEPORT"):
@@ -817,7 +810,6 @@ class Server:
             await asyncio.sleep(delay)
         peer_id = message.get("Peer-ID") or "unknown"
         self._direct_target_endpoints[(remote.address, remote.port)] = peer_id
-        self._peer_hosts[remote.address] = peer_id
         peer_session = message.get("Peer-Session") or ""
         attempt = self._next_direct_attempt()
         writer = None
@@ -845,12 +837,16 @@ class Server:
             )
             my_nonce = secrets.token_hex(32)
             writer.write(ControlMessage("AUTH", {
+                "Peer-ID": self.config.peer_id,
                 "Nonce": my_nonce,
             }).encode())
             await writer.drain()
             peer_info = await asyncio.wait_for(read_control(reader), timeout=CONTROL_REPLY_TIMEOUT_SECONDS)
             if peer_info.command != "AUTH":
                 raise ProtocolError("invalid direct peer handshake")
+            remote_peer_id = peer_info.get("Peer-ID") or ""
+            if remote_peer_id and remote_peer_id != peer_id:
+                raise ProtocolError(f"direct peer identity mismatch: expected {peer_id}, got {remote_peer_id}")
             peer_nonce = peer_info.get("Nonce") or ""
             if not peer_nonce or peer_nonce == my_nonce:
                 raise ProtocolError("invalid direct peer authentication challenge")

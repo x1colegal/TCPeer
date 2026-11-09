@@ -35,6 +35,16 @@ def is_usable_ipv6(address: str | None) -> bool:
     )
 
 
+def set_ipv6_prefer_public(sock: socket.socket) -> None:
+    """RFC 5014: Instruct the kernel to prefer stable public IPv6 addresses over temporary privacy ones."""
+    if sock.family == socket.AF_INET6:
+        try:
+            # IPV6_ADDR_PREFERENCES = 72, IPV6_PREFER_SRC_PUBLIC = 0x0002
+            sock.setsockopt(socket.IPPROTO_IPV6, 72, 2)
+        except OSError:
+            pass
+
+
 def choose_family(local_ipv6: Iterable[str], remote_ipv6: Iterable[str]) -> socket.AddressFamily:
     local_has_ipv6 = any(is_usable_ipv6(item) for item in local_ipv6)
     remote_has_ipv6 = any(is_usable_ipv6(item) for item in remote_ipv6)
@@ -117,6 +127,12 @@ class DirectConnector:
             sock = prebound_socket or socket.socket(required_family, socket.SOCK_STREAM, socket.IPPROTO_TCP)
             sock.setblocking(False)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if required_family == socket.AF_INET6:
+                try:
+                    # IPV6_ADDR_PREFERENCES = 72, IPV6_PREFER_SRC_PUBLIC = 0x0002 (RFC 5014)
+                    sock.setsockopt(socket.IPPROTO_IPV6, 72, 2)
+                except OSError:
+                    pass
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
             if hasattr(socket, "SO_REUSEPORT"):

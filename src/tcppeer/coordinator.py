@@ -268,6 +268,23 @@ class Coordinator:
             peer.listen_port = int(port) if port else peer.observed_port
             peer.role = message.get("Role") or "Client"
             peer.platform = message.get("Platform") or "Unknown"
+
+            # Align public endpoint data with the active control socket observation
+            # so the registered directory address and PUNCH-GO targets always match.
+            try:
+                obs_ver = ipaddress.ip_address(peer.observed_address.split("%", 1)[0]).version
+            except ValueError:
+                obs_ver = 0
+
+            if obs_ver == 6:
+                peer.declared_ipv6 = peer.observed_address
+                if not peer.mapped_ipv6_port:
+                    peer.mapped_ipv6_port = peer.observed_port
+            elif obs_ver == 4:
+                peer.declared_ipv4 = peer.observed_address
+                if not peer.mapped_ipv4_port:
+                    peer.mapped_ipv4_port = peer.observed_port
+
             known = self.known_peers[(peer.network, peer.peer_id)]
             known.display_name = display_name
             known.role = peer.role
@@ -462,6 +479,17 @@ class Coordinator:
             online = known.online
             registered = self.peers.get((peer.network, known.peer_id))
             listen_port = str(registered.listen_port if registered else 7444)
+            ipv4_p = ""
+            ipv6_p = ""
+            if registered and online:
+                try:
+                    obs_ver = ipaddress.ip_address(registered.observed_address.split("%", 1)[0]).version
+                except ValueError:
+                    obs_ver = 0
+                ipv4_val = registered.mapped_ipv4_port or (registered.observed_port if obs_ver == 4 else registered.listen_port)
+                ipv6_val = registered.mapped_ipv6_port or (registered.observed_port if obs_ver == 6 else registered.listen_port)
+                ipv4_p = str(ipv4_val) if ipv4_val else ""
+                ipv6_p = str(ipv6_val) if ipv6_val else ""
             snapshot.append(ControlMessage("PEER-INFO", {
                 "Action": "Device",
                 "Peer-ID": known.peer_id,
@@ -473,6 +501,8 @@ class Coordinator:
                 # stale physical addresses as usable while a peer is offline.
                 "IPv4": known.ipv4 if online else "",
                 "IPv6": known.ipv6 if online else "",
+                "IPv4-Port": ipv4_p,
+                "IPv6-Port": ipv6_p,
                 "Port": listen_port if online else "",
                 "Overlay-IPv4": known.overlay_ipv4 if online else "",
                 "Overlay-IPv6": known.overlay_ipv6 if online else "",

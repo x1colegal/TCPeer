@@ -28,6 +28,7 @@ from tcppeer.server import (
     public_address,
 )
 from tcppeer.state import StateStore
+from tcppeer.transport import set_ipv6_prefer_public
 from tcppeer.tun import TunDevice
 
 LOG = logging.getLogger("tcppeer.client")
@@ -82,7 +83,6 @@ class Client(Server):
         self._direct_connect_tasks = {}
         self._direct_connect_peer_sessions = {}
         self._direct_target_endpoints: dict[tuple[str, int], str] = {}
-        self._peer_hosts: dict[str, str] = {}
         self._direct_adoption_lock = asyncio.Lock()
         self._direct_owner_tokens = {}
         self._direct_owner_keys = {}
@@ -126,6 +126,7 @@ class Client(Server):
                 else self._direct_bind_ipv4
             ) or ("::" if family == socket.AF_INET6 else "0.0.0.0")
             candidate = socket.socket(family, socket.SOCK_STREAM, socket.IPPROTO_TCP)
+            set_ipv6_prefer_public(candidate)
             candidate.setblocking(False)
             candidate.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             if hasattr(socket, "SO_REUSEPORT"):

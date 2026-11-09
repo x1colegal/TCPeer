@@ -1135,8 +1135,8 @@ private fun DeviceCard(
                         DetailRow("Transport", device.transport)
                         DetailRow("Direct connection endpoint", formatEndpointDisplay(device.connectedUsing))
                     }
-                    DetailRow("Public IPv4", formatPublicAddressDisplay(device.ipv4, device.port))
-                    DetailRow("Public IPv6", formatPublicAddressDisplay(device.ipv6, device.port))
+                    DetailRow("Public IPv4", formatAddressWithPort(device.ipv4, device.ipv4Port))
+                    DetailRow("Public IPv6", formatAddressWithPort(device.ipv6, device.ipv6Port))
                     DetailRow("PeerNet IPv4", device.overlayIpv4)
                     DetailRow("PeerNet IPv6", device.overlayIpv6)
                     Row(
@@ -1355,23 +1355,16 @@ private fun formatEndpointDisplay(value: String): String {
     return value
 }
 
-private fun formatPublicAddressDisplay(address: String, port: Int = 7444): String {
+private fun formatAddressWithPort(address: String, port: Int?): String {
     if (address.isBlank() || address == "-") return "-"
-    val clean = address.trim()
-    if (clean.startsWith("[")) return clean
-    val lastColon = clean.lastIndexOf(':')
-    if (lastColon > 0) {
-        val host = clean.substring(0, lastColon)
-        val p = clean.substring(lastColon + 1)
-        if (host.contains(':') && p.all { it.isDigit() }) {
-            return "[$host]:$p"
-        }
-        if (!host.contains(':') && p.all { it.isDigit() }) {
-            return clean
-        }
+    val clean = address.removeSurrounding("[", "]").substringBefore('%').trim()
+    if (clean.isBlank() || clean == "-") return "-"
+    val isIpv6 = clean.contains(':')
+    return if (port != null && port in 1..65535) {
+        if (isIpv6) "[$clean]:$port" else "$clean:$port"
+    } else {
+        if (isIpv6) "[$clean]" else clean
     }
-    val targetPort = if (port in 1..65535) port else 7444
-    return if (clean.contains(':')) "[$clean]:$targetPort" else "$clean:$targetPort"
 }
 
 @Composable
