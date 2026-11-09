@@ -48,6 +48,13 @@ TCP_SOCKET_BUFFER_LIMIT = 8 * 1024 * 1024
 DIRECT_BATCH_BYTES = 256 * 1024
 
 
+def format_endpoint_address(host: str, port: int | str) -> str:
+    host_str = str(host).strip()
+    if ":" in host_str and not host_str.startswith("["):
+        return f"[{host_str}]:{port}"
+    return f"{host_str}:{port}"
+
+
 def configure_tcp_socket_buffer_limits(
     sysctl_root: Path = Path("/proc/sys/net/core"),
     minimum: int = TCP_SOCKET_BUFFER_LIMIT,
@@ -414,7 +421,7 @@ class Server:
                 writer,
                 peer_id,
                 actual_family,
-                f"{endpoint[0]}:{endpoint[1]}",
+                format_endpoint_address(endpoint[0], endpoint[1]),
                 initiated=False,
                 attempt=attempt,
             )
@@ -864,7 +871,7 @@ class Server:
                 writer,
                 peer_id,
                 family,
-                f"{remote.address}:{remote.port}",
+                format_endpoint_address(remote.address, remote.port),
                 initiated=True,
                 attempt=attempt,
                 peer_session=peer_session,

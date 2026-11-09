@@ -460,6 +460,8 @@ class Coordinator:
         snapshot: list[bytes] = []
         for known in devices:
             online = known.online
+            registered = self.peers.get((peer.network, known.peer_id))
+            listen_port = str(registered.listen_port if registered else 7444)
             snapshot.append(ControlMessage("PEER-INFO", {
                 "Action": "Device",
                 "Peer-ID": known.peer_id,
@@ -471,6 +473,7 @@ class Coordinator:
                 # stale physical addresses as usable while a peer is offline.
                 "IPv4": known.ipv4 if online else "",
                 "IPv6": known.ipv6 if online else "",
+                "Port": listen_port if online else "",
                 "Overlay-IPv4": known.overlay_ipv4 if online else "",
                 "Overlay-IPv6": known.overlay_ipv6 if online else "",
                 "Last-Seen": str(known.last_seen),

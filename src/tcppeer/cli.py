@@ -24,11 +24,32 @@ def _rows(connection: sqlite3.Connection, query: str) -> list[sqlite3.Row]:
     return list(connection.execute(query))
 
 
+def _format_endpoint(val: str | None) -> str:
+    if not val or val == "-":
+        return "-"
+    val = val.strip()
+    if val.startswith("["):
+        return val
+    if ":" in val:
+        host, _, port = val.rpartition(":")
+        if ":" in host and port.isdigit():
+            return f"[{host}]:{port}"
+    return val
+
+
 def _print_table(rows: list[sqlite3.Row], columns: list[str]) -> None:
     if not rows:
         print("No records.")
         return
-    values = [[str(row[column] if row[column] not in {None, ""} else "-") for column in columns] for row in rows]
+    values = [
+        [
+            _format_endpoint(str(row[column]))
+            if column == "endpoint" and row[column] not in {None, ""}
+            else str(row[column] if row[column] not in {None, ""} else "-")
+            for column in columns
+        ]
+        for row in rows
+    ]
     widths = [max(len(column), *(len(row[index]) for row in values)) for index, column in enumerate(columns)]
     print("  ".join(column.upper().ljust(widths[index]) for index, column in enumerate(columns)))
     for row in values:

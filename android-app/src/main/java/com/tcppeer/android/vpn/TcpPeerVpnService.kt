@@ -863,6 +863,7 @@ class TcpPeerVpnService : VpnService() {
                                         overlayIpv4 = message.field("Overlay-IPv4").orEmpty().ifBlank { "-" },
                                         overlayIpv6 = message.field("Overlay-IPv6").orEmpty().ifBlank { "-" },
                                         connectedUsing = activeEndpoint,
+                                        port = message.field("Port")?.toIntOrNull() ?: 7444,
                                     ).also { device ->
                                         if (
                                             device.online &&
@@ -1625,6 +1626,7 @@ class TcpPeerVpnService : VpnService() {
                         overlayIpv4 = message.field("Overlay-IPv4").orEmpty().ifBlank { "-" },
                         overlayIpv6 = message.field("Overlay-IPv6").orEmpty().ifBlank { "-" },
                         connectedUsing = activeEndpoint,
+                        port = message.field("Port")?.toIntOrNull() ?: 7444,
                     )
                 }
             }

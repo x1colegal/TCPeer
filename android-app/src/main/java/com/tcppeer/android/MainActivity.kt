@@ -382,7 +382,7 @@ private fun HomeTab(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         style = MaterialTheme.typography.bodyMedium,
                     )
-                    DetailRow("Endpoint", runtime.endpoint)
+                    DetailRow("Endpoint", formatEndpointDisplay(runtime.endpoint))
                     DetailRow("PeerNet IPv4", runtime.overlayIpv4)
                     DetailRow("PeerNet IPv6", runtime.overlayIpv6)
                     DetailRow("Traffic", "${formatBytes(runtime.rxBytes)} down / ${formatBytes(runtime.txBytes)} up")
@@ -1133,10 +1133,10 @@ private fun DeviceCard(
                     DetailRow("Platform", device.platform)
                     if (!isSelf) {
                         DetailRow("Transport", device.transport)
-                        DetailRow("Direct connection endpoint", device.connectedUsing)
+                        DetailRow("Direct connection endpoint", formatEndpointDisplay(device.connectedUsing))
                     }
-                    DetailRow("Public IPv4", device.ipv4)
-                    DetailRow("Public IPv6", device.ipv6)
+                    DetailRow("Public IPv4", formatPublicAddressDisplay(device.ipv4, device.port))
+                    DetailRow("Public IPv6", formatPublicAddressDisplay(device.ipv6, device.port))
                     DetailRow("PeerNet IPv4", device.overlayIpv4)
                     DetailRow("PeerNet IPv6", device.overlayIpv6)
                     Row(
@@ -1339,6 +1339,39 @@ private fun formatElapsedTime(elapsedMillis: Long): String {
         hours > 0 -> String.format(Locale.US, "%d:%02d:%02d", hours, minutes, seconds)
         else -> String.format(Locale.US, "%d:%02d", minutes, seconds)
     }
+}
+
+private fun formatEndpointDisplay(value: String): String {
+    if (value.isBlank() || value == "-") return "-"
+    if (value.startsWith("[")) return value
+    val lastColon = value.lastIndexOf(':')
+    if (lastColon > 0) {
+        val host = value.substring(0, lastColon)
+        val port = value.substring(lastColon + 1)
+        if (host.contains(':') && port.all { it.isDigit() }) {
+            return "[$host]:$port"
+        }
+    }
+    return value
+}
+
+private fun formatPublicAddressDisplay(address: String, port: Int = 7444): String {
+    if (address.isBlank() || address == "-") return "-"
+    val clean = address.trim()
+    if (clean.startsWith("[")) return clean
+    val lastColon = clean.lastIndexOf(':')
+    if (lastColon > 0) {
+        val host = clean.substring(0, lastColon)
+        val p = clean.substring(lastColon + 1)
+        if (host.contains(':') && p.all { it.isDigit() }) {
+            return "[$host]:$p"
+        }
+        if (!host.contains(':') && p.all { it.isDigit() }) {
+            return clean
+        }
+    }
+    val targetPort = if (port in 1..65535) port else 7444
+    return if (clean.contains(':')) "[$clean]:$targetPort" else "$clean:$targetPort"
 }
 
 @Composable
