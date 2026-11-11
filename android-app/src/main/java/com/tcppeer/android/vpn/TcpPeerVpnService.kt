@@ -537,16 +537,14 @@ class TcpPeerVpnService : VpnService() {
             coordinatorFamily == DirectFamily.IPV6 -> observedEndpoint
             else -> queryPublicEndpoint(config, DirectFamily.IPV6, physicalNetwork)
         }
-        val directPublicIpv4 = localIpv4.firstOrNull(TransportPolicy::isPublicIpv4)?.hostAddress
-        val directPublicIpv6 = localIpv6.firstOrNull(TransportPolicy::isUsableIpv6)?.hostAddress?.substringBefore('%')
         var advertisedIpv4 = ""
         var advertisedIpv6 = ""
 
         fun registerCurrentEndpoints() {
-            advertisedIpv4 = endpointIpv4?.address ?: directPublicIpv4.orEmpty()
-            advertisedIpv6 = endpointIpv6?.address ?: directPublicIpv6.orEmpty()
-            val mappedIpv4Port = endpointIpv4?.port ?: if (directPublicIpv4 != null) config.directPort else null
-            val mappedIpv6Port = endpointIpv6?.port ?: if (directPublicIpv6 != null) config.directPort else null
+            advertisedIpv4 = endpointIpv4?.address.orEmpty()
+            advertisedIpv6 = endpointIpv6?.address.orEmpty()
+            val mappedIpv4Port = endpointIpv4?.port
+            val mappedIpv6Port = endpointIpv6?.port
             val localIpv4Address = localIpv4.firstOrNull { it.hostAddress == advertisedIpv4 }
                 ?: localIpv4.firstOrNull()
             val localIpv6Address = localIpv6.firstOrNull { it.hostAddress?.substringBefore('%') == advertisedIpv6 }
@@ -1676,6 +1674,27 @@ class TcpPeerVpnService : VpnService() {
         }
     }
 
+    private fun isPortConflictOrUnavailable(error: Throwable?): Boolean {
+        var current = error
+        while (current != null) {
+            val msg = current.message.orEmpty()
+            if (msg.contains("EADDRNOTAVAIL", ignoreCase = true) ||
+                msg.contains("EADDRINUSE", ignoreCase = true) ||
+                msg.contains("Cannot assign requested address", ignoreCase = true) ||
+                msg.contains("Address already in use", ignoreCase = true)) {
+                return true
+            }
+            if (current is android.system.ErrnoException) {
+                if (current.errno == OsConstants.EADDRNOTAVAIL ||
+                    current.errno == OsConstants.EADDRINUSE) {
+                    return true
+                }
+            }
+            current = current.cause
+        }
+        return false
+    }
+
     private fun openCoordinator(
         config: VpnConfiguration,
         preferIpv6: Boolean,
@@ -1687,28 +1706,40 @@ class TcpPeerVpnService : VpnService() {
             if (preferIpv6) if (it is Inet6Address) 0 else 1 else if (it is Inet4Address) 0 else 1
         }
         var lastError: Exception? = null
+        val maxAttempts = 12
         addresses.forEach { address ->
             val family = if (address is Inet6Address) DirectFamily.IPV6 else DirectFamily.IPV4
-            val socket = OsTcpSocket(if (family == DirectFamily.IPV6) OsConstants.AF_INET6 else OsConstants.AF_INET)
-            inFlightSockets.add(socket)
-            try {
-                socket.reuseAddress = true
-                val wildcard = if (address is Inet6Address) InetAddress.getByName("::") else InetAddress.getByName("0.0.0.0")
-                // Match the Linux transport: the long-lived coordinator socket
-                // owns the NAT mapping for its address family. SO_REUSEADDR lets
-                // listener and simultaneous-open sockets share :7444 while their
-                // remote tuples remain distinct.
-                socket.bindNetwork(physicalNetwork)
-                socket.bind(InetSocketAddress(wildcard, config.directPort))
-                requireProtectedOrBound(socket, physicalNetwork, "coordinator")
-                socket.connect(InetSocketAddress(address, config.coordinatorPort), 10_000)
-                socket.tcpNoDelay = false
-                socket.soTimeout = COORDINATOR_TIMEOUT_MS
-                return socket
-            } catch (error: Exception) {
-                lastError = error
-                inFlightSockets.remove(socket)
-                socket.close()
+            val wildcard = if (address is Inet6Address) InetAddress.getByName("::") else InetAddress.getByName("0.0.0.0")
+            for (attempt in 1..maxAttempts) {
+                val socket = OsTcpSocket(if (family == DirectFamily.IPV6) OsConstants.AF_INET6 else OsConstants.AF_INET)
+                inFlightSockets.add(socket)
+                try {
+                    socket.reuseAddress = true
+                    // Match the Linux transport: the long-lived coordinator socket
+                    // owns the NAT mapping for its address family. SO_REUSEADDR lets
+                    // listener and simultaneous-open sockets share :7444 while their
+                    // remote tuples remain distinct.
+                    socket.bindNetwork(physicalNetwork)
+                    socket.bind(InetSocketAddress(wildcard, config.directPort))
+                    requireProtectedOrBound(socket, physicalNetwork, "coordinator")
+                    socket.connect(InetSocketAddress(address, config.coordinatorPort), 10_000)
+                    socket.tcpNoDelay = false
+                    socket.soTimeout = COORDINATOR_TIMEOUT_MS
+                    return socket
+                } catch (error: Exception) {
+                    lastError = error
+                    inFlightSockets.remove(socket)
+                    socket.close()
+                    if (isPortConflictOrUnavailable(error) && attempt < maxAttempts) {
+                        try {
+                            Thread.sleep(250)
+                        } catch (_: InterruptedException) {
+                            break
+                        }
+                    } else {
+                        break
+                    }
+                }
             }
         }
         throw IllegalStateException("Cannot connect to the coordinator", lastError)
@@ -1726,47 +1757,59 @@ class TcpPeerVpnService : VpnService() {
             (family == DirectFamily.IPV6 && it is Inet6Address) ||
                 (family == DirectFamily.IPV4 && it is Inet4Address)
         }
+        val wildcard = if (family == DirectFamily.IPV6) InetAddress.getByName("::") else InetAddress.getByName("0.0.0.0")
+        val maxAttempts = 12
         addresses.forEach { address ->
-            val socket = OsTcpSocket(if (family == DirectFamily.IPV6) OsConstants.AF_INET6 else OsConstants.AF_INET)
-            var retained = false
-            inFlightSockets.add(socket)
-            try {
-                socket.reuseAddress = true
-                val wildcard = if (family == DirectFamily.IPV6) InetAddress.getByName("::") else InetAddress.getByName("0.0.0.0")
-                socket.bindNetwork(physicalNetwork)
-                socket.bind(InetSocketAddress(wildcard, config.directPort))
-                requireProtectedOrBound(socket, physicalNetwork, "endpoint query")
-                socket.connect(InetSocketAddress(address, config.coordinatorPort), 5_000)
-                socket.enableMappingKeepAlive()
-                socket.soTimeout = 5_000
-                TcpPeerProtocol.writeControl(socket.getOutputStream(), ControlMessage("ENDPOINT-QUERY"))
-                val response = TcpPeerProtocol.readControl(socket.getInputStream())
-                if (response.command == "ENDPOINT-INFO") {
-                    val endpointAddress = response.field("Address")
-                    val endpointPort = response.field("Port")?.toIntOrNull()
-                    if (!endpointAddress.isNullOrBlank() && endpointPort != null) {
-                        inFlightSockets.remove(socket)
-                        endpointMappingSockets[family] = socket
-                        retained = true
-                        Log.i(
-                            TAG,
-                            "Keeping ${familyLabel(family)} endpoint mapping alive " +
-                                "socket=${socketToken(socket)} local=${socket.localSocketAddress} " +
-                                "public=${formatEndpoint(InetAddress.getByName(endpointAddress), endpointPort)}",
-                        )
-                        return PublicEndpoint(normalizeEndpointAddress(endpointAddress), endpointPort)
+            for (attempt in 1..maxAttempts) {
+                val socket = OsTcpSocket(if (family == DirectFamily.IPV6) OsConstants.AF_INET6 else OsConstants.AF_INET)
+                var retained = false
+                inFlightSockets.add(socket)
+                try {
+                    socket.reuseAddress = true
+                    socket.bindNetwork(physicalNetwork)
+                    socket.bind(InetSocketAddress(wildcard, config.directPort))
+                    requireProtectedOrBound(socket, physicalNetwork, "endpoint query")
+                    socket.connect(InetSocketAddress(address, config.coordinatorPort), 5_000)
+                    socket.enableMappingKeepAlive()
+                    socket.soTimeout = 5_000
+                    TcpPeerProtocol.writeControl(socket.getOutputStream(), ControlMessage("ENDPOINT-QUERY"))
+                    val response = TcpPeerProtocol.readControl(socket.getInputStream())
+                    if (response.command == "ENDPOINT-INFO") {
+                        val endpointAddress = response.field("Address")
+                        val endpointPort = response.field("Port")?.toIntOrNull()
+                        if (!endpointAddress.isNullOrBlank() && endpointPort != null) {
+                            inFlightSockets.remove(socket)
+                            endpointMappingSockets[family] = socket
+                            retained = true
+                            Log.i(
+                                TAG,
+                                "Keeping ${familyLabel(family)} endpoint mapping alive " +
+                                    "socket=${socketToken(socket)} local=${socket.localSocketAddress} " +
+                                    "public=${formatEndpoint(InetAddress.getByName(endpointAddress), endpointPort)}",
+                            )
+                            return PublicEndpoint(normalizeEndpointAddress(endpointAddress), endpointPort)
+                        }
                     }
+                } catch (error: Exception) {
+                    if (isPortConflictOrUnavailable(error) && attempt < maxAttempts) {
+                        try {
+                            Thread.sleep(250)
+                        } catch (_: InterruptedException) {
+                            break
+                        }
+                        continue
+                    }
+                    Log.w(
+                        TAG,
+                        "${familyLabel(family)} endpoint discovery failed " +
+                            "network=$physicalNetwork coordinator=${address.hostAddress}",
+                        error,
+                    )
+                    break
+                } finally {
+                    inFlightSockets.remove(socket)
+                    if (!retained) socket.close()
                 }
-            } catch (error: Exception) {
-                Log.w(
-                    TAG,
-                    "${familyLabel(family)} endpoint discovery failed " +
-                        "network=$physicalNetwork coordinator=${address.hostAddress}",
-                    error,
-                )
-            } finally {
-                inFlightSockets.remove(socket)
-                if (!retained) socket.close()
             }
         }
         return null
