@@ -25,7 +25,7 @@ from tcppeer.auth import authentication_proof, proof_matches
 from tcppeer.dhcp import DhcpServer
 from tcppeer.dns import discover_upstream_dns
 from tcppeer.exit_node import ExitNodeFirewall
-from tcppeer.packet import build_dhcp_packet, extract_dhcp_payload
+from tcppeer.packet import build_dhcp_packet, build_tcp_reset, extract_dhcp_payload
 from tcppeer.protocol import ControlMessage, ProtocolError, encode_data, encode_data_plane_control, encode_tpp_control, read_control, read_data
 from tcppeer.ra import ALL_NODES, LINK_LOCAL_ROUTER, build_router_advertisement, ipv6_source, is_router_solicitation
 from tcppeer.pd import PrefixDelegationClient, discover_ipv6_upstream, router_address, slaac_subnet
@@ -191,6 +191,26 @@ def discover_ipv4_prefix(address: str | None) -> int | None:
     return None
 
 
+def _close_with_reset(writer: asyncio.StreamWriter | None) -> None:
+    """Close *writer* with an immediate TCP RST by setting SO_LINGER(1, 0)."""
+    if writer is None:
+        return
+    sock = writer.get_extra_info("socket")
+    if sock is not None:
+        try:
+            sock.setsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_LINGER,
+                struct.pack("ii", 1, 0),
+            )
+        except OSError:
+            pass
+    try:
+        writer.close()
+    except OSError:
+        pass
+
+
 class Server:
     """Own the TUN device, address services, state, and direct peer streams."""
 
@@ -307,7 +327,7 @@ class Server:
             self._direct_candidates.clear()
             self._direct_connect_peer_sessions.clear()
             for writer in list(self.direct_writers.values()):
-                writer.close()
+                _close_with_reset(writer)
             for task in self._peer_send_tasks.values():
                 task.cancel()
             await asyncio.gather(*self._peer_send_tasks.values(), return_exceptions=True)
@@ -424,7 +444,7 @@ class Server:
             )
         except (ProtocolError, ConnectionError, TimeoutError, asyncio.IncompleteReadError) as exc:
             LOG.warning("Rejected direct connection: %s", exc)
-            writer.close()
+            _close_with_reset(writer)
 
     async def _control_loop(self) -> None:
         """Keep the control plane reconnecting without tearing down the data plane."""
@@ -654,7 +674,7 @@ class Server:
     async def _query_observed_endpoint(self, family: socket.AddressFamily) -> tuple[str, int] | None:
         previous_writer = self._endpoint_mapping_writers.pop(family, None)
         if previous_writer is not None:
-            previous_writer.close()
+            _close_with_reset(previous_writer)
             await asyncio.gather(previous_writer.wait_closed(), return_exceptions=True)
         local_address = self._direct_bind_ipv6 if family == socket.AF_INET6 else self._direct_bind_ipv4
         local_address = local_address or ("::" if family == socket.AF_INET6 else "0.0.0.0")
@@ -716,9 +736,9 @@ class Server:
                     )
                 finally:
                     if writer is not None and not retained:
-                        writer.close()
+                        _close_with_reset(writer)
                         await asyncio.gather(writer.wait_closed(), return_exceptions=True)
-                    elif writer is None:
+                    elif writer is None and sock is not None:
                         sock.close()
             if attempt < max_attempts:
                 await asyncio.sleep(retry_delay)
@@ -730,20 +750,7 @@ class Server:
         writers = list(self._endpoint_mapping_writers.values())
         self._endpoint_mapping_writers.clear()
         for writer in writers:
-            transport_socket = writer.get_extra_info("socket")
-            if transport_socket is not None:
-                try:
-                    # The mapping is protocol state, not application data.  A
-                    # reset prevents a restarted process from inheriting an
-                    # unusable FIN-WAIT four-tuple on direct_port.
-                    transport_socket.setsockopt(
-                        socket.SOL_SOCKET,
-                        socket.SO_LINGER,
-                        struct.pack("ii", 1, 0),
-                    )
-                except OSError:
-                    pass
-            writer.close()
+            _close_with_reset(writer)
         if writers:
             await asyncio.gather(
                 *(writer.wait_closed() for writer in writers),
@@ -899,7 +906,7 @@ class Server:
             # socket is owned by StreamWriter, so DirectConnector cannot close
             # it for us.
             if writer is not None and not handed_off:
-                writer.close()
+                _close_with_reset(writer)
                 await asyncio.gather(writer.wait_closed(), return_exceptions=True)
 
     def _prepare_remote_route(self, address: str, family: socket.AddressFamily) -> None:
@@ -944,7 +951,7 @@ class Server:
             self._direct_owner_committed.discard(peer_id)
             if getattr(self, "store", None) is not None:
                 self.store.update_peer(peer_id, transport="-", endpoint=None)
-        current_writer.close()
+        _close_with_reset(current_writer)
         return True
 
     async def _adopt_direct(
@@ -986,7 +993,7 @@ class Server:
                         connection_key,
                         "current-owner-has-data" if owner_committed else "deterministic-arbitration",
                     )
-                    writer.close()
+                    _close_with_reset(writer)
                     await asyncio.gather(writer.wait_closed(), return_exceptions=True)
                     return
             replaced_writer = current_writer
@@ -1020,7 +1027,7 @@ class Server:
                 attempt,
                 self._socket_fd(replaced_writer),
             )
-            replaced_writer.close()
+            _close_with_reset(replaced_writer)
 
         label = "TCP6 Direct" if family == socket.AF_INET6 else "TCP4 Direct"
         self.store.update_peer(peer_id, online=1, transport=label, endpoint=endpoint, connected_at=int(time.time()))
@@ -1057,7 +1064,7 @@ class Server:
                             peer_id,
                             exc,
                         )
-                        writer.close()
+                        _close_with_reset(writer)
                         return
                     await asyncio.sleep(10)
                     if last_data_plane_rx <= probe_started_after:
@@ -1065,7 +1072,7 @@ class Server:
                             "data-plane liveness timeout after final probe peer_id=%s; closing direct stream",
                             peer_id,
                         )
-                        writer.close()
+                        _close_with_reset(writer)
                         return
                     LOG.info("data-plane liveness recovered peer_id=%s", peer_id)
 
@@ -1165,7 +1172,7 @@ class Server:
                 self._peername_text(writer),
                 packet_count,
             )
-            writer.close()
+            _close_with_reset(writer)
 
     async def _before_direct_data(self, reader, writer, peer_id: str) -> None:
         """Hook for clients that must negotiate overlay addresses first."""
@@ -1397,6 +1404,15 @@ class Server:
             writer = self.direct_writers.get(peer_id) if peer_id else None
             if writer is not None and peer_id is not None:
                 self._queue_peer_data(peer_id, writer, packet)
+            else:
+                dest_peer = self._destination_peer(packet)
+                if (dest_peer is not None and dest_peer not in self.direct_writers) or self._is_overlay_destination(packet):
+                    rst = build_tcp_reset(packet)
+                    if rst is not None:
+                        try:
+                            await self._write_tun(rst, dest_peer or "")
+                        except Exception as exc:
+                            LOG.debug("Could not write TCP reset to TUN: %s", exc)
             # _read_tun() returns without awaiting while the non-blocking TUN
             # remains readable. During a sustained download that can starve
             # direct-stream RX and its liveness callbacks until an otherwise
@@ -1483,7 +1499,7 @@ class Server:
             self._sockname_text(writer), self._peername_text(writer),
             "yes" if released_owner else "no", reason,
         )
-        writer.close()
+        _close_with_reset(writer)
         await asyncio.gather(writer.wait_closed(), return_exceptions=True)
         if released_owner:
             await self._after_direct_data(peer_id)
@@ -1603,6 +1619,39 @@ class Server:
         if self.config.target_peer in self.direct_writers:
             return self.config.target_peer
         return None
+
+    def _destination_peer(self, packet: bytes) -> str | None:
+        """Return the peer owning the packet destination, connected or not."""
+        if not packet:
+            return None
+        version = packet[0] >> 4
+        if version == 4 and len(packet) >= 20:
+            destination = packet[16:20]
+        elif version == 6 and len(packet) >= 40:
+            destination = packet[24:40]
+        else:
+            return None
+        indexed_peer = self._overlay_peer_index.get(destination)
+        if indexed_peer is not None:
+            return indexed_peer
+        if self.config.target_peer:
+            return self.config.target_peer
+        return None
+
+    def _is_overlay_destination(self, packet: bytes) -> bool:
+        """Return whether *packet* is addressed to an IP inside our overlay networks."""
+        if not packet:
+            return False
+        version = packet[0] >> 4
+        if version == 4 and len(packet) >= 20:
+            destination = ipaddress.IPv4Address(packet[16:20])
+            subnet = getattr(self.config, "ipv4_subnet", None)
+            return subnet is not None and destination in subnet
+        elif version == 6 and len(packet) >= 40:
+            destination = ipaddress.IPv6Address(packet[24:40])
+            prefix = getattr(self, "_active_ipv6_prefix", None) or getattr(self.config, "ipv6_prefix", None)
+            return prefix is not None and destination in prefix
+        return False
 
     async def _configure_initial_ipv6(self) -> None:
         interface = discover_ipv6_upstream({self.config.tun_name})
