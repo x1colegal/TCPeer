@@ -698,11 +698,16 @@ class TcpPeerVpnService : VpnService() {
         } finally {
             preDirectControlLiveness.cancel()
         }
-        // The winning direct socket now owns the NAT state for :7444. The
-        // endpoint-query sockets were intentionally kept open only through
-        // simultaneous-open so the advertised TCP4 mapping could not point at
-        // a recently closed socket while the new punch socket was SYN-SENT.
-        closeEndpointMappingSockets()
+        // The winning direct socket owns the NAT state for :7444 if the direct
+        // connection is IPv4. But if the direct connection established over IPv6,
+        // closing the IPv4 endpoint mapping socket drops the router's NAPT
+        // mapping, breaking incoming IPv4 mesh punch from IPv4-only peers.
+        // Close IPv6 mapping socket (IPv6 doesn't have NAPT state), but keep
+        // IPv4 mapping socket alive when connected over IPv6.
+        endpointMappingSockets.remove(DirectFamily.IPV6)?.let(::closeQuietly)
+        if (family == DirectFamily.IPV4) {
+            endpointMappingSockets.remove(DirectFamily.IPV4)?.let(::closeQuietly)
+        }
         val directInput = direct.getInputStream()
         val directOutput = direct.getOutputStream()
         val directNonce = AuthProof.generateNonce()
@@ -816,6 +821,20 @@ class TcpPeerVpnService : VpnService() {
                     config, advertisedIpv4, advertisedIpv6,
                     addresses.second.address, peerOutputs, tunPackets,
                 )
+            }
+            val endpointMappingKeepaliveJob = launch(Dispatchers.IO) {
+                while (isActive) {
+                    delay(20_000)
+                    endpointMappingSockets.entries.forEach { (fam, socket) ->
+                        try {
+                            TcpPeerProtocol.writeControl(socket.getOutputStream(), ControlMessage("PING"))
+                        } catch (e: Throwable) {
+                            Log.w(TAG, "Endpoint mapping keepalive failed for ${familyLabel(fam)}: ${e.message}")
+                            closeQuietly(socket)
+                            endpointMappingSockets.remove(fam, socket)
+                        }
+                    }
+                }
             }
             val coordinatorControlJob = launch(Dispatchers.IO) {
                 val devices = mutableListOf<NetworkDevice>()
@@ -1809,6 +1828,7 @@ class TcpPeerVpnService : VpnService() {
                         val endpointAddress = response.field("Address")
                         val endpointPort = response.field("Port")?.toIntOrNull()
                         if (!endpointAddress.isNullOrBlank() && endpointPort != null) {
+                            socket.soTimeout = 0
                             inFlightSockets.remove(socket)
                             endpointMappingSockets[family] = socket
                             retained = true
