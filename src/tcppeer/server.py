@@ -1021,6 +1021,17 @@ class Server:
         _close_with_reset(current_writer)
         return True
 
+    async def _notify_punch_success(self, peer_id: str) -> None:
+        """Notify the coordinator that direct punch succeeded to release busy lease early."""
+        writer = self._coordinator_writer
+        if writer is not None and not writer.is_closing():
+            try:
+                writer.write(ControlMessage("PUNCH-SUCCESS", {"Peer-ID": peer_id}).encode())
+                await writer.drain()
+                LOG.info("Notified coordinator of punch success for peer %s", peer_id)
+            except Exception as exc:
+                LOG.warning("Failed to notify coordinator of punch success for %s: %s", peer_id, exc)
+
     async def _adopt_direct(
         self,
         reader,
@@ -1098,6 +1109,7 @@ class Server:
 
         label = "TCP6 Direct" if family == socket.AF_INET6 else "TCP4 Direct"
         self.store.update_peer(peer_id, online=1, transport=label, endpoint=endpoint, connected_at=int(time.time()))
+        await self._notify_punch_success(peer_id)
         session_id = str(uuid.uuid4())
         started_at = int(time.time())
         last_data_plane_rx = time.monotonic()

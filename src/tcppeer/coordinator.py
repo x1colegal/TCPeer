@@ -236,6 +236,8 @@ class Coordinator:
         finally:
             if peer is not None and self.peers.get((peer.network, peer.peer_id)) is peer:
                 del self.peers[(peer.network, peer.peer_id)]
+                self._punch_busy_until.pop((peer.network, peer.peer_id), None)
+                self._wake_deferred_punches(peer.network, peer.peer_id)
                 known = self.known_peers.get((peer.network, peer.peer_id))
                 if known is not None:
                     known.online = False
@@ -355,6 +357,25 @@ class Coordinator:
                     })
                 if peer.peer_id in target.ready_for:
                     await self._punch_go(peer, target)
+        elif message.command == "PUNCH-SUCCESS":
+            target_id = message.get("Peer-ID") or peer.last_punch_peer or ""
+            async with self._punch_lock:
+                peer_key = (peer.network, peer.peer_id)
+                self._punch_busy_until.pop(peer_key, None)
+                if target_id:
+                    target_key = (peer.network, target_id)
+                    self._punch_busy_until.pop(target_key, None)
+                    target = self.peers.get(target_key)
+                    if target is not None:
+                        pair = self._pair_key(peer, target)
+                        self._active_direct_sessions[pair] = self._pair_sessions(peer, target)
+                    LOG.info(
+                        "Punch succeeded between %s and %s; released busy lease",
+                        peer.peer_id, target_id,
+                    )
+                else:
+                    LOG.info("Punch succeeded for %s; released busy lease", peer.peer_id)
+                self._wake_deferred_punches(peer.network, peer.peer_id, target_id)
         elif message.command == "DISCONNECT":
             peer.writer.close()
         else:
@@ -693,6 +714,40 @@ class Coordinator:
         finally:
             if self._deferred_punch_tasks.get(pair) is task:
                 self._deferred_punch_tasks.pop(pair, None)
+
+    def _wake_deferred_punches(self, network: str, *peer_ids: str) -> None:
+        """Wake up sleeping deferred punch tasks whose peers are no longer busy."""
+        valid_ids = {pid for pid in peer_ids if pid}
+        if not valid_ids:
+            return
+        now = time.monotonic()
+        for pair, task in list(self._deferred_punch_tasks.items()):
+            net, p1, p2 = pair
+            if net != network:
+                continue
+            if p1 not in valid_ids and p2 not in valid_ids:
+                continue
+            k1 = (net, p1)
+            k2 = (net, p2)
+            left = self.peers.get(k1)
+            right = self.peers.get(k2)
+            if left is None or right is None:
+                continue
+            if right.peer_id not in left.ready_for or left.peer_id not in right.ready_for:
+                continue
+            left_busy = self._punch_busy_until.get(k1, 0.0)
+            right_busy = self._punch_busy_until.get(k2, 0.0)
+            remaining = max(left_busy, right_busy) - now
+            delay = 0.05 if remaining <= 0 else remaining + 0.05
+            sessions = self._pair_sessions(left, right)
+            task.cancel()
+            LOG.info(
+                "Rescheduling deferred punch between %s and %s in %.2fs after busy lease release",
+                left.peer_id, right.peer_id, delay,
+            )
+            self._deferred_punch_tasks[pair] = asyncio.create_task(
+                self._retry_deferred_punch(pair, sessions, delay)
+            )
 
     @staticmethod
     def _pair_key(left: RegisteredPeer, right: RegisteredPeer) -> tuple[str, str, str]:

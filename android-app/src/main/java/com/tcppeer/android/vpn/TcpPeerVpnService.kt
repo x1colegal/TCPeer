@@ -747,6 +747,7 @@ class TcpPeerVpnService : VpnService() {
         )))
 
         Log.i(TAG, "Overlay-Update sent to coordinator")
+        writeCoordinatorControl(controlOutput, ControlMessage("PUNCH-SUCCESS", mapOf("Peer-ID" to targetPeerId)))
         val descriptor = establishTunnel(config, addresses.first, addresses.second)
             ?: throw IllegalStateException("Android refused to establish the VPN interface")
         val tunStreams = publishTunnel(generation, descriptor)
@@ -1433,6 +1434,7 @@ class TcpPeerVpnService : VpnService() {
         )
         updateConnectedUsing(peerId, formatSocketEndpoint(socket), socketFamily(socket))
         meshReadySentAt.remove(peerId)
+        notifyCoordinatorPunchSuccess(peerId)
         return true
     }
 
@@ -1673,6 +1675,17 @@ class TcpPeerVpnService : VpnService() {
     ) {
         synchronized(output) {
             TcpPeerProtocol.writeControl(output, message)
+        }
+    }
+
+    private fun notifyCoordinatorPunchSuccess(peerId: String) {
+        coordinatorSocket?.takeUnless { it.isClosed }?.getOutputStream()?.let { output ->
+            try {
+                writeCoordinatorControl(output, ControlMessage("PUNCH-SUCCESS", mapOf("Peer-ID" to peerId)))
+                Log.i(TAG, "Sent PUNCH-SUCCESS for peer_id=$peerId to coordinator")
+            } catch (error: Exception) {
+                Log.w(TAG, "Failed to send PUNCH-SUCCESS for peer_id=$peerId", error)
+            }
         }
     }
 
