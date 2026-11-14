@@ -9,6 +9,7 @@ import ipaddress
 import logging
 import random
 import socket
+import struct
 from typing import Iterable
 
 
@@ -81,7 +82,7 @@ class Endpoint:
 class DirectConnector:
     """Attempt exactly one policy-approved direct TCP family."""
 
-    def __init__(self, timeout: float = 10.0, retry_window: float = 12.0):
+    def __init__(self, timeout: float = 4.0, retry_window: float = 12.0):
         self.timeout = timeout
         self.retry_window = retry_window
 
@@ -233,6 +234,10 @@ class DirectConnector:
                     attempt,
                     sock.fileno(),
                 )
+                try:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                except OSError:
+                    pass
                 sock.close()
                 raise
             except Exception as exc:
@@ -249,6 +254,10 @@ class DirectConnector:
                     remote.port,
                     exc,
                 )
+                try:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                except OSError:
+                    pass
                 sock.close()
 
                 if prebound_socket is not None:

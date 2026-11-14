@@ -281,8 +281,8 @@ internal class OsTcpSocket internal constructor(
         if (closed) return
         closed = true
         try {
-            Os.shutdown(fileDescriptor, OsConstants.SHUT_RDWR)
-        } catch (_: ErrnoException) {
+            NativeSocketOptions.setLingerReset(fileDescriptor)
+        } catch (_: Throwable) {
         }
         try {
             Os.close(fileDescriptor)
@@ -387,8 +387,8 @@ internal class OsTcpServerSocket(private val family: Int) : ServerSocket() {
         if (closed) return
         closed = true
         try {
-            Os.shutdown(fileDescriptor, OsConstants.SHUT_RDWR)
-        } catch (_: ErrnoException) {
+            NativeSocketOptions.setLingerReset(fileDescriptor)
+        } catch (_: Throwable) {
         }
         try {
             Os.close(fileDescriptor)

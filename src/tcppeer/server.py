@@ -311,6 +311,7 @@ class Server:
                 asyncio.create_task(self._ra_loop(), name="router-advertisement"),
                 asyncio.create_task(self._statistics_loop(), name="statistics"),
                 asyncio.create_task(self._pd_loop(), name="prefix-delegation"),
+                asyncio.create_task(self._endpoint_mapping_loop(), name="endpoint-mapping"),
             }
             done, pending = await asyncio.wait(self._tasks, return_when=asyncio.FIRST_EXCEPTION)
             for task in pending:
@@ -746,6 +747,70 @@ class Server:
             LOG.warning("Coordinator DNS has no %s address; that family cannot be advertised", family_name)
         return None
 
+    async def _endpoint_mapping_loop(self) -> None:
+        """Keep NAT state entries active and refresh endpoint mappings if they close."""
+        while True:
+            await asyncio.sleep(20)
+            for family in (socket.AF_INET, socket.AF_INET6):
+                writer = self._endpoint_mapping_writers.get(family)
+                if writer is None:
+                    continue
+                try:
+                    if writer.is_closing():
+                        raise ConnectionError("mapping writer is closing")
+                    writer.write(ControlMessage("PING", {}).encode())
+                    await writer.drain()
+                except (ConnectionError, OSError) as exc:
+                    LOG.warning(
+                        "%s endpoint mapping lost: %s; refreshing",
+                        "IPv6" if family == socket.AF_INET6 else "IPv4",
+                        exc,
+                    )
+                    self._endpoint_mapping_writers.pop(family, None)
+                    _close_with_reset(writer)
+                    asyncio.create_task(self._refresh_endpoint_mapping(family))
+
+    async def _refresh_endpoint_mapping(self, family: socket.AddressFamily) -> None:
+        if not self._coordinator_writer or self._coordinator_writer.is_closing():
+            return
+        observed = await self._query_observed_endpoint(family)
+        if not observed:
+            return
+        address, port = observed
+        if family == socket.AF_INET:
+            self._registered_ipv4 = address
+            self._registered_port_ipv4 = port
+        else:
+            self._registered_ipv6 = address
+            self._registered_port_ipv6 = port
+        LOG.info(
+            "Refreshed endpoint mapping %s: %s:%s",
+            "IPv6" if family == socket.AF_INET6 else "IPv4",
+            address,
+            port,
+        )
+        overlay_ipv4, overlay_ipv6 = self._registration_overlays()
+        try:
+            self._coordinator_writer.write(ControlMessage("REGISTER", {
+                "Peer-ID": self.config.peer_id,
+                "Device-Name": self.store.metadata("device_name", self.config.peer_id),
+                "IPv4": self._registered_ipv4 or "",
+                "IPv6": self._registered_ipv6 or "",
+                "Mapped-IPv4-Port": str(self._registered_port_ipv4 or ""),
+                "Mapped-IPv6-Port": str(self._registered_port_ipv6 or ""),
+                "Local-IPv4": self._direct_bind_ipv4 or "",
+                "Local-IPv4-Prefix": str(discover_ipv4_prefix(self._direct_bind_ipv4) or ""),
+                "Local-IPv6": self._direct_bind_ipv6 or "",
+                "Port": str(self.config.direct_port),
+                "Role": self._registration_role(),
+                "Platform": "Linux",
+                "Overlay-IPv4": overlay_ipv4,
+                "Overlay-IPv6": overlay_ipv6,
+            }).encode())
+            await self._coordinator_writer.drain()
+        except (ConnectionError, OSError):
+            pass
+
     async def _close_endpoint_mapping_writers(self) -> None:
         writers = list(self._endpoint_mapping_writers.values())
         self._endpoint_mapping_writers.clear()
@@ -810,9 +875,15 @@ class Server:
         remote = Endpoint(message.get("Address") or "", int(message.get("Port") or 0), family)
         self._prepare_remote_route(remote.address, family)
         local = Endpoint(local_address, self.config.direct_port, family)
-        start_after_ms = int(message.get("Start-After-Ms") or 0)
         start_ms = int(message.get("Start-Ms") or 0)
-        delay = start_after_ms / 1000 if start_after_ms else start_ms / 1000 - time.time()
+        start_after_ms = int(message.get("Start-After-Ms") or 0)
+        now = time.time()
+        if start_ms and 0 < (start_ms / 1000 - now) <= 10.0:
+            delay = start_ms / 1000 - now
+        elif start_after_ms:
+            delay = start_after_ms / 1000
+        else:
+            delay = 0.0
         if delay > 0:
             await asyncio.sleep(delay)
         peer_id = message.get("Peer-ID") or "unknown"

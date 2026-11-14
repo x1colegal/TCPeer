@@ -22,6 +22,8 @@ internal object NativeSocketOptions {
 
     external fun useIpv4OnCreatedServerSocket()
 
+    external fun setLingerReset(fileDescriptor: java.io.FileDescriptor)
+
     private external fun setIpv6Only(socket: Any)
     private external fun setMappingKeepAlive(socket: Any)
     private external fun useIpv4Socket(socket: Any)

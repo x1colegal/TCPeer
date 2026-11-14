@@ -583,6 +583,12 @@ class TcpPeerVpnService : VpnService() {
             while (true) {
                 delay(5_000)
                 writeCoordinatorControl(controlOutput, ControlMessage("PONG"))
+                endpointMappingSockets.values.forEach { socket ->
+                    try {
+                        TcpPeerProtocol.writeControl(socket.getOutputStream(), ControlMessage("PING"))
+                    } catch (_: Throwable) {
+                    }
+                }
             }
         }
         try {
@@ -619,9 +625,14 @@ class TcpPeerVpnService : VpnService() {
                     throw ProtocolException("TCP4 is forbidden when both peers have usable IPv6")
                 }
 
-                val startAfterMillis = punch.field("Start-After-Ms")?.toLongOrNull()
-                val startMillis = punch.field("Start-Ms")?.toLongOrNull() ?: 0L
-                val waitMillis = startAfterMillis ?: (startMillis - System.currentTimeMillis())
+                val startMillis = punch.field("Start-Ms")?.toLongOrNull()
+                val startAfterMillis = punch.field("Start-After-Ms")?.toLongOrNull() ?: 500L
+                val now = System.currentTimeMillis()
+                val waitMillis = if (startMillis != null && startMillis > now && (startMillis - now) <= 10_000L) {
+                    startMillis - now
+                } else {
+                    startAfterMillis
+                }
                 if (waitMillis > 0)
                     kotlinx.coroutines.delay(waitMillis)
 
@@ -1064,9 +1075,14 @@ class TcpPeerVpnService : VpnService() {
         val port = punch.field("Port")?.toIntOrNull() ?: return
         val traversal = "Simultaneous-Open"
         val bindToUnderlying = punch.field("Path") != "Local"
-        val startAfterMillis = punch.field("Start-After-Ms")?.toLongOrNull()
-        val waitMillis = startAfterMillis
-            ?: ((punch.field("Start-Ms")?.toLongOrNull() ?: 0L) - System.currentTimeMillis())
+        val startMillis = punch.field("Start-Ms")?.toLongOrNull()
+        val startAfterMillis = punch.field("Start-After-Ms")?.toLongOrNull() ?: 500L
+        val now = System.currentTimeMillis()
+        val waitMillis = if (startMillis != null && startMillis > now && (startMillis - now) <= 10_000L) {
+            startMillis - now
+        } else {
+            startAfterMillis
+        }
         if (waitMillis > 0) delay(waitMillis)
         val activeLocalPort = config.directPort
         val socket = try {
