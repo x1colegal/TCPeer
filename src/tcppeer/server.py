@@ -503,16 +503,9 @@ class Server:
         if observed_version == 6:
             self._registered_ipv6 = observed_address
             self._registered_port_ipv6 = int(observed.get("Port") or self.config.direct_port)
-        other_family = socket.AF_INET if observed_version == 6 else socket.AF_INET6
-        other_observed = await self._query_observed_endpoint(other_family)
-        if other_observed:
-            other_address, other_port = other_observed
-            if other_family == socket.AF_INET:
-                self._registered_ipv4 = other_address
-                self._registered_port_ipv4 = other_port
-            else:
-                self._registered_ipv6 = other_address
-                self._registered_port_ipv6 = other_port
+            other_observed = await self._query_observed_endpoint(socket.AF_INET)
+            if other_observed:
+                self._registered_ipv4, self._registered_port_ipv4 = other_observed
         LOG.info(
             "Registering direct endpoints IPv4=%s IPv6=%s",
             self._registered_ipv4 or "none",
@@ -528,7 +521,7 @@ class Server:
             "Mapped-IPv6-Port": str(self._registered_port_ipv6 or ""),
             "Local-IPv4": self._direct_bind_ipv4 or "",
             "Local-IPv4-Prefix": str(discover_ipv4_prefix(self._direct_bind_ipv4) or ""),
-            "Local-IPv6": self._direct_bind_ipv6 or "",
+            "Local-IPv6": (self._direct_bind_ipv6 or "") if self._registered_ipv6 else "",
             "Port": str(self.config.direct_port),
             "Role": self._registration_role(),
             "Platform": "Linux",
@@ -796,7 +789,7 @@ class Server:
                 "Mapped-IPv6-Port": str(self._registered_port_ipv6 or ""),
                 "Local-IPv4": self._direct_bind_ipv4 or "",
                 "Local-IPv4-Prefix": str(discover_ipv4_prefix(self._direct_bind_ipv4) or ""),
-                "Local-IPv6": self._direct_bind_ipv6 or "",
+                "Local-IPv6": (self._direct_bind_ipv6 or "") if self._registered_ipv6 else "",
                 "Port": str(self.config.direct_port),
                 "Role": self._registration_role(),
                 "Platform": "Linux",

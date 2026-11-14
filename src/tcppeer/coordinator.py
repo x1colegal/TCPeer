@@ -287,6 +287,9 @@ class Coordinator:
                 if not peer.mapped_ipv4_port:
                     peer.mapped_ipv4_port = peer.observed_port
 
+            if not is_usable_ipv6(peer.declared_ipv6):
+                peer.local_ipv6 = None
+
             known = self.known_peers[(peer.network, peer.peer_id)]
             known.display_name = display_name
             known.role = peer.role

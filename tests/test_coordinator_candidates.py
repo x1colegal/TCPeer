@@ -69,6 +69,38 @@ def test_mismatched_ipv4_prefixes_use_public_candidates_even_in_same_octets() ->
     )
 
 
+def test_peer_without_usable_public_ipv6_clears_local_ipv6() -> None:
+    async def scenario() -> None:
+        coordinator = Coordinator.__new__(Coordinator)
+        coordinator._punch_lock = asyncio.Lock()
+        coordinator.known_peers = {}
+        writer = FakeWriter()
+        peer = RegisteredPeer(
+            "home", "a8", writer, "198.51.100.1", 50001,
+            registered=False,
+        )
+        coordinator.peers = {("home", "a8"): peer}
+        coordinator.known_peers[("home", "a8")] = type("FakeKnown", (), {
+            "display_name": "", "role": "", "platform": "", "ipv4": "", "ipv6": "",
+            "overlay_ipv4": "", "overlay_ipv6": "", "last_seen": 0,
+        })()
+        coordinator._persist = lambda known: None
+
+        await coordinator.handle_message(
+            peer,
+            ControlMessage("REGISTER", {
+                "IPv4": "198.51.100.1",
+                "IPv6": "",
+                "Local-IPv6": "2001:db8::1234",
+            }),
+        )
+
+        assert peer.declared_ipv6 is None or peer.declared_ipv6 == ""
+        assert peer.local_ipv6 is None
+
+    asyncio.run(scenario())
+
+
 def test_authenticated_peer_cannot_be_punched_before_register() -> None:
     async def scenario() -> None:
         coordinator = Coordinator.__new__(Coordinator)

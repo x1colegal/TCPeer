@@ -182,7 +182,9 @@ class TcpPeerVpnService : VpnService() {
             }
             physicalLanAddresses = lanAddrs
             physicalLanPrefixes = lanPrefixList
-            val addresses = linkProperties.linkAddresses.map { it.address }
+            val nonTempLinks = linkProperties.linkAddresses.filter { (it.flags and 0x01) == 0 }
+            val effectiveLinks = if (nonTempLinks.isNotEmpty()) nonTempLinks else linkProperties.linkAddresses
+            val addresses = effectiveLinks.map { it.address }
             val (ipv4, ipv6) = TransportPolicy.localAddresses(addresses)
             // Track reachability changes without treating an IPv6 privacy-IID
             // rotation as a new underlay.  Using only the Network handle left
@@ -195,18 +197,29 @@ class TcpPeerVpnService : VpnService() {
                 .map { it.hostAddress.orEmpty() }
                 .sorted()
                 .joinToString(",")
-            val ipv6PrefixSignature = linkProperties.linkAddresses
+            val ipv6PrefixSignature = effectiveLinks
                 .filter { link -> ipv6.any { it == link.address } }
                 .map { link -> networkPrefixSignature(link.address, link.prefixLength) }
                 .distinct()
                 .sorted()
                 .joinToString(",")
             val signature = "$network|v4=$ipv4Signature|v6=$ipv6PrefixSignature"
+            val established = TcpPeerRuntime.state.value.status in setOf(
+                ConnectionStatus.TCP4_DIRECT,
+                ConnectionStatus.TCP6_DIRECT,
+            )
             val changed = synchronized(this) {
+                val previousNetwork = underlyingNetwork
                 val previous = underlyingNetworkSignature
                 underlyingNetwork = network
                 underlyingNetworkSignature = signature
-                previous != null && previous != signature
+                if (previousNetwork == null) {
+                    false
+                } else if (previousNetwork != network) {
+                    true
+                } else {
+                    previous != null && previous != signature && established
+                }
             }
             if (changed && connectionJob?.isActive == true && !disconnectRequested.get()) {
                 Log.i(
@@ -365,20 +378,7 @@ class TcpPeerVpnService : VpnService() {
                         removeForegroundNotification()
                         stopAfterConnectivityRefresh()
                     } else {
-                        Log.i(TAG, "Superseded connection generation=$generation stopped; starting the replacement session")
-                        connectionJob = null
-                        restartRequested.set(false)
-                        TcpPeerRuntime.replace(
-                            VpnRuntimeState(
-                                status = ConnectionStatus.CONNECTING,
-                                detail = "Underlying network changed. Reconnecting.",
-                            ),
-                        )
-                        updateNotification(ConnectionStatus.CONNECTING)
-                        serviceScope.launch {
-                            delay(250)
-                            if (!disconnectRequested.get() && connectionJob?.isActive != true) connect()
-                        }
+                        Log.i(TAG, "Superseded connection generation=$generation stopped")
                     }
                     return@launch
                 }
@@ -479,7 +479,10 @@ class TcpPeerVpnService : VpnService() {
             selected
         }
         val activeLinkProperties = physicalNetwork?.let(connectivityManager::getLinkProperties)
-        val sortedLinkAddresses = activeLinkProperties?.linkAddresses.orEmpty().sortedWith(
+        val allLinkAddresses = activeLinkProperties?.linkAddresses.orEmpty()
+        val nonTempLinkAddresses = allLinkAddresses.filter { (it.flags and 0x01) == 0 }
+        val effectiveLinkAddresses = if (nonTempLinkAddresses.isNotEmpty()) nonTempLinkAddresses else allLinkAddresses
+        val sortedLinkAddresses = effectiveLinkAddresses.sortedWith(
             compareBy(
                 { (it.flags and 0x20) != 0 }, // Deprecated last (0x20 = IFA_F_DEPRECATED)
                 { (it.flags and 0x01) != 0 }, // Temporary privacy extensions after stable (0x01 = IFA_F_TEMPORARY)
@@ -535,7 +538,7 @@ class TcpPeerVpnService : VpnService() {
         var endpointIpv6 = when {
             localIpv6.isEmpty() -> null
             coordinatorFamily == DirectFamily.IPV6 -> observedEndpoint
-            else -> queryPublicEndpoint(config, DirectFamily.IPV6, physicalNetwork)
+            else -> null
         }
         var advertisedIpv4 = ""
         var advertisedIpv6 = ""
@@ -547,8 +550,10 @@ class TcpPeerVpnService : VpnService() {
             val mappedIpv6Port = endpointIpv6?.port
             val localIpv4Address = localIpv4.firstOrNull { it.hostAddress == advertisedIpv4 }
                 ?: localIpv4.firstOrNull()
-            val localIpv6Address = localIpv6.firstOrNull { it.hostAddress?.substringBefore('%') == advertisedIpv6 }
-                ?: localIpv6.firstOrNull()
+            val localIpv6Address = if (advertisedIpv6.isNotEmpty()) {
+                localIpv6.firstOrNull { it.hostAddress?.substringBefore('%') == advertisedIpv6 }
+                    ?: localIpv6.firstOrNull()
+            } else null
             writeCoordinatorControl(controlOutput, ControlMessage("REGISTER", linkedMapOf(
                 "Peer-ID" to config.peerId,
                 "Device-Name" to config.deviceName,
@@ -679,8 +684,6 @@ class TcpPeerVpnService : VpnService() {
                 } else null
                 endpointIpv6 = if (coordinatorFamily == DirectFamily.IPV6) {
                     endpointIpv6
-                } else if (localIpv6.isNotEmpty()) {
-                    queryPublicEndpoint(config, DirectFamily.IPV6, physicalNetwork)
                 } else null
                 registerCurrentEndpoints()
                 Log.i(
