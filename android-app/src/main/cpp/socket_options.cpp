@@ -135,29 +135,6 @@ Java_com_tcppeer_android_vpn_NativeSocketOptions_setIpv6Only(
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_tcppeer_android_vpn_NativeSocketOptions_setMappingKeepAlive(
-        JNIEnv* env, jobject, jobject socket) {
-    const int fd = socket_fd(env, socket);
-    if (env->ExceptionCheck()) return;
-    if (fd < 0) {
-        throw_socket_exception(env, "TCP socket has no file descriptor");
-        return;
-    }
-    const int enabled = 1;
-    const int idle = 15;
-    const int interval = 5;
-    const int count = 3;
-    if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled)) != 0 ||
-            setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle)) != 0 ||
-            setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval)) != 0 ||
-            setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count)) != 0) {
-        char message[160];
-        snprintf(message, sizeof(message), "Cannot configure endpoint keepalive: %s", strerror(errno));
-        throw_socket_exception(env, message);
-    }
-}
-
-extern "C" JNIEXPORT void JNICALL
 Java_com_tcppeer_android_vpn_NativeSocketOptions_useIpv4Socket(
         JNIEnv* env, jobject, jobject socket) {
     const int fd = socket_fd(env, socket);

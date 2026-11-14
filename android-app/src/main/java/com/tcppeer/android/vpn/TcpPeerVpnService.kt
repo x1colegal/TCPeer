@@ -1786,7 +1786,6 @@ class TcpPeerVpnService : VpnService() {
                     socket.bind(InetSocketAddress(wildcard, config.directPort))
                     requireProtectedOrBound(socket, physicalNetwork, "endpoint query")
                     socket.connect(InetSocketAddress(address, config.coordinatorPort), 5_000)
-                    socket.enableMappingKeepAlive()
                     socket.soTimeout = 5_000
                     TcpPeerProtocol.writeControl(socket.getOutputStream(), ControlMessage("ENDPOINT-QUERY"))
                     val response = TcpPeerProtocol.readControl(socket.getInputStream())

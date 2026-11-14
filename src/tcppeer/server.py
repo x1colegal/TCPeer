@@ -710,10 +710,6 @@ class Server:
                     transport_socket = writer.get_extra_info("socket")
                     if transport_socket is not None:
                         transport_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 0)
-                        transport_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                        transport_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 15)
-                        transport_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
-                        transport_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
                     writer.write(ControlMessage("ENDPOINT-QUERY", {}).encode())
                     await writer.drain()
                     response = await asyncio.wait_for(read_control(reader), timeout=5)

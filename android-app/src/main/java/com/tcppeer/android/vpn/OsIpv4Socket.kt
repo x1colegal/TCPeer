@@ -270,13 +270,6 @@ internal class OsTcpSocket internal constructor(
 
     override fun getSoTimeout(): Int = timeoutMillis
 
-    fun enableMappingKeepAlive() {
-        setInt(OsConstants.SOL_SOCKET, OsConstants.SO_KEEPALIVE, true)
-        Os.setsockoptInt(fileDescriptor, OsConstants.IPPROTO_TCP, TCP_KEEPIDLE_LINUX, 15)
-        Os.setsockoptInt(fileDescriptor, OsConstants.IPPROTO_TCP, TCP_KEEPINTVL_LINUX, 5)
-        Os.setsockoptInt(fileDescriptor, OsConstants.IPPROTO_TCP, TCP_KEEPCNT_LINUX, 3)
-    }
-
     override fun close() {
         if (closed) return
         closed = true
@@ -296,9 +289,6 @@ internal class OsTcpSocket internal constructor(
     companion object {
         private const val POLL_STEP_MS = 250
         private const val SO_REUSEPORT_LINUX = 15
-        private const val TCP_KEEPIDLE_LINUX = 4
-        private const val TCP_KEEPINTVL_LINUX = 5
-        private const val TCP_KEEPCNT_LINUX = 6
         private fun addressFamily(address: InetAddress): Int =
             if (address.address.size == 16) OsConstants.AF_INET6 else OsConstants.AF_INET
 
