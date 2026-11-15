@@ -653,8 +653,10 @@ class Coordinator:
         right.ready_for.discard(left.peer_id)
         left.last_punch_peer = right.peer_id
         right.last_punch_peer = left.peer_id
-        start_delay_ms = 500
-        start = str(int(time.time() * 1000) + start_delay_ms)
+        left_delay_ms, right_delay_ms = self._simultaneous_open_delays_ms(left, right)
+        now_ms = int(time.time() * 1000)
+        left_start = str(now_ms + left_delay_ms)
+        right_start = str(now_ms + right_delay_ms)
         # A local TCP port can participate in only one opening four-tuple at a
         # time on Android.  Coordinating overlapping pairs made each device
         # serialize them in a different order, so matching SYN windows never
@@ -665,8 +667,8 @@ class Coordinator:
         self._punch_busy_until[right_key] = lease_until
         await self.send(left.writer, "PUNCH-GO", **{
             "Peer-ID": right.peer_id, "Address": str(right_address),
-            "Port": str(right_port), "Family": family, "Start-Ms": start,
-            "Start-After-Ms": str(start_delay_ms),
+            "Port": str(right_port), "Family": family, "Start-Ms": left_start,
+            "Start-After-Ms": str(left_delay_ms),
             "Traversal": traversal,
             "Path": "Local" if use_local_candidates else "Public",
             # Identifies the remote control-plane incarnation.  A peer can
@@ -678,12 +680,35 @@ class Coordinator:
         })
         await self.send(right.writer, "PUNCH-GO", **{
             "Peer-ID": left.peer_id, "Address": str(left_address),
-            "Port": str(left_port), "Family": family, "Start-Ms": start,
-            "Start-After-Ms": str(start_delay_ms),
+            "Port": str(left_port), "Family": family, "Start-Ms": right_start,
+            "Start-After-Ms": str(right_delay_ms),
             "Traversal": traversal,
             "Path": "Local" if use_local_candidates else "Public",
             "Peer-Session": repr(left.connected_at),
         })
+
+    @staticmethod
+    def _simultaneous_open_delays_ms(
+        left: RegisteredPeer,
+        right: RegisteredPeer,
+    ) -> tuple[int, int]:
+        """Stagger SYN start so the server/desktop NAT opens before a CGNAT client.
+
+        When a CGNAT peer sends its SYN before the residential router opens its
+        outbound pinhole, the router replies with RST; CGNATs can taint that
+        four-tuple's conntrack entry and drop the retried session seconds later.
+        """
+        left_is_server = left.role.strip().lower() == "server"
+        right_is_server = right.role.strip().lower() == "server"
+        if left_is_server != right_is_server:
+            return (350, 550) if left_is_server else (550, 350)
+
+        left_is_android = left.platform.strip().lower() == "android"
+        right_is_android = right.platform.strip().lower() == "android"
+        if left_is_android != right_is_android:
+            return (550, 350) if left_is_android else (350, 550)
+
+        return (500, 500)
 
     async def _retry_deferred_punch(
         self,
