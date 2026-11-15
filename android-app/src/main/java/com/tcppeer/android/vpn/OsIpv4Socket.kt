@@ -273,9 +273,11 @@ internal class OsTcpSocket internal constructor(
     override fun close() {
         if (closed) return
         closed = true
-        try {
-            NativeSocketOptions.setLingerReset(fileDescriptor)
-        } catch (_: Throwable) {
+        if (connected) {
+            try {
+                NativeSocketOptions.setLingerReset(fileDescriptor)
+            } catch (_: Throwable) {
+            }
         }
         try {
             Os.close(fileDescriptor)
@@ -376,10 +378,6 @@ internal class OsTcpServerSocket(private val family: Int) : ServerSocket() {
     override fun close() {
         if (closed) return
         closed = true
-        try {
-            NativeSocketOptions.setLingerReset(fileDescriptor)
-        } catch (_: Throwable) {
-        }
         try {
             Os.close(fileDescriptor)
         } catch (_: ErrnoException) {

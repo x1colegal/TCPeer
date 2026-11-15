@@ -864,15 +864,8 @@ class Server:
         remote = Endpoint(message.get("Address") or "", int(message.get("Port") or 0), family)
         self._prepare_remote_route(remote.address, family)
         local = Endpoint(local_address, self.config.direct_port, family)
-        start_ms = int(message.get("Start-Ms") or 0)
-        start_after_ms = int(message.get("Start-After-Ms") or 0)
-        now = time.time()
-        if start_ms and 0 < (start_ms / 1000 - now) <= 10.0:
-            delay = start_ms / 1000 - now
-        elif start_after_ms:
-            delay = start_after_ms / 1000
-        else:
-            delay = 0.0
+        start_after_ms = int(message.get("Start-After-Ms") or 400)
+        delay = start_after_ms / 1000
         if delay > 0:
             await asyncio.sleep(delay)
         peer_id = message.get("Peer-ID") or "unknown"

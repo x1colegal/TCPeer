@@ -630,16 +630,9 @@ class TcpPeerVpnService : VpnService() {
                     throw ProtocolException("TCP4 is forbidden when both peers have usable IPv6")
                 }
 
-                val startMillis = punch.field("Start-Ms")?.toLongOrNull()
-                val startAfterMillis = punch.field("Start-After-Ms")?.toLongOrNull() ?: 500L
-                val now = System.currentTimeMillis()
-                val waitMillis = if (startMillis != null && startMillis > now && (startMillis - now) <= 10_000L) {
-                    startMillis - now
-                } else {
-                    startAfterMillis
-                }
-                if (waitMillis > 0)
-                    kotlinx.coroutines.delay(waitMillis)
+                val startAfterMillis = punch.field("Start-After-Ms")?.toLongOrNull() ?: 400L
+                if (startAfterMillis > 0)
+                    kotlinx.coroutines.delay(startAfterMillis)
 
                 peerPort = punch.field("Port")?.toIntOrNull()
                     ?: throw ProtocolException("PUNCH-GO has no valid port")
@@ -1098,29 +1091,17 @@ class TcpPeerVpnService : VpnService() {
         val port = punch.field("Port")?.toIntOrNull() ?: return
         val traversal = "Simultaneous-Open"
         val bindToUnderlying = punch.field("Path") != "Local"
-        val startMillis = punch.field("Start-Ms")?.toLongOrNull()
-        val startAfterMillis = punch.field("Start-After-Ms")?.toLongOrNull() ?: 500L
-        val now = System.currentTimeMillis()
-        val waitMillis = if (startMillis != null && startMillis > now && (startMillis - now) <= 10_000L) {
-            startMillis - now
-        } else {
-            startAfterMillis
-        }
-        if (waitMillis > 0) delay(waitMillis)
+        val startAfterMillis = punch.field("Start-After-Ms")?.toLongOrNull() ?: 400L
+        if (startAfterMillis > 0) delay(startAfterMillis)
         val activeLocalPort = config.directPort
         val socket = try {
             directPunchMutex.withLock {
-                closeDirectListener(family)
                 Log.i(
                     TAG,
                     "Mesh attempt peer_id=$peerId family=${familyLabel(family)} traversal=$traversal " +
                         "initiated=true local_port=$activeLocalPort remote=${formatEndpoint(address, port)}",
                 )
-                try {
-                    openActiveDirect(address, port, activeLocalPort, family, peerId, bindToUnderlying)
-                } finally {
-                    prepareDirectListener(config.directPort, family)
-                }
+                openActiveDirect(address, port, activeLocalPort, family, peerId, bindToUnderlying)
             }
         } catch (error: Exception) {
             Log.w(TAG, "Direct mesh connection to $peerId failed", error)
@@ -1235,6 +1216,7 @@ class TcpPeerVpnService : VpnService() {
             meshConnecting.remove(peerId)
             meshReadySentAt.remove(peerId)
             closeQuietly(socket)
+            prepareDirectListener(activeLocalPort, family)
         }
     }
 
@@ -1920,7 +1902,17 @@ class TcpPeerVpnService : VpnService() {
             // used for public mapping discovery. An ephemeral source port makes
             // two-NAT hole punching impossible.
             socket.bindNetwork(boundNetwork)
-            socket.bind(InetSocketAddress(wildcard, localPort))
+            try {
+                socket.bind(InetSocketAddress(wildcard, localPort))
+            } catch (e: Exception) {
+                if (isPortConflictOrUnavailable(e)) {
+                    Log.w(TAG, "Port $localPort busy on active bind, closing listener for fallback: ${e.message}")
+                    closeDirectListener(family)
+                    socket.bind(InetSocketAddress(wildcard, localPort))
+                } else {
+                    throw e
+                }
+            }
             Log.i(
                 TAG,
                 "Direct bind succeeded peer_id=$peerId family=${familyLabel(family)} " +
@@ -1934,7 +1926,7 @@ class TcpPeerVpnService : VpnService() {
             // Keep the same four-tuple alive long enough for the peer's SYN to
             // cross this socket. Replacing it every second made simultaneous
             // open intermittent when control delivery or scheduling differed.
-            socket.connect(InetSocketAddress(address, port), minOf(4_000L, remaining).toInt())
+            socket.connect(InetSocketAddress(address, port), minOf(8_000L, remaining).toInt())
             socket.tcpNoDelay = false
             socket.soTimeout = 15_000
             inFlightSockets.remove(socket)

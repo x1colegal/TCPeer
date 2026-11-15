@@ -145,6 +145,7 @@ class MainActivity : ComponentActivity() {
                 ApplySystemBars(window = window, appTheme = configuration.appTheme)
                 val runtime by TcpPeerRuntime.state.collectAsStateWithLifecycle()
                 val serviceActive by TcpPeerRuntime.serviceActive.collectAsStateWithLifecycle()
+                val isSessionActive = serviceActive || runtime.status != ConnectionStatus.DISCONNECTED
                 TcpPeerScreen(
                     configuration = configuration,
                     runtime = runtime,
@@ -153,7 +154,7 @@ class MainActivity : ComponentActivity() {
                         val renamed = updated.deviceName != configuration.deviceName
                         configuration = updated
                         runCatching { store.save(updated) }
-                        if (renamed && serviceActive) {
+                        if (renamed && isSessionActive) {
                             startService(
                                 Intent(this, TcpPeerVpnService::class.java)
                                     .setAction(TcpPeerVpnService.ACTION_RENAME_DEVICE)
@@ -231,13 +232,14 @@ private fun TcpPeerScreen(
 ) {
     var selectedTab by remember { mutableStateOf(RootTab.HOME) }
     var selectedSettingsSection by remember { mutableStateOf(SettingsSection.NETWORK) }
-    // NO_DIRECT_CONNECTION is a retry state, not a user-requested disconnect.
-    // Keep the switch on while the foreground service owns the VPN session so
-    // the next tap reliably means "disconnect" instead of a lost connect tap.
-    val active = serviceActive
     val connected = runtime.status == ConnectionStatus.COORDINATOR_ONLY ||
         runtime.status == ConnectionStatus.TCP4_DIRECT ||
         runtime.status == ConnectionStatus.TCP6_DIRECT
+    // NO_DIRECT_CONNECTION and CONNECTING are active VPN states, not a user-requested disconnect.
+    // Keep the switch on while the foreground service owns the VPN session or the runtime is active
+    // so the next tap reliably means "disconnect" instead of a lost connect tap, and the Connect
+    // button never reappears while the VPN is connected or attempting connection.
+    val active = serviceActive || connected || runtime.status != ConnectionStatus.DISCONNECTED
 
     runtime.activePingPeerId?.let { peerId ->
         TppPingSheet(
