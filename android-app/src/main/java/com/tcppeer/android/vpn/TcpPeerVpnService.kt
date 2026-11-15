@@ -159,6 +159,9 @@ class TcpPeerVpnService : VpnService() {
                     true
                 }
             }
+            if (lostActiveNetwork) {
+                runCatching { setUnderlyingNetworks(null) }
+            }
             if (lostActiveNetwork && connectionJob?.isActive == true && !disconnectRequested.get()) {
                 Log.i(TAG, "Physical underlay lost network=$network; abandoning the old TCPeer session")
                 restartForNetworkChange()
@@ -220,6 +223,9 @@ class TcpPeerVpnService : VpnService() {
                 } else {
                     previous != null && previous != signature && established
                 }
+            }
+            if (tunnel != null) {
+                runCatching { setUnderlyingNetworks(arrayOf(network)) }
             }
             if (changed && connectionJob?.isActive == true && !disconnectRequested.get()) {
                 Log.i(
@@ -2687,11 +2693,13 @@ class TcpPeerVpnService : VpnService() {
         tunnel = descriptor
         tunnelInput = input
         tunnelOutput = output
+        underlyingNetwork?.let { runCatching { setUnderlyingNetworks(arrayOf(it)) } }
         return TunStreams(input, output)
     }
 
     @Synchronized
     private fun closeResources() {
+        runCatching { setUnderlyingNetworks(null) }
         TcpPeerRuntime.stopContinuousPing()
         // API 28 keeps the VPN file descriptor referenced by streams created
         // from ParcelFileDescriptor.fileDescriptor. Close those owners first;
