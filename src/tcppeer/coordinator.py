@@ -708,7 +708,7 @@ class Coordinator:
         if left_is_android != right_is_android:
             return (550, 350) if left_is_android else (350, 550)
 
-        return (500, 500)
+        return (350, 550) if left.peer_id <= right.peer_id else (550, 350)
 
     async def _retry_deferred_punch(
         self,
