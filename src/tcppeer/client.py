@@ -165,6 +165,7 @@ class Client(Server):
                 asyncio.create_task(self._tun_receive_loop(), name="tun-receive"),
                 asyncio.create_task(self._statistics_loop(), name="statistics"),
                 asyncio.create_task(self._address_change_loop(), name="address-change"),
+                asyncio.create_task(self._endpoint_mapping_loop(), name="endpoint-mapping"),
             })
             done, pending = await asyncio.wait(self._tasks, return_when=asyncio.FIRST_EXCEPTION)
             for task in pending:
