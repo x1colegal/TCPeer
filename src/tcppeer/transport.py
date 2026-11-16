@@ -252,6 +252,9 @@ class DirectConnector:
                 )
                 sock.close()
 
+                if isinstance(exc, ConnectionRefusedError):
+                    break
+
                 if prebound_socket is not None:
                     if self._retry_without_prebound(exc):
                         # A recently closed direct stream can leave its exact

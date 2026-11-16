@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections import deque
 import errno
 import fcntl
 import ipaddress
@@ -235,6 +236,16 @@ class Server:
         self._peer_send_tasks: dict[str, asyncio.Task] = {}
         self._tun_receive_queue: asyncio.Queue[tuple[str, bytes]] = asyncio.Queue(maxsize=4096)
         self._tasks: set[asyncio.Task] = set()
+        self._coord_clock_samples: deque[tuple[int, int]] = deque(maxlen=8)
+        self._coord_clock_offset_ms: int | None = None
+        self._ipv4_connect_ms: int | None = None
+        self._active_direct_ports: dict[socket.AddressFamily, int] = {
+            socket.AF_INET: config.direct_port,
+            socket.AF_INET6: config.direct_port,
+        }
+        self._family_listeners: dict[socket.AddressFamily, asyncio.AbstractServer] = {}
+        self._port_rotate_lock = asyncio.Lock()
+        self._last_port_rotate_at: dict[socket.AddressFamily, float] = {}
         self._listeners: list[asyncio.AbstractServer] = []
         self._direct_bind_ipv4 = config.direct_ipv4 or discover_direct_ipv4({config.tun_name})
         self._direct_bind_ipv6 = config.direct_ipv6
@@ -242,7 +253,7 @@ class Server:
         self._registered_ipv6 = public_address(config.direct_ipv6)
         self._registered_port_ipv4: int | None = config.direct_port if self._registered_ipv4 else None
         self._registered_port_ipv6: int | None = config.direct_port if self._registered_ipv6 else None
-        self._direct_candidates: dict[socket.AddressFamily, socket.socket] = {}
+        self._direct_candidates: dict[tuple[socket.AddressFamily, int], socket.socket] = {}
         self._direct_connect_tasks: dict[str, asyncio.Task] = {}
         self._direct_connect_peer_sessions: dict[str, str] = {}
         self._direct_target_endpoints: dict[tuple[str, int], str] = {}
@@ -258,7 +269,9 @@ class Server:
         # observed NAT mapping.  The auxiliary ENDPOINT-QUERY connection must
         # likewise stay open: closing a TCP flow can make a NAPT immediately
         # discard the advertised public port before simultaneous-open starts.
-        self._endpoint_mapping_writers: dict[socket.AddressFamily, object] = {}
+        self._endpoint_mapping_writers: dict[tuple[socket.AddressFamily, int], object] = {}
+        self._ipv4_port_pool: list[tuple[int, int]] = []
+        self._ipv6_port_pool: list[tuple[int, int]] = []
         self._registration_complete = asyncio.Event()
         self._pending_tpp_pings: dict[int, asyncio.Future] = {}
         self.exit_node = ExitNodeFirewall(config, config.tun_name)
@@ -346,8 +359,18 @@ class Server:
             self._flush_byte_counters()
             self.store.close()
 
+    def _direct_port_for(self, family: socket.AddressFamily) -> int:
+        return self._active_direct_ports.get(family, self.config.direct_port)
+
+    def _port_pool_list(self) -> list[int]:
+        return [self.config.direct_port + i for i in range(8)]
+
+    @staticmethod
+    def _format_port_pool(pool: list[tuple[int, int]]) -> str:
+        return ",".join(f"{local_p}:{mapped_p}" for local_p, mapped_p in pool)
+
     def _prepare_direct_candidates(
-        self, only_family: socket.AddressFamily | None = None,
+        self, only_family: socket.AddressFamily | None = None, only_port: int | None = None,
     ) -> None:
         """Pre-bind ICE-TCP simultaneous-open candidates before listen()."""
         for family, address in (
@@ -356,21 +379,24 @@ class Server:
         ):
             if only_family is not None and family != only_family:
                 continue
-            current = self._direct_candidates.get(family)
-            if current is not None and current.fileno() >= 0:
-                continue
-            candidate = socket.socket(family, socket.SOCK_STREAM, socket.IPPROTO_TCP)
-            set_ipv6_prefer_public(candidate)
-            candidate.setblocking(False)
-            candidate.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            if hasattr(socket, "SO_REUSEPORT"):
-                candidate.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-            try:
-                candidate.bind((address, self.config.direct_port))
-            except OSError:
-                candidate.close()
-                continue
-            self._direct_candidates[family] = candidate
+            ports = [only_port] if only_port is not None else self._port_pool_list()
+            for port in ports:
+                key = (family, port)
+                current = self._direct_candidates.get(key)
+                if current is not None and current.fileno() >= 0:
+                    continue
+                candidate = socket.socket(family, socket.SOCK_STREAM, socket.IPPROTO_TCP)
+                set_ipv6_prefer_public(candidate)
+                candidate.setblocking(False)
+                candidate.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if hasattr(socket, "SO_REUSEPORT"):
+                    candidate.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                try:
+                    candidate.bind((address, port))
+                except OSError:
+                    candidate.close()
+                    continue
+                self._direct_candidates[key] = candidate
 
     async def _start_direct_listeners(self) -> None:
         candidates = []
@@ -385,11 +411,14 @@ class Server:
         if not candidates:
             candidates = [("::", socket.AF_INET6), ("0.0.0.0", socket.AF_INET)]
         for address, family in candidates:
-            listener = await asyncio.start_server(
-                self._accept_direct, address, self.config.direct_port,
-                family=family, reuse_port=True,
-            )
-            self._listeners.append(listener)
+            for port in self._port_pool_list():
+                listener = await asyncio.start_server(
+                    self._accept_direct, address, port,
+                    family=family, reuse_port=True,
+                )
+                self._listeners.append(listener)
+                if port == self._direct_port_for(family):
+                    self._family_listeners[family] = listener
 
     async def _accept_direct(self, reader, writer) -> None:
         attempt = self._next_direct_attempt()
@@ -497,15 +526,45 @@ class Server:
             observed_version = ipaddress.ip_address(observed_address).version
         except ValueError:
             observed_version = 0
+        self._ipv4_port_pool = []
+        self._ipv6_port_pool = []
         if observed_version == 4:
             self._registered_ipv4 = observed_address
             self._registered_port_ipv4 = int(observed.get("Port") or self.config.direct_port)
+            self._ipv4_port_pool.append((self.config.direct_port, self._registered_port_ipv4))
+            extra_v4 = await asyncio.gather(*(
+                self._query_observed_endpoint(socket.AF_INET, bind_port=p, max_attempts=1)
+                for p in self._port_pool_list()[1:]
+            ))
+            for port, obs in zip(self._port_pool_list()[1:], extra_v4):
+                if obs:
+                    self._ipv4_port_pool.append((port, obs[1]))
         if observed_version == 6:
             self._registered_ipv6 = observed_address
             self._registered_port_ipv6 = int(observed.get("Port") or self.config.direct_port)
-            other_observed = await self._query_observed_endpoint(socket.AF_INET)
-            if other_observed:
-                self._registered_ipv4, self._registered_port_ipv4 = other_observed
+            self._ipv6_port_pool.append((self.config.direct_port, self._registered_port_ipv6))
+            extra_v6 = await asyncio.gather(*(
+                self._query_observed_endpoint(socket.AF_INET6, bind_port=p, max_attempts=1)
+                for p in self._port_pool_list()[1:]
+            ))
+            for port, obs6 in zip(self._port_pool_list()[1:], extra_v6):
+                if obs6:
+                    self._ipv6_port_pool.append((port, obs6[1]))
+            first_v4, *rest_v4 = await asyncio.gather(
+                self._query_observed_endpoint(socket.AF_INET, bind_port=self.config.direct_port, max_attempts=15),
+                *(
+                    self._query_observed_endpoint(socket.AF_INET, bind_port=p, max_attempts=1)
+                    for p in self._port_pool_list()[1:]
+                ),
+            )
+            if first_v4:
+                self._registered_ipv4, self._registered_port_ipv4 = first_v4
+                self._ipv4_port_pool.append((self.config.direct_port, first_v4[1]))
+            for port, obs4 in zip(self._port_pool_list()[1:], rest_v4):
+                if obs4:
+                    if not self._registered_ipv4:
+                        self._registered_ipv4, self._registered_port_ipv4 = obs4
+                    self._ipv4_port_pool.append((port, obs4[1]))
         LOG.info(
             "Registering direct endpoints IPv4=%s IPv6=%s",
             self._registered_ipv4 or "none",
@@ -527,6 +586,9 @@ class Server:
             "Platform": "Linux",
             "Overlay-IPv4": overlay_ipv4,
             "Overlay-IPv6": overlay_ipv6,
+            "IPv4-Connect-Ms": str(self._ipv4_connect_ms or ""),
+            "IPv4-Port-Pool": self._format_port_pool(self._ipv4_port_pool),
+            "IPv6-Port-Pool": self._format_port_pool(self._ipv6_port_pool),
         }).encode())
         if self.config.target_peer:
             writer.write(ControlMessage("PUNCH-READY", {"Peer-ID": self.config.target_peer}).encode())
@@ -556,11 +618,35 @@ class Server:
         self._tasks.add(refresh_task)
         refresh_task.add_done_callback(self._tasks.discard)
 
+        async def sync_coord_clock() -> None:
+            for idx in range(3):
+                if idx > 0:
+                    await asyncio.sleep(0.15)
+                if writer.is_closing():
+                    return
+                writer.write(ControlMessage("PING", {"T1": str(int(time.time() * 1000))}).encode())
+                await writer.drain()
+            while True:
+                await asyncio.sleep(15)
+                if writer.is_closing():
+                    return
+                writer.write(ControlMessage("PING", {"T1": str(int(time.time() * 1000))}).encode())
+                await writer.drain()
+
+        clock_sync_task = asyncio.create_task(
+            sync_coord_clock(),
+            name="coord-clock-sync",
+        )
+        self._tasks.add(clock_sync_task)
+        clock_sync_task.add_done_callback(self._tasks.discard)
+
         while True:
             message = await self._read_control_alive(reader, writer)
             if message.command == "PING":
                 writer.write(ControlMessage("PONG", {}).encode())
                 await writer.drain()
+            elif message.command == "PONG":
+                self._record_coord_pong(message)
             elif message.command == "PUNCH-GO":
                 peer_id = message.get("Peer-ID") or "unknown"
                 if not self._prepare_owner_for_peer_session(
@@ -607,6 +693,28 @@ class Server:
                 LOG.warning("Coordinator error: %s", message.get("Reason", "unspecified error"))
             elif message.command in {"DISCONNECT", "AUTH-ERROR"}:
                 raise ConnectionError(message.get("Reason", "coordinator disconnected"))
+
+    def _record_coord_pong(self, message: ControlMessage) -> None:
+        t1_raw = message.get("T1")
+        t2_raw = message.get("T2")
+        t3_raw = message.get("T3")
+        if not t1_raw or not t2_raw or not t3_raw:
+            return
+        try:
+            t1 = int(t1_raw)
+            t2 = int(t2_raw)
+            t3 = int(t3_raw)
+        except ValueError:
+            return
+        t4 = int(time.time() * 1000)
+        rtt_ms = (t4 - t1) - (t3 - t2)
+        if not (0 <= rtt_ms <= 5000):
+            return
+        offset_ms = ((t2 - t1) + (t3 - t4)) // 2
+        self._coord_clock_samples.append((rtt_ms, offset_ms))
+        best_rtt, best_offset = min(self._coord_clock_samples, key=lambda item: item[0])
+        self._coord_clock_offset_ms = best_offset
+        LOG.debug("Coordinator clock sync sample rtt=%sms offset=%sms (best rtt=%sms)", rtt_ms, offset_ms, best_rtt)
 
     async def _read_control_alive(self, reader, writer) -> ControlMessage:
         """Read control traffic while detecting a black-holed TCP session."""
@@ -665,13 +773,22 @@ class Server:
             except ValueError:
                 LOG.warning("Ignoring invalid overlay address peer_id=%s address=%s", peer_id, value)
 
-    async def _query_observed_endpoint(self, family: socket.AddressFamily) -> tuple[str, int] | None:
-        previous_writer = self._endpoint_mapping_writers.pop(family, None)
+    async def _query_observed_endpoint(
+        self,
+        family: socket.AddressFamily,
+        *,
+        ephemeral: bool = False,
+        bind_port: int | None = None,
+        max_attempts: int = 15,
+    ) -> tuple[str, int] | None:
+        target_port = 0 if ephemeral else (bind_port if bind_port is not None else self._direct_port_for(family))
+        previous_writer = self._endpoint_mapping_writers.pop((family, target_port), None)
         if previous_writer is not None:
             _close_with_reset(previous_writer)
             await asyncio.gather(previous_writer.wait_closed(), return_exceptions=True)
         local_address = self._direct_bind_ipv6 if family == socket.AF_INET6 else self._direct_bind_ipv4
         local_address = local_address or ("::" if family == socket.AF_INET6 else "0.0.0.0")
+        bind_port = target_port
         results = await resolve_tcp_endpoints(self.config.coordinator_address, self.config.coordinator_port)
         loop = asyncio.get_running_loop()
         family_name = "IPv6" if family == socket.AF_INET6 else "IPv4"
@@ -679,7 +796,6 @@ class Server:
         # A service restart can briefly leave the previous mapping's identical
         # four-tuple in FIN-WAIT.  Keep retrying EADDRNOTAVAIL long enough for
         # kernel cleanup instead of permanently dropping this address family.
-        max_attempts = 15
         for attempt in range(1, max_attempts + 1):
             retry_delay = 0.25
             for candidate_family, socktype, protocol, _name, address in family_results:
@@ -692,8 +808,13 @@ class Server:
                 writer = None
                 retained = False
                 try:
-                    sock.bind((local_address, self.config.direct_port))
+                    sock.bind((local_address, bind_port))
+                    connect_started = time.monotonic()
                     await asyncio.wait_for(loop.sock_connect(sock, address), timeout=5)
+                    if family == socket.AF_INET:
+                        self._ipv4_connect_ms = max(1, round((time.monotonic() - connect_started) * 1000))
+                    if ephemeral:
+                        self._active_direct_ports[family] = int(sock.getsockname()[1])
                     selected_address = str(sock.getsockname()[0]).split("%", 1)[0]
                     if family == socket.AF_INET6 and is_usable_ipv6(selected_address):
                         self._direct_bind_ipv6 = selected_address
@@ -710,7 +831,8 @@ class Server:
                         address_value = response.get("Address") or ""
                         port_value = int(response.get("Port") or 0)
                         if public_address(address_value) and port_value:
-                            self._endpoint_mapping_writers[family] = writer
+                            actual_local_port = int(sock.getsockname()[1])
+                            self._endpoint_mapping_writers[(family, actual_local_port)] = writer
                             retained = True
                             LOG.info(
                                 "Keeping %s endpoint mapping alive local=%s public=%s:%s attempt=%s",
@@ -740,10 +862,7 @@ class Server:
         """Keep NAT state entries active and refresh endpoint mappings if they close."""
         while True:
             await asyncio.sleep(20)
-            for family in (socket.AF_INET, socket.AF_INET6):
-                writer = self._endpoint_mapping_writers.get(family)
-                if writer is None:
-                    continue
+            for (family, local_port), writer in list(self._endpoint_mapping_writers.items()):
                 try:
                     if writer.is_closing():
                         raise ConnectionError("mapping writer is closing")
@@ -751,18 +870,19 @@ class Server:
                     await writer.drain()
                 except (ConnectionError, OSError) as exc:
                     LOG.warning(
-                        "%s endpoint mapping lost: %s; refreshing",
+                        "%s endpoint mapping lost (port=%s): %s; refreshing",
                         "IPv6" if family == socket.AF_INET6 else "IPv4",
+                        local_port,
                         exc,
                     )
-                    self._endpoint_mapping_writers.pop(family, None)
+                    self._endpoint_mapping_writers.pop((family, local_port), None)
                     _close_with_reset(writer)
-                    asyncio.create_task(self._refresh_endpoint_mapping(family))
+                    asyncio.create_task(self._refresh_endpoint_mapping(family, local_port))
 
-    async def _refresh_endpoint_mapping(self, family: socket.AddressFamily) -> None:
+    async def _refresh_endpoint_mapping(self, family: socket.AddressFamily, local_port: int | None = None) -> None:
         if not self._coordinator_writer or self._coordinator_writer.is_closing():
             return
-        observed = await self._query_observed_endpoint(family)
+        observed = await self._query_observed_endpoint(family, bind_port=local_port)
         if not observed:
             return
         address, port = observed
@@ -795,10 +915,82 @@ class Server:
                 "Platform": "Linux",
                 "Overlay-IPv4": overlay_ipv4,
                 "Overlay-IPv6": overlay_ipv6,
+                "IPv4-Connect-Ms": str(self._ipv4_connect_ms or ""),
             }).encode())
             await self._coordinator_writer.drain()
         except (ConnectionError, OSError):
             pass
+
+    async def _rotate_direct_port(self, family: socket.AddressFamily, reason: str) -> None:
+        async with self._port_rotate_lock:
+            now = time.monotonic()
+            if (now - self._last_port_rotate_at.get(family, 0.0)) < 2.0:
+                return
+            if not self._coordinator_writer or self._coordinator_writer.is_closing():
+                return
+            old_port = self._direct_port_for(family)
+            old_candidate = self._direct_candidates.pop((family, old_port), None)
+            if old_candidate is not None:
+                try:
+                    old_candidate.close()
+                except OSError:
+                    pass
+            old_listener = self._family_listeners.pop(family, None)
+            if old_listener is not None:
+                old_listener.close()
+                await asyncio.gather(old_listener.wait_closed(), return_exceptions=True)
+                if old_listener in self._listeners:
+                    self._listeners.remove(old_listener)
+            observed = await self._query_observed_endpoint(family, ephemeral=True)
+            if observed is None:
+                return
+            address, port = observed
+            if family == socket.AF_INET6:
+                self._registered_ipv6, self._registered_port_ipv6 = address, port
+                bind_addr = self._direct_bind_ipv6 or "::"
+            else:
+                self._registered_ipv4, self._registered_port_ipv4 = address, port
+                bind_addr = self._direct_bind_ipv4 or "0.0.0.0"
+            new_port = self._direct_port_for(family)
+            listener = await asyncio.start_server(
+                self._accept_direct, bind_addr, new_port,
+                family=family, reuse_port=True,
+            )
+            self._family_listeners[family] = listener
+            self._listeners.append(listener)
+            self._prepare_direct_candidates(family, new_port)
+            self._last_port_rotate_at[family] = time.monotonic()
+            LOG.info(
+                "Rotated %s direct port local=%s:%s public=%s:%s reason=%s",
+                "IPv6" if family == socket.AF_INET6 else "IPv4",
+                bind_addr,
+                new_port,
+                address,
+                port,
+                reason,
+            )
+            overlay_ipv4, overlay_ipv6 = self._registration_overlays()
+            try:
+                self._coordinator_writer.write(ControlMessage("REGISTER", {
+                    "Peer-ID": self.config.peer_id,
+                    "Device-Name": self.store.metadata("device_name", self.config.peer_id),
+                    "IPv4": self._registered_ipv4 or "",
+                    "IPv6": self._registered_ipv6 or "",
+                    "Mapped-IPv4-Port": str(self._registered_port_ipv4 or ""),
+                    "Mapped-IPv6-Port": str(self._registered_port_ipv6 or ""),
+                    "Local-IPv4": self._direct_bind_ipv4 or "",
+                    "Local-IPv4-Prefix": str(discover_ipv4_prefix(self._direct_bind_ipv4) or ""),
+                    "Local-IPv6": (self._direct_bind_ipv6 or "") if self._registered_ipv6 else "",
+                    "Port": str(self.config.direct_port),
+                    "Role": self._registration_role(),
+                    "Platform": "Linux",
+                    "Overlay-IPv4": overlay_ipv4,
+                    "Overlay-IPv6": overlay_ipv6,
+                    "IPv4-Connect-Ms": str(self._ipv4_connect_ms or ""),
+                }).encode())
+                await self._coordinator_writer.drain()
+            except (ConnectionError, OSError):
+                pass
 
     async def _close_endpoint_mapping_writers(self) -> None:
         writers = list(self._endpoint_mapping_writers.values())
@@ -863,9 +1055,18 @@ class Server:
             local_address = "::" if family == socket.AF_INET6 else "0.0.0.0"
         remote = Endpoint(message.get("Address") or "", int(message.get("Port") or 0), family)
         self._prepare_remote_route(remote.address, family)
-        local = Endpoint(local_address, self.config.direct_port, family)
+        local_port = int(message.get("Local-Port") or self._direct_port_for(family))
+        local = Endpoint(local_address, local_port, family)
+        start_ms_raw = message.get("Start-Ms")
         start_after_ms = int(message.get("Start-After-Ms") or 400)
-        delay = start_after_ms / 1000
+        if start_ms_raw and self._coord_clock_offset_ms is not None:
+            try:
+                target_local_ms = int(start_ms_raw) - self._coord_clock_offset_ms
+                delay = max(0.0, min(2.0, (target_local_ms - int(time.time() * 1000)) / 1000.0))
+            except ValueError:
+                delay = start_after_ms / 1000
+        else:
+            delay = start_after_ms / 1000
         if delay > 0:
             await asyncio.sleep(delay)
         peer_id = message.get("Peer-ID") or "unknown"
@@ -875,11 +1076,11 @@ class Server:
         writer = None
         handed_off = False
         try:
-            candidate = self._direct_candidates.pop(family, None)
+            candidate = self._direct_candidates.pop((family, local_port), None)
             # Keep the next simultaneous-open attempt pre-bound. Previously
             # the one startup candidate was consumed permanently, so only a
             # process restart restored the original socket state.
-            self._prepare_direct_candidates(family)
+            self._prepare_direct_candidates(family, local_port)
             LOG.info(
                 "direct-connect attempt ts=%.6f peer_id=%s family=%s attempt=%s initiated=yes local=%s:%s remote=%s:%s candidate_fd=%s",
                 time.time(),
@@ -941,7 +1142,7 @@ class Server:
                 attempt,
             )
             raise
-        except DirectConnectionError:
+        except DirectConnectionError as exc:
             if peer_id not in self.direct_writers:
                 self.store.update_peer(peer_id, transport="-", endpoint=None)
             # A failed path to one peer must not tear down the shared control

@@ -423,7 +423,7 @@ data-plane path.
 
 TPCP primarily operates on the Coordinator control connection (`:7443`).
 
-When a direct peer connection is established on the direct TCP port (`:7444`), both peers first perform a mutual challenge-response authentication handshake directly over that TCP socket:
+When a direct peer connection is established on the direct TCP port pool (`:7444`–`:7451` by default, starting from `direct_port`), both peers first perform a mutual challenge-response authentication handshake directly over that TCP socket:
 
 1. Each peer sends an `AUTH` message containing a locally generated cryptographic random `Nonce` (32 bytes hex).
 2. Each peer verifies that the remote nonce is not empty and does not equal its own nonce (preventing reflection and echo attacks).
@@ -988,7 +988,7 @@ Typical defaults are:
 | Purpose | Protocol | Port |
 |---|---|---:|
 | Coordinator | TCP | 7443 |
-| Direct peer connection | TCP | 7444 |
+| Direct peer connection (8-port pool) | TCP | 7444–7451 |
 
 Both are configurable.
 
@@ -1452,11 +1452,13 @@ Common server configuration areas include:
 | `paths` | Persistent state |
 | `runtime` | Runtime/logging behavior |
 
-Typical direct port:
+Typical direct port pool (`direct_port` through `direct_port + 7`):
 
 ```text
-7444/TCP
+7444-7451/TCP
 ```
+
+For `Simultaneous-Open` across stateful NAT/CGNATs (including `RST`-sending CGNATs and NAPT66), peers pre-open `ENDPOINT-QUERY` keepalive mappings across the 8-port pool in both `IPv4` and `IPv6`, calibrate clock offset via `PING`/`PONG` (`T1`/`T2`/`T3`/`T4` min-RTT), and compensate new-flow `IPv4-Connect-Ms` delay via synchronized `Start-Ms` / `Local-Port` coordination.
 
 ## Linux client
 

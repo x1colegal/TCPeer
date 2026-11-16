@@ -117,8 +117,14 @@ class TcpPeerVpnService : VpnService() {
     private val meshReadySentAt = ConcurrentHashMap<String, Long>()
     private val inFlightSockets: MutableSet<Socket> =
         Collections.newSetFromMap(ConcurrentHashMap<Socket, Boolean>())
-    private val endpointMappingSockets = ConcurrentHashMap<DirectFamily, Socket>()
+    private val endpointMappingSockets = ConcurrentHashMap<Pair<DirectFamily, Int>, Socket>()
     private val nextTppPingId = AtomicLong(System.nanoTime())
+    private val coordClockSamples = ArrayDeque<Pair<Long, Long>>()
+    @Volatile private var coordClockOffsetMs: Long? = null
+    @Volatile private var ipv4ConnectMs: Long? = null
+    private val activeDirectPorts = ConcurrentHashMap<DirectFamily, Int>()
+    private val ipv4PortPool = mutableListOf<Pair<Int, Int>>()
+    private val ipv6PortPool = mutableListOf<Pair<Int, Int>>()
     private val connectionGeneration = AtomicLong(0)
     private val pendingTppPings = ConcurrentHashMap<Long, Pair<String, Long>>()
     private val directListeners = mutableMapOf<DirectFamily, ServerSocket>()
@@ -527,6 +533,8 @@ class TcpPeerVpnService : VpnService() {
         }
         val observed = TcpPeerProtocol.readControl(controlInput)
         if (observed.command != "ENDPOINT-INFO") throw ProtocolException("Coordinator did not report the TCP mapping")
+        activeDirectPorts[DirectFamily.IPV4] = config.directPort
+        activeDirectPorts[DirectFamily.IPV6] = config.directPort
         val coordinatorFamily = if (coordinator.inetAddress is Inet6Address) {
             DirectFamily.IPV6
         } else {
@@ -536,15 +544,45 @@ class TcpPeerVpnService : VpnService() {
             normalizeEndpointAddress(observed.field("Address").orEmpty()),
             observed.field("Port")?.toIntOrNull() ?: config.directPort,
         )
-        var endpointIpv4 = when {
-            localIpv4.isEmpty() -> null
-            coordinatorFamily == DirectFamily.IPV4 -> observedEndpoint
-            else -> queryPublicEndpoint(config, DirectFamily.IPV4, physicalNetwork)
-        }
-        var endpointIpv6 = when {
-            localIpv6.isEmpty() -> null
-            coordinatorFamily == DirectFamily.IPV6 -> observedEndpoint
-            else -> null
+        val portPool = (0 until 8).map { config.directPort + it }
+        ipv4PortPool.clear()
+        ipv6PortPool.clear()
+        var endpointIpv4: PublicEndpoint? = null
+        var endpointIpv6: PublicEndpoint? = null
+        if (coordinatorFamily == DirectFamily.IPV4) {
+            if (localIpv4.isNotEmpty()) {
+                endpointIpv4 = observedEndpoint
+                ipv4PortPool.add(config.directPort to observedEndpoint.port)
+                portPool.drop(1).forEach { port ->
+                    queryPublicEndpoint(config, DirectFamily.IPV4, physicalNetwork, bindPort = port, maxAttempts = 1)?.let {
+                        ipv4PortPool.add(port to it.port)
+                    }
+                }
+            }
+        } else {
+            if (localIpv6.isNotEmpty()) {
+                endpointIpv6 = observedEndpoint
+                ipv6PortPool.add(config.directPort to observedEndpoint.port)
+                portPool.drop(1).forEach { port ->
+                    queryPublicEndpoint(config, DirectFamily.IPV6, physicalNetwork, bindPort = port, maxAttempts = 1)?.let {
+                        ipv6PortPool.add(port to it.port)
+                    }
+                }
+            }
+            if (localIpv4.isNotEmpty()) {
+                portPool.forEachIndexed { idx, port ->
+                    queryPublicEndpoint(
+                        config,
+                        DirectFamily.IPV4,
+                        physicalNetwork,
+                        bindPort = port,
+                        maxAttempts = if (idx == 0) 12 else 1,
+                    )?.let {
+                        if (endpointIpv4 == null) endpointIpv4 = it
+                        ipv4PortPool.add(port to it.port)
+                    }
+                }
+            }
         }
         var advertisedIpv4 = ""
         var advertisedIpv6 = ""
@@ -573,6 +611,9 @@ class TcpPeerVpnService : VpnService() {
                 "Port" to config.directPort.toString(),
                 "Role" to "Client",
                 "Platform" to "Android",
+                "IPv4-Connect-Ms" to (ipv4ConnectMs?.toString() ?: ""),
+                "IPv4-Port-Pool" to ipv4PortPool.joinToString(",") { "${it.first}:${it.second}" },
+                "IPv6-Port-Pool" to ipv6PortPool.joinToString(",") { "${it.first}:${it.second}" },
             )))
             readExpectedControl(controlInput, controlOutput, "ENDPOINT-INFO", "registration")
         }
@@ -591,9 +632,22 @@ class TcpPeerVpnService : VpnService() {
         // session active while no coroutine is reading it, otherwise the
         // coordinator expires the peer in the middle of simultaneous-open.
         val preDirectControlLiveness = serviceScope.launch(Dispatchers.IO) {
+            repeat(3) { idx ->
+                if (idx > 0) delay(150)
+                try {
+                    writeCoordinatorControl(
+                        controlOutput,
+                        ControlMessage("PING", mapOf("T1" to System.currentTimeMillis().toString())),
+                    )
+                } catch (_: Throwable) {
+                }
+            }
             while (true) {
                 delay(5_000)
-                writeCoordinatorControl(controlOutput, ControlMessage("PONG"))
+                writeCoordinatorControl(
+                    controlOutput,
+                    ControlMessage("PING", mapOf("T1" to System.currentTimeMillis().toString())),
+                )
                 endpointMappingSockets.values.forEach { socket ->
                     try {
                         TcpPeerProtocol.writeControl(socket.getOutputStream(), ControlMessage("PING"))
@@ -636,10 +690,13 @@ class TcpPeerVpnService : VpnService() {
                     throw ProtocolException("TCP4 is forbidden when both peers have usable IPv6")
                 }
 
-                val startAfterMillis = punch.field("Start-After-Ms")?.toLongOrNull() ?: 400L
-                if (startAfterMillis > 0)
-                    kotlinx.coroutines.delay(startAfterMillis)
+                val punchDelayMillis = computePunchDelayMs(punch)
+                if (punchDelayMillis > 0)
+                    kotlinx.coroutines.delay(punchDelayMillis)
 
+                val localPort = punch.field("Local-Port")?.toIntOrNull()
+                    ?: (activeDirectPorts[family] ?: config.directPort)
+                activeDirectPorts[family] = localPort
                 peerPort = punch.field("Port")?.toIntOrNull()
                     ?: throw ProtocolException("PUNCH-GO has no valid port")
 
@@ -653,7 +710,7 @@ class TcpPeerVpnService : VpnService() {
                         openDirect(
                             address,
                             peerPort,
-                            config.directPort,
+                            localPort,
                             family,
                             bindToUnderlying = punch.field("Path") != "Local",
                         ),
@@ -676,37 +733,14 @@ class TcpPeerVpnService : VpnService() {
                 // The failed active socket may have replaced the NAPT mapping
                 // that was discovered before REGISTER. Refresh both mapped
                 // endpoints before requesting another coordinated punch.
-                endpointIpv4 = if (coordinatorFamily == DirectFamily.IPV4) {
-                    endpointIpv4
-                } else if (localIpv4.isNotEmpty()) {
-                    queryPublicEndpoint(config, DirectFamily.IPV4, physicalNetwork)
-                } else null
-                endpointIpv6 = if (coordinatorFamily == DirectFamily.IPV6) {
-                    endpointIpv6
-                } else null
-                registerCurrentEndpoints()
-                Log.i(
-                    TAG,
-                    "Refreshed direct endpoint registration after failed punch " +
-                        "IPv4=${endpointIpv4?.address}:${endpointIpv4?.port} " +
-                        "IPv6=${endpointIpv6?.address}:${endpointIpv6?.port}",
-                )
-                    kotlinx.coroutines.delay(1_000)
+                    kotlinx.coroutines.delay(250)
                 }
             }
         } finally {
             preDirectControlLiveness.cancel()
         }
-        // The winning direct socket owns the NAT state for :7444 if the direct
-        // connection is IPv4. But if the direct connection established over IPv6,
-        // closing the IPv4 endpoint mapping socket drops the router's NAPT
-        // mapping, breaking incoming IPv4 mesh punch from IPv4-only peers.
-        // Close IPv6 mapping socket (IPv6 doesn't have NAPT state), but keep
-        // IPv4 mapping socket alive when connected over IPv6.
-        endpointMappingSockets.remove(DirectFamily.IPV6)?.let(::closeQuietly)
-        if (family == DirectFamily.IPV4) {
-            endpointMappingSockets.remove(DirectFamily.IPV4)?.let(::closeQuietly)
-        }
+        // Keep all endpoint mapping sockets in the port pool alive so mesh
+        // peers and fallback punches have pre-warmed NAT/NAPT66 mappings ready.
         val directInput = direct.getInputStream()
         val directOutput = direct.getOutputStream()
         val directNonce = AuthProof.generateNonce()
@@ -805,8 +839,8 @@ class TcpPeerVpnService : VpnService() {
             // Mesh peers may use either family independently of the primary
             // Exit Node connection. Keep one V6-only listener and one native
             // IPv4 listener available at the direct port.
-            prepareDirectListener(config.directPort, DirectFamily.IPV4)
-            prepareDirectListener(config.directPort, DirectFamily.IPV6)
+            prepareDirectListener(activeDirectPorts[DirectFamily.IPV4] ?: config.directPort, DirectFamily.IPV4)
+            prepareDirectListener(activeDirectPorts[DirectFamily.IPV6] ?: config.directPort, DirectFamily.IPV6)
             val passiveIpv4AcceptJob = launch(Dispatchers.IO) {
                 acceptMeshConnections(
                     DirectFamily.IPV4,
@@ -824,15 +858,28 @@ class TcpPeerVpnService : VpnService() {
             val endpointMappingKeepaliveJob = launch(Dispatchers.IO) {
                 while (isActive) {
                     delay(20_000)
-                    endpointMappingSockets.entries.forEach { (fam, socket) ->
+                    endpointMappingSockets.entries.forEach { (key, socket) ->
                         try {
                             TcpPeerProtocol.writeControl(socket.getOutputStream(), ControlMessage("PING"))
                         } catch (e: Throwable) {
-                            Log.w(TAG, "Endpoint mapping keepalive failed for ${familyLabel(fam)}: ${e.message}")
+                            Log.w(TAG, "Endpoint mapping keepalive failed for ${familyLabel(key.first)} port=${key.second}: ${e.message}")
                             closeQuietly(socket)
-                            endpointMappingSockets.remove(fam, socket)
+                            endpointMappingSockets.remove(key, socket)
                         }
                     }
+                }
+            }
+            val coordinatorClockSyncJob = launch(Dispatchers.IO) {
+                while (isActive) {
+                    try {
+                        writeCoordinatorControl(
+                            controlOutput,
+                            ControlMessage("PING", mapOf("T1" to System.currentTimeMillis().toString())),
+                        )
+                    } catch (_: Throwable) {
+                        break
+                    }
+                    delay(15_000)
                 }
             }
             val coordinatorControlJob = launch(Dispatchers.IO) {
@@ -989,6 +1036,8 @@ class TcpPeerVpnService : VpnService() {
                                 )
                             }
 
+                            "PONG" -> recordCoordPong(message)
+
                             "AUTH-ERROR", "DISCONNECT" -> {
                                 throw ProtocolException(
                                     message.field("Reason")
@@ -1097,9 +1146,10 @@ class TcpPeerVpnService : VpnService() {
         val port = punch.field("Port")?.toIntOrNull() ?: return
         val traversal = "Simultaneous-Open"
         val bindToUnderlying = punch.field("Path") != "Local"
-        val startAfterMillis = punch.field("Start-After-Ms")?.toLongOrNull() ?: 400L
-        if (startAfterMillis > 0) delay(startAfterMillis)
-        val activeLocalPort = config.directPort
+        val punchDelayMillis = computePunchDelayMs(punch)
+        if (punchDelayMillis > 0) delay(punchDelayMillis)
+        val activeLocalPort = punch.field("Local-Port")?.toIntOrNull()
+            ?: (activeDirectPorts[family] ?: config.directPort)
         val socket = try {
             directPunchMutex.withLock {
                 Log.i(
@@ -1565,6 +1615,35 @@ class TcpPeerVpnService : VpnService() {
         }
     }
 
+    private fun recordCoordPong(message: ControlMessage) {
+        val t1 = message.field("T1")?.toLongOrNull() ?: return
+        val t2 = message.field("T2")?.toLongOrNull() ?: return
+        val t3 = message.field("T3")?.toLongOrNull() ?: return
+        val t4 = System.currentTimeMillis()
+        val rttMs = (t4 - t1) - (t3 - t2)
+        if (rttMs !in 0L..5_000L) return
+        val offsetMs = ((t2 - t1) + (t3 - t4)) / 2L
+        synchronized(coordClockSamples) {
+            if (coordClockSamples.size >= 8) coordClockSamples.removeFirst()
+            coordClockSamples.addLast(rttMs to offsetMs)
+            coordClockOffsetMs = coordClockSamples.minByOrNull { it.first }?.second
+        }
+    }
+
+    private fun computePunchDelayMs(punch: ControlMessage): Long {
+        val startAfterMillis = punch.field("Start-After-Ms")?.toLongOrNull() ?: 400L
+        val startMillis = punch.field("Start-Ms")?.toLongOrNull() ?: return startAfterMillis
+        val offsetMs = coordClockOffsetMs
+        if (offsetMs == null) {
+            Log.i(TAG, "Punch delay fallback startAfter=${startAfterMillis}ms (no clock offset)")
+            return startAfterMillis
+        }
+        val targetLocalMs = startMillis - offsetMs
+        val delayMs = (targetLocalMs - System.currentTimeMillis()).coerceIn(0L, 2_500L)
+        Log.i(TAG, "Punch delay synced=${delayMs}ms offset=${offsetMs}ms startAfter=${startAfterMillis}ms")
+        return delayMs
+    }
+
     private fun awaitPunchGo(input: java.io.InputStream, output: java.io.OutputStream, targetPeerId: String): ControlMessage {
         while (true) {
             when (val message = TcpPeerProtocol.readControl(input)) {
@@ -1584,6 +1663,7 @@ class TcpPeerVpnService : VpnService() {
                         }
                     }
                     "PING", "KEEPALIVE" -> writeCoordinatorControl(output, ControlMessage("PONG"))
+                    "PONG" -> recordCoordPong(message)
                     "AUTH-ERROR", "DISCONNECT" -> throw ProtocolException(message.field("Reason") ?: "Coordinator disconnected")
                     "ERROR" -> throw ProtocolException(message.field("Reason") ?: "Coordinator rejected the direct connection")
                 }
@@ -1631,6 +1711,10 @@ class TcpPeerVpnService : VpnService() {
         val devices = mutableListOf<NetworkDevice>()
         while (true) {
             val message = TcpPeerProtocol.readControl(input)
+            if (message.command == "PONG") {
+                recordCoordPong(message)
+                continue
+            }
             if (message.command == "ERROR") throw ProtocolException(message.field("Reason") ?: "Device list failed")
             if (message.command != "PEER-INFO") continue
             when (message.field("Action")) {
@@ -1788,8 +1872,14 @@ class TcpPeerVpnService : VpnService() {
         config: VpnConfiguration,
         family: DirectFamily,
         physicalNetwork: Network?,
+        ephemeral: Boolean = false,
+        bindPort: Int? = null,
+        maxAttempts: Int = 12,
     ): PublicEndpoint? {
-        endpointMappingSockets.remove(family)?.let(::closeQuietly)
+        val targetPort = bindPort ?: config.directPort
+        if (!ephemeral) {
+            endpointMappingSockets.remove(family to targetPort)?.let(::closeQuietly)
+        }
         val addresses = resolveCoordinatorAddresses(
             config.coordinatorAddress, physicalNetwork,
         ).filter {
@@ -1797,7 +1887,6 @@ class TcpPeerVpnService : VpnService() {
                 (family == DirectFamily.IPV4 && it is Inet4Address)
         }
         val wildcard = if (family == DirectFamily.IPV6) InetAddress.getByName("::") else InetAddress.getByName("0.0.0.0")
-        val maxAttempts = 12
         addresses.forEach { address ->
             for (attempt in 1..maxAttempts) {
                 val socket = OsTcpSocket(if (family == DirectFamily.IPV6) OsConstants.AF_INET6 else OsConstants.AF_INET)
@@ -1806,9 +1895,17 @@ class TcpPeerVpnService : VpnService() {
                 try {
                     socket.reuseAddress = true
                     socket.bindNetwork(physicalNetwork)
-                    socket.bind(InetSocketAddress(wildcard, config.directPort))
+                    val localBindPort = if (ephemeral) 0 else targetPort
+                    socket.bind(InetSocketAddress(wildcard, localBindPort))
                     requireProtectedOrBound(socket, physicalNetwork, "endpoint query")
+                    val connectStartMs = android.os.SystemClock.elapsedRealtime()
                     socket.connect(InetSocketAddress(address, config.coordinatorPort), 5_000)
+                    if (family == DirectFamily.IPV4) {
+                        ipv4ConnectMs = (android.os.SystemClock.elapsedRealtime() - connectStartMs).coerceAtLeast(1L)
+                    }
+                    if (ephemeral) {
+                        activeDirectPorts[family] = socket.localPort
+                    }
                     socket.soTimeout = 5_000
                     TcpPeerProtocol.writeControl(socket.getOutputStream(), ControlMessage("ENDPOINT-QUERY"))
                     val response = TcpPeerProtocol.readControl(socket.getInputStream())
@@ -1818,7 +1915,7 @@ class TcpPeerVpnService : VpnService() {
                         if (!endpointAddress.isNullOrBlank() && endpointPort != null) {
                             socket.soTimeout = 0
                             inFlightSockets.remove(socket)
-                            endpointMappingSockets[family] = socket
+                            endpointMappingSockets[family to socket.localPort] = socket
                             retained = true
                             Log.i(
                                 TAG,
@@ -1957,6 +2054,9 @@ class TcpPeerVpnService : VpnService() {
                 )
                 inFlightSockets.remove(socket)
                 socket.close()
+                if (error is ConnectException) {
+                    break
+                }
                 if (android.os.SystemClock.elapsedRealtime() < deadline) {
                     // A fixed delay on both peers can phase-lock fast RST/
                     // ECONNREFUSED retries, leaving neither socket in SYN-SENT

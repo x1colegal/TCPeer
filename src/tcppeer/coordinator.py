@@ -10,6 +10,7 @@ import ipaddress
 from pathlib import Path
 import socket
 import secrets
+import struct
 import sys
 import time
 from typing import Any
@@ -49,6 +50,9 @@ class RegisteredPeer:
     ready_for: set[str] = field(default_factory=set)
     connected_at: float = field(default_factory=time.monotonic)
     last_punch_peer: str | None = None
+    ipv4_connect_ms: int | None = None
+    ipv4_port_pool: list[tuple[int, int]] = field(default_factory=list)
+    ipv6_port_pool: list[tuple[int, int]] = field(default_factory=list)
     registered: bool = False
 
 
@@ -88,6 +92,8 @@ class Coordinator:
             tuple[str, str, str], tuple[tuple[float, float], float]
         ] = {}
         self._punch_busy_until: dict[tuple[str, str], float] = {}
+        self._pool_cursor: dict[tuple[str, tuple[str, str, str]], int] = {}
+        self._last_pair_punch_at: dict[tuple[str, tuple[str, str, str]], float] = {}
         self._deferred_punch_tasks: dict[
             tuple[str, str, str], asyncio.Task[None]
         ] = {}
@@ -290,6 +296,17 @@ class Coordinator:
             if not is_usable_ipv6(peer.declared_ipv6):
                 peer.local_ipv6 = None
 
+            ipv4_connect_raw = message.get("IPv4-Connect-Ms")
+            if ipv4_connect_raw:
+                try:
+                    parsed_connect_ms = int(ipv4_connect_raw)
+                    if 0 < parsed_connect_ms <= 10000:
+                        peer.ipv4_connect_ms = parsed_connect_ms
+                except ValueError:
+                    pass
+            peer.ipv4_port_pool = self._parse_port_pool(message.get("IPv4-Port-Pool"))
+            peer.ipv6_port_pool = self._parse_port_pool(message.get("IPv6-Port-Pool"))
+
             known = self.known_peers[(peer.network, peer.peer_id)]
             known.display_name = display_name
             known.role = peer.role
@@ -339,7 +356,18 @@ class Coordinator:
             await self.send(peer.writer, "PEER-INFO", Action="Rename-OK", **{"Device-Name": display_name})
             LOG.info("Peer %s renamed to %s", peer.peer_id, display_name)
         elif message.command in {"PING", "KEEPALIVE"}:
-            await self.send(peer.writer, "PONG")
+            t2_ms = int(time.time() * 1000)
+            t1 = message.get("T1")
+            if t1:
+                await self.send(
+                    peer.writer,
+                    "PONG",
+                    T1=t1,
+                    T2=str(t2_ms),
+                    T3=str(int(time.time() * 1000)),
+                )
+            else:
+                await self.send(peer.writer, "PONG")
         elif message.command == "PONG":
             # PONG is the expected answer to the coordinator's own idle
             # liveness probe.  Treating it as an unknown command made every
@@ -653,10 +681,44 @@ class Coordinator:
         right.ready_for.discard(left.peer_id)
         left.last_punch_peer = right.peer_id
         right.last_punch_peer = left.peer_id
+        left_local_port, right_local_port, left_port, right_port = self._select_pool_ports(
+            family,
+            pair,
+            left,
+            right,
+            left_port,
+            right_port,
+            use_local_candidates,
+        )
         left_delay_ms, right_delay_ms = self._simultaneous_open_delays_ms(left, right)
         now_ms = int(time.time() * 1000)
-        left_start = str(now_ms + left_delay_ms)
-        right_start = str(now_ms + right_delay_ms)
+        fire_after_ms = max(600, left_delay_ms + 200, right_delay_ms + 200)
+        left_extra = self._peer_new_flow_extra_ms(left) if family == "IPv4" and not use_local_candidates else 0
+        right_extra = self._peer_new_flow_extra_ms(right) if family == "IPv4" and not use_local_candidates else 0
+        left_shift = min(1200, max(0, right_extra - left_extra))
+        right_shift = min(1200, max(0, left_extra - right_extra))
+        left_start = str(now_ms + fire_after_ms + left_shift)
+        right_start = str(now_ms + fire_after_ms + right_shift)
+        LOG.info(
+            "Punch sync %s (%sms, lport=%s, rport=%s, c4=%s, rtt=%s, extra=%sms, shift=+%sms) <-> %s (%sms, lport=%s, rport=%s, c4=%s, rtt=%s, extra=%sms, shift=+%sms) base=+%sms",
+            left.peer_id,
+            left_delay_ms,
+            left_local_port,
+            left_port,
+            left.ipv4_connect_ms,
+            round(self._peer_tcp_rtt_ms(left) or 0),
+            left_extra,
+            left_shift,
+            right.peer_id,
+            right_delay_ms,
+            right_local_port,
+            right_port,
+            right.ipv4_connect_ms,
+            round(self._peer_tcp_rtt_ms(right) or 0),
+            right_extra,
+            right_shift,
+            fire_after_ms,
+        )
         # A local TCP port can participate in only one opening four-tuple at a
         # time on Android.  Coordinating overlapping pairs made each device
         # serialize them in a different order, so matching SYN windows never
@@ -667,8 +729,9 @@ class Coordinator:
         self._punch_busy_until[right_key] = lease_until
         await self.send(left.writer, "PUNCH-GO", **{
             "Peer-ID": right.peer_id, "Address": str(right_address),
-            "Port": str(right_port), "Family": family, "Start-Ms": left_start,
-            "Start-After-Ms": str(left_delay_ms),
+            "Port": str(right_port), "Local-Port": str(left_local_port),
+            "Family": family, "Start-Ms": left_start,
+            "Start-After-Ms": str(left_delay_ms + left_shift),
             "Traversal": traversal,
             "Path": "Local" if use_local_candidates else "Public",
             # Identifies the remote control-plane incarnation.  A peer can
@@ -680,12 +743,93 @@ class Coordinator:
         })
         await self.send(right.writer, "PUNCH-GO", **{
             "Peer-ID": left.peer_id, "Address": str(left_address),
-            "Port": str(left_port), "Family": family, "Start-Ms": right_start,
-            "Start-After-Ms": str(right_delay_ms),
+            "Port": str(left_port), "Local-Port": str(right_local_port),
+            "Family": family, "Start-Ms": right_start,
+            "Start-After-Ms": str(right_delay_ms + right_shift),
             "Traversal": traversal,
             "Path": "Local" if use_local_candidates else "Public",
             "Peer-Session": repr(left.connected_at),
         })
+
+    @staticmethod
+    def _parse_port_pool(raw: str | None) -> list[tuple[int, int]]:
+        if not raw:
+            return []
+        pool: list[tuple[int, int]] = []
+        for entry in raw.split(","):
+            entry = entry.strip()
+            if ":" not in entry:
+                continue
+            local_s, mapped_s = entry.split(":", 1)
+            try:
+                local_p = int(local_s)
+                mapped_p = int(mapped_s)
+            except ValueError:
+                continue
+            if 1 <= local_p <= 65535 and 1 <= mapped_p <= 65535:
+                pool.append((local_p, mapped_p))
+        return pool
+
+    def _select_pool_ports(
+        self,
+        family: str,
+        pair: tuple[str, str, str],
+        left: RegisteredPeer,
+        right: RegisteredPeer,
+        default_left_pub: int,
+        default_right_pub: int,
+        use_local_candidates: bool,
+    ) -> tuple[int, int, int, int]:
+        left_def_local = left.listen_port or 7444
+        right_def_local = right.listen_port or 7444
+        if use_local_candidates:
+            return left_def_local, right_def_local, default_left_pub, default_right_pub
+        left_pool = (left.ipv6_port_pool if family == "IPv6" else left.ipv4_port_pool) or [
+            (left_def_local, default_left_pub),
+        ]
+        right_pool = (right.ipv6_port_pool if family == "IPv6" else right.ipv4_port_pool) or [
+            (right_def_local, default_right_pub),
+        ]
+        key = (family, pair)
+        now = time.monotonic()
+        last_at = self._last_pair_punch_at.get(key, 0.0)
+        idx = self._pool_cursor.get(key, 0)
+        if last_at > 0.0 and (now - last_at) < 35.0:
+            idx = (idx + 1) % max(len(left_pool), len(right_pool))
+        elif (now - last_at) > 300.0:
+            idx = 0
+        self._pool_cursor[key] = idx
+        self._last_pair_punch_at[key] = now
+        left_local, left_pub = left_pool[idx % len(left_pool)]
+        right_local, right_pub = right_pool[idx % len(right_pool)]
+        return left_local, right_local, left_pub, right_pub
+
+    @staticmethod
+    def _peer_tcp_rtt_ms(peer: RegisteredPeer) -> float | None:
+        tcp_info_opt = getattr(socket, "TCP_INFO", None)
+        if tcp_info_opt is None:
+            return None
+        sock = peer.writer.get_extra_info("socket")
+        if sock is None:
+            return None
+        try:
+            info = sock.getsockopt(socket.IPPROTO_TCP, tcp_info_opt, 128)
+        except OSError:
+            return None
+        if len(info) < 76:
+            return None
+        rtt_us = struct.unpack_from("I", info, 68)[0]
+        return rtt_us / 1000.0 if rtt_us > 0 else None
+
+    @classmethod
+    def _peer_new_flow_extra_ms(cls, peer: RegisteredPeer) -> int:
+        if peer.ipv4_connect_ms is None:
+            return 0
+        ctrl_rtt = cls._peer_tcp_rtt_ms(peer)
+        if ctrl_rtt is None:
+            return 0
+        extra = peer.ipv4_connect_ms - round(ctrl_rtt)
+        return extra if extra > 40 else 0
 
     @staticmethod
     def _simultaneous_open_delays_ms(
