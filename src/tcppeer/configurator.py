@@ -69,7 +69,7 @@ state_db = {quote(str(state_db))}
 [runtime]
 log_level = {quote(log_level)}
 max_message_size = 16384
-keepalive_seconds = 30
+keepalive_seconds = 15
 """, state_db
 
 

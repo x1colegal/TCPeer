@@ -26,7 +26,7 @@ from tcppeer.transport import is_usable_ipv6
 
 LOG = logging.getLogger("tcppeer.coordinator")
 
-CONTROL_PONG_TIMEOUT_SECONDS = 15
+CONTROL_PONG_TIMEOUT_SECONDS = 10
 
 
 @dataclass
@@ -160,11 +160,18 @@ class Coordinator:
             auth = await read_control(reader, self.config.max_message_size)
             if auth.command == "ENDPOINT-QUERY":
                 await self.send(writer, "ENDPOINT-INFO", Address=observed_address, Port=str(observed_port))
-                # Keep the direct-port TCP mapping alive until the client has
-                # completed its simultaneous-open attempt. Closing immediately
-                # left Android's advertised TCP4 endpoint attached to a dead
-                # flow while its replacement socket was still SYN-SENT.
-                await reader.read()
+                last_pong = time.monotonic()
+
+                async def read_endpoint_query() -> None:
+                    nonlocal last_pong
+                    while True:
+                        message = await read_control(reader, self.config.max_message_size)
+                        if message.command == "PING":
+                            await self.send(writer, "PONG", **message.fields)
+                        elif message.command == "PONG":
+                            last_pong = time.monotonic()
+
+                await self._run_with_control_liveness(writer, lambda: last_pong, read_endpoint_query(), "endpoint-query")
                 return
             if auth.command != "AUTH":
                 raise ProtocolError("AUTH must be the first command")
@@ -201,36 +208,17 @@ class Coordinator:
             LOG.info("Peer %s authenticated on network %s from %s", peer_id, network, observed_address)
             await self.send(writer, "AUTH-OK", **{"Peer-ID": peer_id})
             await self.send(writer, "ENDPOINT-INFO", Address=observed_address, Port=str(observed_port))
-            while True:
-                try:
-                    message = await asyncio.wait_for(
-                        read_control(reader, self.config.max_message_size),
-                        timeout=self.config.keepalive_seconds,
-                    )
-                except TimeoutError:
-                    LOG.debug(
-                        "Peer %s idle for %ss; sending liveness probe",
-                        peer.peer_id,
-                        self.config.keepalive_seconds,
-                    )
-                    await self.send(writer, "PING")
-                    try:
-                        # Any complete authenticated control message proves the
-                        # socket is alive. Requiring PONG specifically could
-                        # discard a concurrent list/register message and is not
-                        # necessary for failure detection.
-                        message = await asyncio.wait_for(
-                            read_control(reader, self.config.max_message_size),
-                            timeout=CONTROL_PONG_TIMEOUT_SECONDS,
-                        )
-                    except TimeoutError:
-                        LOG.warning(
-                            "Peer %s liveness timeout after %ss; marking offline",
-                            peer.peer_id,
-                            CONTROL_PONG_TIMEOUT_SECONDS,
-                        )
-                        break
-                await self.handle_message(peer, message)
+            last_pong = time.monotonic()
+
+            async def read_authenticated() -> None:
+                nonlocal last_pong
+                while True:
+                    message = await read_control(reader, self.config.max_message_size)
+                    if message.command == "PONG":
+                        last_pong = time.monotonic()
+                    await self.handle_message(peer, message)
+
+            await self._run_with_control_liveness(writer, lambda: last_pong, read_authenticated(), peer.peer_id)
         except (ProtocolError, asyncio.IncompleteReadError) as exc:
             if not writer.is_closing():
                 try:
@@ -255,6 +243,59 @@ class Coordinator:
                 await writer.wait_closed()
             except ConnectionError:
                 pass
+
+    async def _run_with_control_liveness(
+        self,
+        writer: asyncio.StreamWriter,
+        get_last_pong,
+        read_coro,
+        label: str,
+    ) -> None:
+        """Run control reader alongside 15s PING and 45s-no-PONG + 10s final probe."""
+        keepalive_task = asyncio.create_task(self._control_keepalive_loop(writer))
+        liveness_task = asyncio.create_task(self._control_liveness_loop(writer, get_last_pong, label))
+        read_task = asyncio.create_task(read_coro)
+        try:
+            done, _ = await asyncio.wait(
+                {read_task, liveness_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if read_task in done:
+                read_task.result()
+        finally:
+            for task in (keepalive_task, liveness_task, read_task):
+                task.cancel()
+            await asyncio.gather(keepalive_task, liveness_task, read_task, return_exceptions=True)
+
+    async def _control_liveness_loop(
+        self,
+        writer: asyncio.StreamWriter,
+        get_last_pong,
+        label: str,
+    ) -> None:
+        idle_limit = float(self.config.keepalive_seconds) * 3.0
+        poll_interval = min(1.0, float(self.config.keepalive_seconds))
+        while not writer.is_closing():
+            await asyncio.sleep(poll_interval)
+            if time.monotonic() - get_last_pong() >= idle_limit:
+                before_probe = get_last_pong()
+                await self.send(writer, "PING")
+                await asyncio.sleep(CONTROL_PONG_TIMEOUT_SECONDS)
+                if get_last_pong() <= before_probe:
+                    LOG.warning("Peer %s PONG timeout after final probe; closing", label)
+                    writer.close()
+                    return
+
+    async def _control_keepalive_loop(self, writer: asyncio.StreamWriter) -> None:
+        """Send periodic PINGs regardless of idleness, matching data-plane keepalive."""
+        try:
+            while not writer.is_closing():
+                await asyncio.sleep(self.config.keepalive_seconds)
+                if writer.is_closing():
+                    return
+                await self.send(writer, "PING")
+        except (ConnectionError, OSError):
+            return
 
     async def handle_message(self, peer: RegisteredPeer, message: ControlMessage) -> None:
         if message.command == "REGISTER":

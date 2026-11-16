@@ -228,6 +228,10 @@ internal class OsTcpSocket internal constructor(
     }
     override fun getInetAddress(): InetAddress? = (remoteSocketAddress as? InetSocketAddress)?.address
     override fun getPort(): Int = (remoteSocketAddress as? InetSocketAddress)?.port ?: 0
+    override fun getLocalAddress(): InetAddress =
+        (localSocketAddress as? InetSocketAddress)?.address
+            ?: InetAddress.getByName(if (family == OsConstants.AF_INET6) "::" else "0.0.0.0")
+    override fun getLocalPort(): Int = (localSocketAddress as? InetSocketAddress)?.port ?: -1
     override fun isBound(): Boolean = bound
     override fun isConnected(): Boolean = connected
     override fun isClosed(): Boolean = closed

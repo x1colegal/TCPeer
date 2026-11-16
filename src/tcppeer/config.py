@@ -39,7 +39,7 @@ class CoordinatorConfig:
     networks: dict[str, str] = field(default_factory=dict)
     log_level: str = "INFO"
     max_message_size: int = 16384
-    keepalive_seconds: int = 30
+    keepalive_seconds: int = 15
     state_db: Path = Path("/var/lib/tcppeer/coordinator/state.db")
     @classmethod
     def from_file(cls, path: str | Path) -> "CoordinatorConfig":
@@ -59,7 +59,7 @@ class CoordinatorConfig:
             networks={str(k): str(v) for k, v in networks.items()},
             log_level=str(runtime.get("log_level", "INFO")).upper(),
             max_message_size=int(runtime.get("max_message_size", 16384)),
-            keepalive_seconds=int(runtime.get("keepalive_seconds", 30)),
+            keepalive_seconds=int(runtime.get("keepalive_seconds", 15)),
             state_db=Path(paths.get("state_db", "/var/lib/tcppeer/coordinator/state.db")),
         )
 

@@ -160,7 +160,7 @@ packets immediately so inner ACK, SYN, and FIN feedback is not delayed.
 TPCP liveness and TPP messages share the direct TCP stream as independent top-level ASCII messages:
 
 ```text
-TPCP/2 KEEPALIVE\r\n
+TPCP/2 PING\r\n
 \r\n
 ```
 
@@ -430,7 +430,7 @@ When a direct peer connection is established on the direct TCP port pool (`:7444
 3. Each peer sends an `AUTH-PROOF` message with the HMAC-SHA256 computed over the remote peer's nonce.
 4. Each peer verifies the remote `AUTH-PROOF`. If authentication succeeds, the direct TCP socket is adopted as the active Layer 3 tunnel.
 
-Once adopted, the direct data-plane connection additionally carries `KEEPALIVE`, `PONG`, `TPP-PING`, and `TPP-PONG` as top-level ASCII messages. Liveness messages detect expired NAT state and half-open connections; TPP messages measure the direct peer path.
+Once adopted, the direct data-plane connection additionally carries `PING`, `PONG`, `TPP-PING`, and `TPP-PONG` as top-level ASCII messages. Liveness messages detect expired NAT state and half-open connections; TPP messages measure the direct peer path.
 
 ## Data plane
 
@@ -873,8 +873,8 @@ calculates RTT from its local monotonic clock. The direct stream itself identifi
 the target peer, so TPP needs no overlay source or destination address. This also
 makes the same implementation work over both TCP4 and TCP6.
 
-`TPP-PING`/`TPP-PONG` are deliberately distinct from the Coordinator's
-`PING`/`PONG` and the data-plane `KEEPALIVE`/`PONG`: TPP produces a user-visible
+`TPP-PING`/`TPP-PONG` are deliberately distinct from the Coordinator and
+data-plane `PING`/`PONG` liveness probes: TPP produces a user-visible
 measurement, while keepalive only verifies stream liveness. The Android app and
 Linux CLI provide continuous TPP latency measurements for connected peers.
 
@@ -1478,7 +1478,7 @@ For `Simultaneous-Open` across stateful NAT/CGNATs (including `RST`-sending CGNA
 
 The sender validates the IP packet length and writes exactly that binary packet to the TCP stream. The receiver reads the first byte, selects IPv4, IPv6, or TPCP parsing, and obtains the remaining packet length from the native IP header. IPv4 `Total Length` and IPv6 `Payload Length` preserve boundaries even when TCP splits or coalesces stream segments.
 
-Top-level `TPCP/2 KEEPALIVE` messages are sent every 15 seconds and receive a top-level `TPCP/2 PONG`. TPP probes use top-level `TPCP/2 TPP-PING` and `TPCP/2 TPP-PONG`. These commands are consumed by the direct-stream protocol parser and are never written to the TUN. Unknown TPCP commands, invalid IP versions, malformed lengths, or truncated packets close the direct connection.
+Top-level `TPCP/2 PING` messages are sent every 15 seconds and receive a top-level `TPCP/2 PONG` (45 seconds without `PONG` triggers a final `PING` probe with a 10-second timeout). TPP probes use top-level `TPCP/2 TPP-PING` and `TPCP/2 TPP-PONG`. These commands are consumed by the direct-stream protocol parser and are never written to the TUN. Unknown TPCP commands, invalid IP versions, malformed lengths, or truncated packets close the direct connection.
 
 The inner IPv4 or IPv6 packet remains intact, including transport headers, checksums, and application bytes. TCPeer performs no DATA encapsulation, header conversion, or reconstruction.
 
@@ -1900,7 +1900,7 @@ end-to-end encrypted application protocols
 
 # Protocol summary
 
-The Coordinator control stream uses TPCP for authentication, discovery, endpoint registration, and simultaneous-open coordination. Direct TCP4/TCP6 streams contain raw IP packets plus top-level TPCP `KEEPALIVE`/`PONG` and `TPP-PING`/`TPP-PONG` messages.
+The Coordinator control stream uses TPCP for authentication, discovery, endpoint registration, and simultaneous-open coordination. Direct TCP4/TCP6 streams contain raw IP packets plus top-level TPCP `PING`/`PONG` and `TPP-PING`/`TPP-PONG` messages.
 
 ```text
 Coordinator <-- TPCP control --> Peer

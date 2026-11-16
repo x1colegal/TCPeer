@@ -390,7 +390,7 @@ def encode_data(packet: bytes) -> bytes:
 
 def encode_data_plane_control(command: str) -> bytes:
     """Encode a top-level TPCP liveness command for the direct stream."""
-    if command not in {"KEEPALIVE", "PONG"}:
+    if command not in {"PING", "KEEPALIVE", "PONG"}:
         raise ProtocolError("invalid data-plane TPCP command")
     return f"TPCP/2 {command}\r\n\r\n".encode("ascii")
 
@@ -697,7 +697,7 @@ def decode_data(frame: bytes) -> bytes:
     return frame
 
 
-async def read_data(reader, writer=None, activity=None, tpp=None) -> bytes:
+async def read_data(reader, writer=None, activity=None, tpp=None, pong=None) -> bytes:
     """Read raw IP packets and top-level TPCP liveness from one TCP stream."""
     while True:
         try:
@@ -749,7 +749,7 @@ async def read_data(reader, writer=None, activity=None, tpp=None) -> bytes:
                 raise ProtocolError("connection closed inside data-plane TPCP") from exc
             if len(message) > 512:
                 raise ProtocolError("data-plane TPCP message is too large")
-            if message == encode_data_plane_control("KEEPALIVE"):
+            if message in {encode_data_plane_control("PING"), encode_data_plane_control("KEEPALIVE")}:
                 if writer is not None:
                     writer.write(encode_data_plane_control("PONG"))
                     await writer.drain()
@@ -757,6 +757,8 @@ async def read_data(reader, writer=None, activity=None, tpp=None) -> bytes:
                     activity()
                 continue
             if message == encode_data_plane_control("PONG"):
+                if pong is not None:
+                    pong()
                 if activity is not None:
                     activity()
                 continue
@@ -773,6 +775,6 @@ async def read_data(reader, writer=None, activity=None, tpp=None) -> bytes:
                 if activity is not None:
                     activity()
                 continue
-            raise ProtocolError("invalid data-plane TPCP message")
+            raise ProtocolError(f"invalid data-plane TPCP message: {message[:100]!r}")
 
         raise ProtocolError(f"invalid raw IP/TPCP stream prefix: 0x{first[0]:02x}")

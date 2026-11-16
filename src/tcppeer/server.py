@@ -723,7 +723,7 @@ class Server:
                 read_control(reader), timeout=CONTROL_IDLE_SECONDS,
             )
         except TimeoutError:
-            writer.write(ControlMessage("KEEPALIVE", {}).encode())
+            writer.write(ControlMessage("PING", {}).encode())
             await writer.drain()
             try:
                 # Any valid control message confirms bidirectional liveness;
@@ -782,8 +782,9 @@ class Server:
         max_attempts: int = 15,
     ) -> tuple[str, int] | None:
         target_port = 0 if ephemeral else (bind_port if bind_port is not None else self._direct_port_for(family))
-        previous_writer = self._endpoint_mapping_writers.pop((family, target_port), None)
-        if previous_writer is not None:
+        previous_entry = self._endpoint_mapping_writers.pop((family, target_port), None)
+        if previous_entry is not None:
+            _, previous_writer = previous_entry
             _close_with_reset(previous_writer)
             await asyncio.gather(previous_writer.wait_closed(), return_exceptions=True)
         local_address = self._direct_bind_ipv6 if family == socket.AF_INET6 else self._direct_bind_ipv4
@@ -832,7 +833,7 @@ class Server:
                         port_value = int(response.get("Port") or 0)
                         if public_address(address_value) and port_value:
                             actual_local_port = int(sock.getsockname()[1])
-                            self._endpoint_mapping_writers[(family, actual_local_port)] = writer
+                            self._endpoint_mapping_writers[(family, actual_local_port)] = (reader, writer)
                             retained = True
                             LOG.info(
                                 "Keeping %s endpoint mapping alive local=%s public=%s:%s attempt=%s",
@@ -860,24 +861,45 @@ class Server:
 
     async def _endpoint_mapping_loop(self) -> None:
         """Keep NAT state entries active and refresh endpoint mappings if they close."""
-        while True:
-            await asyncio.sleep(20)
-            for (family, local_port), writer in list(self._endpoint_mapping_writers.items()):
-                try:
-                    if writer.is_closing():
-                        raise ConnectionError("mapping writer is closing")
-                    writer.write(ControlMessage("PING", {}).encode())
+        async def probe_one(
+            family: socket.AddressFamily,
+            local_port: int,
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            try:
+                if writer.is_closing():
+                    raise ConnectionError("mapping writer is closing")
+                writer.write(ControlMessage("PING", {}).encode())
+                await writer.drain()
+                reply = await asyncio.wait_for(read_control(reader), timeout=10)
+                if reply.command == "PING":
+                    writer.write(ControlMessage("PONG", dict(reply.fields)).encode())
                     await writer.drain()
-                except (ConnectionError, OSError) as exc:
-                    LOG.warning(
-                        "%s endpoint mapping lost (port=%s): %s; refreshing",
-                        "IPv6" if family == socket.AF_INET6 else "IPv4",
-                        local_port,
-                        exc,
-                    )
+                    await asyncio.wait_for(read_control(reader), timeout=10)
+            except (ConnectionError, OSError, TimeoutError, ProtocolError, asyncio.IncompleteReadError) as exc:
+                LOG.warning(
+                    "%s endpoint mapping lost (port=%s): %s; refreshing",
+                    "IPv6" if family == socket.AF_INET6 else "IPv4",
+                    local_port,
+                    exc or "liveness timeout",
+                )
+                if self._endpoint_mapping_writers.get((family, local_port)) == (reader, writer):
                     self._endpoint_mapping_writers.pop((family, local_port), None)
-                    _close_with_reset(writer)
-                    asyncio.create_task(self._refresh_endpoint_mapping(family, local_port))
+                _close_with_reset(writer)
+                asyncio.create_task(self._refresh_endpoint_mapping(family, local_port))
+
+        while True:
+            await asyncio.sleep(15)
+            entries = list(self._endpoint_mapping_writers.items())
+            if entries:
+                await asyncio.gather(
+                    *(
+                        probe_one(family, local_port, reader, writer)
+                        for (family, local_port), (reader, writer) in entries
+                    ),
+                    return_exceptions=True,
+                )
 
     async def _refresh_endpoint_mapping(self, family: socket.AddressFamily, local_port: int | None = None) -> None:
         if not self._coordinator_writer or self._coordinator_writer.is_closing():
@@ -993,8 +1015,9 @@ class Server:
                 pass
 
     async def _close_endpoint_mapping_writers(self) -> None:
-        writers = list(self._endpoint_mapping_writers.values())
+        entries = list(self._endpoint_mapping_writers.values())
         self._endpoint_mapping_writers.clear()
+        writers = [writer for _, writer in entries]
         for writer in writers:
             _close_with_reset(writer)
         if writers:
@@ -1300,10 +1323,15 @@ class Server:
         session_id = str(uuid.uuid4())
         started_at = int(time.time())
         last_data_plane_rx = time.monotonic()
+        last_data_plane_pong = time.monotonic()
 
         def mark_data_plane_rx() -> None:
             nonlocal last_data_plane_rx
             last_data_plane_rx = time.monotonic()
+
+        def mark_data_plane_pong() -> None:
+            nonlocal last_data_plane_pong
+            last_data_plane_pong = time.monotonic()
 
         def handle_tpp(command: str, identifier: int, timestamp_ns: int) -> None:
             if command != "TPP-PONG":
@@ -1315,14 +1343,14 @@ class Server:
         async def data_plane_liveness() -> None:
             while True:
                 await asyncio.sleep(1)
-                if time.monotonic() - last_data_plane_rx >= 45:
-                    probe_started_after = last_data_plane_rx
+                if time.monotonic() - last_data_plane_pong >= 45:
+                    probe_started_after = last_data_plane_pong
                     LOG.warning(
-                        "data-plane idle peer_id=%s; sending final liveness probe",
+                        "data-plane PONG missing peer_id=%s; sending final liveness probe",
                         peer_id,
                     )
                     try:
-                        writer.write(encode_data_plane_control("KEEPALIVE"))
+                        writer.write(encode_data_plane_control("PING"))
                         await writer.drain()
                     except (ConnectionError, OSError) as exc:
                         LOG.warning(
@@ -1333,9 +1361,9 @@ class Server:
                         _close_with_reset(writer)
                         return
                     await asyncio.sleep(10)
-                    if last_data_plane_rx <= probe_started_after:
+                    if last_data_plane_pong <= probe_started_after:
                         LOG.warning(
-                            "data-plane liveness timeout after final probe peer_id=%s; closing direct stream",
+                            "data-plane PONG timeout after final probe peer_id=%s; closing direct stream",
                             peer_id,
                         )
                         _close_with_reset(writer)
@@ -1345,7 +1373,7 @@ class Server:
         async def data_plane_keepalive() -> None:
             while True:
                 await asyncio.sleep(15)
-                writer.write(encode_data_plane_control("KEEPALIVE"))
+                writer.write(encode_data_plane_control("PING"))
                 await writer.drain()
 
         liveness_task = asyncio.create_task(data_plane_liveness())
@@ -1358,7 +1386,7 @@ class Server:
         try:
             await self._before_direct_data(reader, writer, peer_id)
             while True:
-                packet = await read_data(reader, writer, mark_data_plane_rx, handle_tpp)
+                packet = await read_data(reader, writer, mark_data_plane_rx, handle_tpp, pong=mark_data_plane_pong)
                 packet_count += 1
                 if packet_count == 1:
                     async with self._direct_adoption_lock:

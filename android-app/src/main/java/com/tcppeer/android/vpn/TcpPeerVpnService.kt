@@ -648,10 +648,18 @@ class TcpPeerVpnService : VpnService() {
                     controlOutput,
                     ControlMessage("PING", mapOf("T1" to System.currentTimeMillis().toString())),
                 )
-                endpointMappingSockets.values.forEach { socket ->
+                endpointMappingSockets.entries.forEach { (key, socket) ->
                     try {
                         TcpPeerProtocol.writeControl(socket.getOutputStream(), ControlMessage("PING"))
-                    } catch (_: Throwable) {
+                        socket.soTimeout = 15_000
+                        val reply = TcpPeerProtocol.readControl(socket.getInputStream())
+                        if (reply.command == "PING") {
+                            TcpPeerProtocol.writeControl(socket.getOutputStream(), ControlMessage("PONG", reply.fields))
+                            TcpPeerProtocol.readControl(socket.getInputStream())
+                        }
+                    } catch (e: Throwable) {
+                        closeQuietly(socket)
+                        endpointMappingSockets.remove(key, socket)
                     }
                 }
             }
@@ -863,14 +871,27 @@ class TcpPeerVpnService : VpnService() {
             }
             val endpointMappingKeepaliveJob = launch(Dispatchers.IO) {
                 while (isActive) {
-                    delay(20_000)
-                    endpointMappingSockets.entries.forEach { (key, socket) ->
-                        try {
-                            TcpPeerProtocol.writeControl(socket.getOutputStream(), ControlMessage("PING"))
-                        } catch (e: Throwable) {
-                            Log.w(TAG, "Endpoint mapping keepalive failed for ${familyLabel(key.first)} port=${key.second}: ${e.message}")
-                            closeQuietly(socket)
-                            endpointMappingSockets.remove(key, socket)
+                    delay(15_000)
+                    coroutineScope {
+                        endpointMappingSockets.entries.forEach { (key, socket) ->
+                            launch(Dispatchers.IO) {
+                                try {
+                                    TcpPeerProtocol.writeControl(socket.getOutputStream(), ControlMessage("PING"))
+                                    socket.soTimeout = 10_000
+                                    val reply = TcpPeerProtocol.readControl(socket.getInputStream())
+                                    if (reply.command == "PING") {
+                                        TcpPeerProtocol.writeControl(
+                                            socket.getOutputStream(),
+                                            ControlMessage("PONG", reply.fields),
+                                        )
+                                        TcpPeerProtocol.readControl(socket.getInputStream())
+                                    }
+                                } catch (e: Throwable) {
+                                    Log.w(TAG, "Endpoint mapping keepalive failed for ${familyLabel(key.first)} port=${key.second}: ${e.message}")
+                                    closeQuietly(socket)
+                                    endpointMappingSockets.remove(key, socket)
+                                }
+                            }
                         }
                     }
                 }
@@ -1075,7 +1096,7 @@ class TcpPeerVpnService : VpnService() {
                         // complete snapshot again.
                         writeCoordinatorControl(
                             controlOutput,
-                            ControlMessage("KEEPALIVE"),
+                            ControlMessage("PING"),
                         )
                         if (
                             listInProgress &&
@@ -1206,15 +1227,16 @@ class TcpPeerVpnService : VpnService() {
             socket.soTimeout = 0
             if (!adoptMeshSocket(peerId, socket, output, peerOutputs, initiated = true)) return
             val lastRx = AtomicLong(System.nanoTime())
+            val lastPong = AtomicLong(System.nanoTime())
             val liveness = serviceScope.launch(Dispatchers.IO) {
                 while (true) {
                     delay(1_000)
-                    if (System.nanoTime() - lastRx.get() >= 45_000_000_000L) {
-                        val beforeProbe = lastRx.get()
-                        Log.w(TAG, "Mesh data-plane idle peer_id=$peerId; sending final liveness probe")
+                    if (System.nanoTime() - lastPong.get() >= 45_000_000_000L) {
+                        val beforeProbe = lastPong.get()
+                        Log.w(TAG, "Mesh data-plane PONG missing peer_id=$peerId; sending final liveness probe")
                         val probe = serviceScope.launch(Dispatchers.IO) {
                             try {
-                                synchronized(output) { TcpPeerProtocol.writeDataPlaneControl(output, "KEEPALIVE") }
+                                synchronized(output) { TcpPeerProtocol.writeDataPlaneControl(output, "PING") }
                             } catch (error: Exception) {
                                 if (error is CancellationException) throw error
                                 Log.w(TAG, "Mesh final liveness probe failed peer_id=$peerId", error)
@@ -1222,8 +1244,8 @@ class TcpPeerVpnService : VpnService() {
                             }
                         }
                         delay(10_000)
-                        if (lastRx.get() <= beforeProbe) {
-                            Log.w(TAG, "Mesh data-plane TPCP keepalive timeout peer_id=$peerId after final probe")
+                        if (lastPong.get() <= beforeProbe) {
+                            Log.w(TAG, "Mesh data-plane PONG timeout peer_id=$peerId after final probe")
                             closeQuietly(socket)
                             probe.cancel()
                             return@launch
@@ -1236,7 +1258,7 @@ class TcpPeerVpnService : VpnService() {
                 try {
                     while (true) {
                         delay(15_000)
-                        synchronized(output) { TcpPeerProtocol.writeDataPlaneControl(output, "KEEPALIVE") }
+                        synchronized(output) { TcpPeerProtocol.writeDataPlaneControl(output, "PING") }
                     }
                 } catch (error: Exception) {
                     if (error is CancellationException) throw error
@@ -1247,7 +1269,7 @@ class TcpPeerVpnService : VpnService() {
             try {
                 while (true) {
                     val packet = TcpPeerProtocol.readData(
-                        input, output, { lastRx.set(System.nanoTime()) },
+                        input, output, { lastRx.set(System.nanoTime()) }, { lastPong.set(System.nanoTime()) },
                     ) { command, identifier, timestamp ->
                         handleTppControl(peerId, command, identifier)
                     }
@@ -1371,15 +1393,16 @@ class TcpPeerVpnService : VpnService() {
             socket.soTimeout = 0
             if (!adoptMeshSocket(peerId, socket, output, peerOutputs, initiated = false)) return
             val lastRx = AtomicLong(System.nanoTime())
+            val lastPong = AtomicLong(System.nanoTime())
             val liveness = serviceScope.launch(Dispatchers.IO) {
                 while (true) {
                     delay(1_000)
-                    if (System.nanoTime() - lastRx.get() >= 45_000_000_000L) {
-                        val beforeProbe = lastRx.get()
-                        Log.w(TAG, "Accepted mesh data-plane idle peer_id=$peerId; sending final liveness probe")
+                    if (System.nanoTime() - lastPong.get() >= 45_000_000_000L) {
+                        val beforeProbe = lastPong.get()
+                        Log.w(TAG, "Accepted mesh data-plane PONG missing peer_id=$peerId; sending final liveness probe")
                         val probe = serviceScope.launch(Dispatchers.IO) {
                             try {
-                                synchronized(output) { TcpPeerProtocol.writeDataPlaneControl(output, "KEEPALIVE") }
+                                synchronized(output) { TcpPeerProtocol.writeDataPlaneControl(output, "PING") }
                             } catch (error: Exception) {
                                 if (error is CancellationException) throw error
                                 Log.w(TAG, "Accepted mesh final liveness probe failed peer_id=$peerId", error)
@@ -1387,8 +1410,8 @@ class TcpPeerVpnService : VpnService() {
                             }
                         }
                         delay(10_000)
-                        if (lastRx.get() <= beforeProbe) {
-                            Log.w(TAG, "Accepted mesh data-plane TPCP keepalive timeout peer_id=$peerId after final probe")
+                        if (lastPong.get() <= beforeProbe) {
+                            Log.w(TAG, "Accepted mesh data-plane PONG timeout peer_id=$peerId after final probe")
                             closeQuietly(socket)
                             probe.cancel()
                             return@launch
@@ -1401,7 +1424,7 @@ class TcpPeerVpnService : VpnService() {
                 try {
                     while (true) {
                         delay(15_000)
-                        synchronized(output) { TcpPeerProtocol.writeDataPlaneControl(output, "KEEPALIVE") }
+                        synchronized(output) { TcpPeerProtocol.writeDataPlaneControl(output, "PING") }
                     }
                 } catch (error: Exception) {
                     if (error is CancellationException) throw error
@@ -1412,7 +1435,7 @@ class TcpPeerVpnService : VpnService() {
             try {
                 while (true) {
                     val packet = TcpPeerProtocol.readData(
-                        input, output, { lastRx.set(System.nanoTime()) },
+                        input, output, { lastRx.set(System.nanoTime()) }, { lastPong.set(System.nanoTime()) },
                     ) { command, identifier, timestamp ->
                         handleTppControl(peerId, command, identifier)
                     }
@@ -2461,15 +2484,16 @@ class TcpPeerVpnService : VpnService() {
                 }
             }
         }
+        val lastDataPlanePong = AtomicLong(System.nanoTime())
         val dataPlaneLiveness = launch(Dispatchers.IO) {
             while (true) {
                 delay(1_000)
-                if (System.nanoTime() - lastDataPlaneRx.get() >= 45_000_000_000L) {
-                    val beforeProbe = lastDataPlaneRx.get()
-                    Log.w(TAG, "Primary data-plane idle; sending final liveness probe")
+                if (System.nanoTime() - lastDataPlanePong.get() >= 45_000_000_000L) {
+                    val beforeProbe = lastDataPlanePong.get()
+                    Log.w(TAG, "Primary data-plane PONG missing; sending final liveness probe")
                     try {
                         synchronized(directOutput) {
-                            TcpPeerProtocol.writeDataPlaneControl(directOutput, "KEEPALIVE")
+                            TcpPeerProtocol.writeDataPlaneControl(directOutput, "PING")
                         }
                     } catch (error: Exception) {
                         Log.w(TAG, "Primary final liveness probe failed; closing direct stream", error)
@@ -2477,8 +2501,8 @@ class TcpPeerVpnService : VpnService() {
                         return@launch
                     }
                     delay(10_000)
-                    if (lastDataPlaneRx.get() <= beforeProbe) {
-                        Log.w(TAG, "Primary data-plane TPCP keepalive timeout after final probe; closing direct stream")
+                    if (lastDataPlanePong.get() <= beforeProbe) {
+                        Log.w(TAG, "Primary data-plane PONG timeout after final probe; closing direct stream")
                         closeQuietly(directSocket)
                         return@launch
                     }
@@ -2490,7 +2514,7 @@ class TcpPeerVpnService : VpnService() {
                 while (true) {
                     delay(15_000)
                     synchronized(directOutput) {
-                        TcpPeerProtocol.writeDataPlaneControl(directOutput, "KEEPALIVE")
+                        TcpPeerProtocol.writeDataPlaneControl(directOutput, "PING")
                     }
                 }
             } catch (error: Exception) {
@@ -2510,6 +2534,7 @@ class TcpPeerVpnService : VpnService() {
                     packet,
                     directOutput,
                     { lastDataPlaneRx.set(System.nanoTime()) },
+                    { lastDataPlanePong.set(System.nanoTime()) },
                 ) { command, identifier, timestamp ->
                     handleTppControl(primaryPeerId, command, identifier)
                 }

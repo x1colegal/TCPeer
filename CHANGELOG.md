@@ -2,6 +2,15 @@
 
 All notable changes to TCPeer are documented in this file.
 
+## [1.0-beta.113] - 2026-11-16
+
+### Fixed
+- Override `getLocalPort()` and `getLocalAddress()` in `OsTcpSocket` so all 8 `ENDPOINT-QUERY` keepalive sockets (`7444`–`7451`) register under their actual local ports instead of overwriting key `-1` and leaving `7444`–`7450` without keepalive `PING`s.
+- Reply with `PONG` to `PING` keepalives on coordinator `ENDPOINT-QUERY` connections and enforce the same `keepalive_seconds` + `CONTROL_PONG_TIMEOUT_SECONDS` (15s) liveness probe and timeout as the main control channel.
+- Read `PONG` with a 15s timeout on every `ENDPOINT-QUERY` keepalive `PING` in both the Exit Node (`server.py`) and Android (`TcpPeerVpnService.kt`), closing and refreshing dead NAT mappings immediately instead of letting receive buffers or half-open sockets linger.
+- Unify control and data-plane keepalives on `PING`/`PONG` (while continuing to accept legacy `KEEPALIVE` probes for backward compatibility).
+- Align coordinator (`AUTH` and `ENDPOINT-QUERY`) and `ENDPOINT-QUERY` keepalive timers with the data plane: `PING` every 15s, 45s without `PONG` threshold, and 10s final probe timeout.
+
 ## [1.0-beta.112] - 2026-11-16
 
 ### Fixed
