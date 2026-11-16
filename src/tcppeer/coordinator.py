@@ -731,7 +731,7 @@ class Coordinator:
             "Peer-ID": right.peer_id, "Address": str(right_address),
             "Port": str(right_port), "Local-Port": str(left_local_port),
             "Family": family, "Start-Ms": left_start,
-            "Start-After-Ms": str(left_delay_ms + left_shift),
+            "Start-After-Ms": str(max(200, fire_after_ms - 100 + left_shift)),
             "Traversal": traversal,
             "Path": "Local" if use_local_candidates else "Public",
             # Identifies the remote control-plane incarnation.  A peer can
@@ -745,7 +745,7 @@ class Coordinator:
             "Peer-ID": left.peer_id, "Address": str(left_address),
             "Port": str(left_port), "Local-Port": str(right_local_port),
             "Family": family, "Start-Ms": right_start,
-            "Start-After-Ms": str(right_delay_ms + right_shift),
+            "Start-After-Ms": str(max(200, fire_after_ms - 100 + right_shift)),
             "Traversal": traversal,
             "Path": "Local" if use_local_candidates else "Public",
             "Peer-Session": repr(left.connected_at),

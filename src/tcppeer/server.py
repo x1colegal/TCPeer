@@ -544,7 +544,7 @@ class Server:
             self._registered_port_ipv6 = int(observed.get("Port") or self.config.direct_port)
             self._ipv6_port_pool.append((self.config.direct_port, self._registered_port_ipv6))
             extra_v6 = await asyncio.gather(*(
-                self._query_observed_endpoint(socket.AF_INET6, bind_port=p, max_attempts=1)
+                self._query_observed_endpoint(socket.AF_INET6, bind_port=p, max_attempts=3)
                 for p in self._port_pool_list()[1:]
             ))
             for port, obs6 in zip(self._port_pool_list()[1:], extra_v6):
@@ -553,7 +553,7 @@ class Server:
             first_v4, *rest_v4 = await asyncio.gather(
                 self._query_observed_endpoint(socket.AF_INET, bind_port=self.config.direct_port, max_attempts=15),
                 *(
-                    self._query_observed_endpoint(socket.AF_INET, bind_port=p, max_attempts=1)
+                    self._query_observed_endpoint(socket.AF_INET, bind_port=p, max_attempts=3)
                     for p in self._port_pool_list()[1:]
                 ),
             )

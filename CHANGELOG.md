@@ -2,6 +2,12 @@
 
 All notable changes to TCPeer are documented in this file.
 
+## [1.0-beta.112] - 2026-11-16
+
+### Fixed
+- Align `Start-After-Ms` fallback timing with synchronized `Start-Ms` in the coordinator so peers without an initial clock-offset sample do not fire 200ms early against NAPT66 or CGNAT.
+- Send an immediate `PING` (`T1`) before `PUNCH-READY` on Android and retry transient `EADDRNOTAVAIL` across all 8 pool ports during endpoint discovery.
+
 ## [1.0-beta.111] - 2026-11-15
 
 ### Changed

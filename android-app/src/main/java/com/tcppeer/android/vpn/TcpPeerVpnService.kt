@@ -564,7 +564,7 @@ class TcpPeerVpnService : VpnService() {
                 endpointIpv6 = observedEndpoint
                 ipv6PortPool.add(config.directPort to observedEndpoint.port)
                 portPool.drop(1).forEach { port ->
-                    queryPublicEndpoint(config, DirectFamily.IPV6, physicalNetwork, bindPort = port, maxAttempts = 1)?.let {
+                    queryPublicEndpoint(config, DirectFamily.IPV6, physicalNetwork, bindPort = port, maxAttempts = 3)?.let {
                         ipv6PortPool.add(port to it.port)
                     }
                 }
@@ -576,7 +576,7 @@ class TcpPeerVpnService : VpnService() {
                         DirectFamily.IPV4,
                         physicalNetwork,
                         bindPort = port,
-                        maxAttempts = if (idx == 0) 12 else 1,
+                        maxAttempts = if (idx == 0) 12 else 3,
                     )?.let {
                         if (endpointIpv4 == null) endpointIpv4 = it
                         ipv4PortPool.add(port to it.port)
@@ -657,6 +657,12 @@ class TcpPeerVpnService : VpnService() {
             }
         }
         try {
+            if (coordClockOffsetMs == null) {
+                writeCoordinatorControl(
+                    controlOutput,
+                    ControlMessage("PING", mapOf("T1" to System.currentTimeMillis().toString())),
+                )
+            }
             while (true) {
                 updateConnecting("Waiting for $targetPeerId to become ready.")
                 writeCoordinatorControl(controlOutput, ControlMessage("PUNCH-READY", mapOf(
