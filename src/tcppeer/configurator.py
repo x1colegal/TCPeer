@@ -104,7 +104,7 @@ def client_text() -> tuple[str, Path]:
     use_exit_node = ask_yes_no("Route Internet and DNS through this Exit Node", False)
     direct_ipv4 = ask("Direct IPv4 address (empty auto-detects)", "")
     direct_ipv6 = ask("Direct IPv6 address (empty auto-detects)", "")
-    direct_port = int(ask("Direct TCP port", "7444"))
+    direct_port = 7444
     tun_name = ask("TUN interface", "tcppeer0")
     mtu = int(ask("MTU", "1400"))
     state_db = Path(ask("SQLite state path", "/var/lib/tcppeer/client/state.db"))
@@ -151,7 +151,7 @@ def server_text() -> tuple[str, Path]:
     secret = ask("Network secret", secret=True)
     direct_ipv4 = ask("Direct IPv4 address (empty means none)", "")
     direct_ipv6 = ask("Direct IPv6 address (empty means none)", "")
-    direct_port = int(ask("Direct TCP port", "7444"))
+    direct_port = 7444
     target_peer = ask("Preferred peer ID (empty waits for coordination)", "")
     tun_name = ask("TUN interface", "tcppeer0")
     mtu = int(ask("MTU", "1400"))

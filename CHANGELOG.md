@@ -5,8 +5,8 @@ All notable changes to TCPeer are documented in this file.
 ## [1.0-beta.111] - 2026-11-15
 
 ### Changed
-- Rename `Public IPv4` and `Public IPv6` labels on the Peers detail sheet to `Principal Public IPv4` and `Principal Public IPv6` to reflect multi-port pool connections.
-- Remove the obsolete `Direct transport port` input field from Android Settings now that direct connections manage the 8-port pool automatically.
+- Rename `Public IPv4` and `Public IPv6` labels on the Peers detail sheet to `Principal Public IPv4` and `Principal Public IPv6` to reflect multi-port pool connections, and rename `IPv4`/`IPv6` columns in `tcppeer-devices list` to `PRINCIPAL IPv4`/`PRINCIPAL IPv6`.
+- Remove the obsolete `Direct transport port` input field from Android Settings and the interactive Linux `tcppeer-configure` CLI now that direct connections manage the 8-port pool automatically.
 
 ## [1.0-beta.110] - 2026-11-15 — Big Update
 
