@@ -868,7 +868,6 @@ private fun NetworkSettingsPanel(
                 enabled = !active,
                 modifier = Modifier.fillMaxWidth(),
             )
-            SettingsField(configuration.directPort.toString(), { it.toIntOrNull()?.let { value -> onConfigurationChange(configuration.copy(directPort = value)) } }, "Direct transport port", active, true)
             SettingsField(configuration.mtu.toString(), { it.toIntOrNull()?.let { value -> onConfigurationChange(configuration.copy(mtu = value)) } }, "Tunnel MTU", active, true)
         }
     }
@@ -1137,8 +1136,8 @@ private fun DeviceCard(
                         DetailRow("Transport", device.transport)
                         DetailRow("Direct connection endpoint", formatEndpointDisplay(device.connectedUsing))
                     }
-                    DetailRow("Public IPv4", formatAddressWithPort(device.ipv4, device.ipv4Port))
-                    DetailRow("Public IPv6", formatAddressWithPort(device.ipv6, device.ipv6Port))
+                    DetailRow("Principal Public IPv4", formatAddressWithPort(device.ipv4, device.ipv4Port))
+                    DetailRow("Principal Public IPv6", formatAddressWithPort(device.ipv6, device.ipv6Port))
                     DetailRow("PeerNet IPv4", device.overlayIpv4)
                     DetailRow("PeerNet IPv6", device.overlayIpv6)
                     Row(
