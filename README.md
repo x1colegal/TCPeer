@@ -899,8 +899,8 @@ The Android interface can expose information such as:
 - Platform
 - Direct transport
 - TCP4/TCP6 state
-- Public IPv4
-- Public IPv6
+- Principal Public IPv4
+- Principal Public IPv6
 - TCPeer IPv4
 - TCPeer IPv6
 - Direct endpoint
@@ -1458,7 +1458,7 @@ Typical direct port pool (`direct_port` through `direct_port + 7`):
 7444-7451/TCP
 ```
 
-For `Simultaneous-Open` across stateful NAT/CGNATs (including `RST`-sending CGNATs and NAPT66), peers pre-open `ENDPOINT-QUERY` keepalive mappings across the 8-port pool in both `IPv4` and `IPv6`, calibrate clock offset via `PING`/`PONG` (`T1`/`T2`/`T3`/`T4` min-RTT), and compensate new-flow `IPv4-Connect-Ms` delay via synchronized `Start-Ms` / `Local-Port` coordination.
+For `Simultaneous-Open` across stateful NAT/CGNATs (including `RST`-sending CGNATs and NAPT66), peers pre-open `ENDPOINT-QUERY` keepalive mappings across the 8-port pool in both `IPv4` and stable (non-temporary, non-deprecated) `IPv6`, run unified `PING`/`PONG` liveness (`15s` periodic `PING`, `45s` without `PONG`, `10s` final probe) on both Coordinator (`AUTH` and `ENDPOINT-QUERY`) and data-plane streams, calibrate clock offset via `PING`/`PONG` (`T1`/`T2`/`T3`/`T4` min-RTT), and compensate new-flow `IPv4-Connect-Ms` delay via synchronized `Start-Ms` / `Local-Port` coordination.
 
 ## Linux client
 
@@ -1649,8 +1649,8 @@ Look for information about:
 
 - Coordinator connection
 - Endpoint registration
-- Public IPv4
-- Public IPv6
+- Principal Public IPv4
+- Principal Public IPv6
 - Direct connection attempts
 - TCP4
 - TCP6
