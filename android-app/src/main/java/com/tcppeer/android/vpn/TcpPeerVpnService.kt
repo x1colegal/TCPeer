@@ -140,6 +140,8 @@ class TcpPeerVpnService : VpnService() {
     private lateinit var connectivityManager: ConnectivityManager
     @Volatile private var underlyingNetworkSignature: String? = null
     @Volatile private var underlyingNetwork: Network? = null
+    @Volatile private var activeLocalIpv4: String? = null
+    @Volatile private var activeLocalIpv6: String? = null
     @Volatile private var physicalLanAddresses: List<ByteArray> = emptyList()
     @Volatile private var physicalLanPrefixes: List<RoutePrefix> = emptyList()
 
@@ -160,6 +162,8 @@ class TcpPeerVpnService : VpnService() {
                 } else {
                     underlyingNetwork = null
                     underlyingNetworkSignature = null
+                    activeLocalIpv4 = null
+                    activeLocalIpv6 = null
                     physicalLanAddresses = emptyList()
                     physicalLanPrefixes = emptyList()
                     true
@@ -191,9 +195,8 @@ class TcpPeerVpnService : VpnService() {
             }
             physicalLanAddresses = lanAddrs
             physicalLanPrefixes = lanPrefixList
-            val nonTempLinks = linkProperties.linkAddresses.filter { (it.flags and 0x01) == 0 }
-            val effectiveLinks = if (nonTempLinks.isNotEmpty()) nonTempLinks else linkProperties.linkAddresses
-            val addresses = effectiveLinks.map { it.address }
+            val stableLinks = linkProperties.linkAddresses.filter { (it.flags and 0x21) == 0 }
+            val addresses = stableLinks.map { it.address }
             val (ipv4, ipv6) = TransportPolicy.localAddresses(addresses)
             // Track reachability changes without treating an IPv6 privacy-IID
             // rotation as a new underlay.  Using only the Network handle left
@@ -202,21 +205,11 @@ class TcpPeerVpnService : VpnService() {
             // addresses and IPv6 network prefixes: a family/prefix appearing,
             // disappearing, or changing now forces endpoint rediscovery, while
             // a temporary address rotating inside the same prefix does not.
-            val ipv4Signature = ipv4
-                .map { it.hostAddress.orEmpty() }
-                .sorted()
-                .joinToString(",")
-            val ipv6Signature = ipv6
-                .map { it.hostAddress?.substringBefore('%').orEmpty() }
-                .sorted()
-                .joinToString(",")
-            val ipv6PrefixSignature = effectiveLinks
-                .filter { link -> ipv6.any { it == link.address } }
-                .map { link -> networkPrefixSignature(link.address, link.prefixLength) }
-                .distinct()
-                .sorted()
-                .joinToString(",")
-            val signature = "$network|v4=$ipv4Signature|v6=$ipv6Signature|p6=$ipv6PrefixSignature"
+            val ipv4Hosts = ipv4.map { it.hostAddress.orEmpty() }.filter { it.isNotEmpty() }
+            val ipv6Hosts = ipv6.map { it.hostAddress?.substringBefore('%').orEmpty() }.filter { it.isNotEmpty() }
+            val effectiveIpv4 = activeLocalIpv4?.takeIf { it in ipv4Hosts } ?: ipv4Hosts.firstOrNull().orEmpty()
+            val effectiveIpv6 = activeLocalIpv6?.takeIf { it in ipv6Hosts } ?: ipv6Hosts.firstOrNull().orEmpty()
+            val signature = "$network|v4=$effectiveIpv4|v6=$effectiveIpv6"
             val changed = synchronized(this) {
                 val previousNetwork = underlyingNetwork
                 val previous = underlyingNetworkSignature
@@ -492,15 +485,8 @@ class TcpPeerVpnService : VpnService() {
         }
         val activeLinkProperties = physicalNetwork?.let(connectivityManager::getLinkProperties)
         val allLinkAddresses = activeLinkProperties?.linkAddresses.orEmpty()
-        val nonTempLinkAddresses = allLinkAddresses.filter { (it.flags and 0x01) == 0 }
-        val effectiveLinkAddresses = if (nonTempLinkAddresses.isNotEmpty()) nonTempLinkAddresses else allLinkAddresses
-        val sortedLinkAddresses = effectiveLinkAddresses.sortedWith(
-            compareBy(
-                { (it.flags and 0x20) != 0 }, // Deprecated last (0x20 = IFA_F_DEPRECATED)
-                { (it.flags and 0x01) != 0 }, // Temporary privacy extensions after stable (0x01 = IFA_F_TEMPORARY)
-            )
-        )
-        val activeAddresses = sortedLinkAddresses.map { it.address } +
+        val stableLinkAddresses = allLinkAddresses.filter { (it.flags and 0x21) == 0 }
+        val activeAddresses = stableLinkAddresses.map { it.address } +
             TransportPolicy.clatIpv4Addresses()
         val (localIpv4, localIpv6) = TransportPolicy.localAddresses(activeAddresses)
         Log.i(
@@ -598,6 +584,8 @@ class TcpPeerVpnService : VpnService() {
                 localIpv6.firstOrNull { it.hostAddress?.substringBefore('%') == advertisedIpv6 }
                     ?: localIpv6.firstOrNull()
             } else null
+            activeLocalIpv4 = localIpv4Address?.hostAddress
+            activeLocalIpv6 = localIpv6Address?.hostAddress?.substringBefore('%')
             writeCoordinatorControl(controlOutput, ControlMessage("REGISTER", linkedMapOf(
                 "Peer-ID" to config.peerId,
                 "Device-Name" to config.deviceName,

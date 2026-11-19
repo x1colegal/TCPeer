@@ -159,18 +159,11 @@ def discover_direct_ipv6(excluded_interfaces: set[str] | None = None) -> str | N
         except ValueError:
             continue
         flags_int = int(flags, 16)
-        # Tentative/DAD-failed addresses must not be advertised or bound.
-        if flags_int & 0x48 or not is_usable_ipv6(address):
+        # Only use stable (non-temporary, non-deprecated, non-tentative/DAD-failed) IPv6.
+        if flags_int & 0x69 or not is_usable_ipv6(address):
             continue
         if name in interfaces.values():
-            # Preference ranking:
-            # 0: non-temporary (stable SLAAC/static) and non-deprecated
-            # 1: temporary (privacy extension) and non-deprecated
-            # 2: deprecated
-            is_temp = bool(flags_int & 0x01)
-            is_dep = bool(flags_int & 0x20)
-            rank = (2 if is_dep else (1 if is_temp else 0))
-            candidates.append((rank, address))
+            candidates.append((0, address))
     if candidates:
         candidates.sort(key=lambda x: x[0])
         return candidates[0][1]
@@ -515,24 +508,34 @@ class Server:
             await asyncio.sleep(1)
 
     def _discover_effective_direct_addresses(
-        self, fallback_ipv4: str | None = None,
+        self,
+        fallback_ipv4: str | None = None,
+        fallback_ipv6: str | None = None,
     ) -> tuple[str | None, str | None]:
-        """Return current physical direct IPv4/IPv6, ignoring tcppeer0 overlay routes."""
+        """Return current physical direct IPv4/IPv6, keeping active addresses while still bindable."""
         current_ipv4 = self.config.direct_ipv4 or discover_direct_ipv4({self.config.tun_name})
         current_ipv6 = self.config.direct_ipv6 or discover_direct_ipv6({self.config.tun_name})
         if (
-            getattr(self.config, "use_exit_node", False)
-            and getattr(self, "_configured", None) is not None
-            and self._configured.is_set()
-            and current_ipv4 == str(getattr(self, "_overlay_ipv4", "") or "")
+            not self.config.direct_ipv4
             and fallback_ipv4
+            and fallback_ipv4 != str(getattr(self, "_overlay_ipv4", "") or "")
             and _can_bind_local_address(fallback_ipv4, socket.AF_INET)
         ):
             current_ipv4 = fallback_ipv4
+        if (
+            not self.config.direct_ipv6
+            and fallback_ipv6
+            and fallback_ipv6 != str(getattr(self, "_overlay_ipv6", "") or "")
+            and _can_bind_local_address(fallback_ipv6, socket.AF_INET6)
+        ):
+            current_ipv6 = fallback_ipv6
         return current_ipv4, current_ipv6
 
     def _refresh_direct_bind_addresses(self) -> tuple[str | None, str | None]:
-        current_ipv4, current_ipv6 = self._discover_effective_direct_addresses(self._direct_bind_ipv4)
+        current_ipv4, current_ipv6 = self._discover_effective_direct_addresses(
+            self._direct_bind_ipv4,
+            self._direct_bind_ipv6,
+        )
         self._direct_bind_ipv4 = current_ipv4
         self._direct_bind_ipv6 = current_ipv6
         self._registered_ipv4 = public_address(current_ipv4)
@@ -545,7 +548,10 @@ class Server:
         initial_ipv6 = self._direct_bind_ipv6
         while True:
             await asyncio.sleep(5)
-            current_ipv4, current_ipv6 = self._discover_effective_direct_addresses(initial_ipv4)
+            current_ipv4, current_ipv6 = self._discover_effective_direct_addresses(
+                initial_ipv4,
+                initial_ipv6,
+            )
             if current_ipv4 != initial_ipv4 or current_ipv6 != initial_ipv6:
                 LOG.warning(
                     "Physical addresses changed IPv4=%s->%s IPv6=%s->%s; reconnecting to re-register endpoints",

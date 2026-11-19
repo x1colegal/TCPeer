@@ -2,6 +2,12 @@
 
 All notable changes to TCPeer are documented in this file.
 
+## [1.0-beta.115] - 2026-11-18
+
+### Fixed
+- Only trigger underlay address-change reconnects when the active IPv4 or stable IPv6 address actually in use by TCPeer disappears or changes, ignoring unrelated secondary addresses on the interface (both Python `server.py` and Android `TcpPeerVpnService.kt`).
+- Never fall back to temporary or deprecated IPv6 addresses during endpoint discovery; only stable IPv6 addresses are registered and used (both Python `server.py` and Android `TcpPeerVpnService.kt`).
+
 ## [1.0-beta.114] - 2026-11-18
 
 ### Fixed
