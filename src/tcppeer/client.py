@@ -10,6 +10,7 @@ import logging
 import socket
 import subprocess
 import sys
+from collections import deque
 from pathlib import Path
 
 if __package__ in {None, ""}:
@@ -69,6 +70,16 @@ class Client(Server):
         self._peer_send_tasks = {}
         self._tun_receive_queue = asyncio.Queue(maxsize=4096)
         self._tasks = set()
+        self._coord_clock_samples: deque[tuple[int, int]] = deque(maxlen=8)
+        self._coord_clock_offset_ms: int | None = None
+        self._ipv4_connect_ms: int | None = None
+        self._active_direct_ports: dict[socket.AddressFamily, int] = {
+            socket.AF_INET: config.direct_port,
+            socket.AF_INET6: config.direct_port,
+        }
+        self._family_listeners: dict[socket.AddressFamily, asyncio.AbstractServer] = {}
+        self._port_rotate_lock = asyncio.Lock()
+        self._last_port_rotate_at: dict[socket.AddressFamily, float] = {}
         self._listeners = []
         self._direct_bind_ipv4 = config.direct_ipv4 or discover_direct_ipv4({config.tun_name})
         self._direct_bind_ipv6 = config.direct_ipv6 or discover_direct_ipv6({config.tun_name})
@@ -91,7 +102,9 @@ class Client(Server):
         self._direct_attempt_counter = 0
         self._byte_counters = {}
         self._coordinator_writer = None
-        self._endpoint_mapping_writers: dict[socket.AddressFamily, object] = {}
+        self._endpoint_mapping_writers: dict[tuple[socket.AddressFamily, int], object] = {}
+        self._ipv4_port_pool: list[tuple[int, int]] = []
+        self._ipv6_port_pool: list[tuple[int, int]] = []
         self._registration_complete = asyncio.Event()
         self._pending_tpp_pings = {}
         self._active_server_ipv6 = ipaddress.IPv6Address("::")
@@ -112,15 +125,29 @@ class Client(Server):
         return str(self._overlay_ipv4 or ""), str(self._overlay_ipv6 or "")
 
     async def _query_observed_endpoint(
-        self, family: socket.AddressFamily,
+        self,
+        family: socket.AddressFamily,
+        *,
+        ephemeral: bool = False,
+        bind_port: int | None = None,
+        max_attempts: int = 15,
     ) -> tuple[str, int] | None:
         """Discover NAPT endpoints without colliding with the punch socket."""
-        reserved = self._direct_candidates.pop(family, None)
-        if reserved is not None:
-            reserved.close()
+        uses_primary_port = not ephemeral and (bind_port is None or bind_port == self.config.direct_port)
+        if uses_primary_port:
+            reserved = self._direct_candidates.pop(family, None)
+            if reserved is not None:
+                reserved.close()
         try:
-            return await super()._query_observed_endpoint(family)
+            return await super()._query_observed_endpoint(
+                family,
+                ephemeral=ephemeral,
+                bind_port=bind_port,
+                max_attempts=max_attempts,
+            )
         finally:
+            if not uses_primary_port:
+                return
             local_address = (
                 self._direct_bind_ipv6 if family == socket.AF_INET6
                 else self._direct_bind_ipv4
