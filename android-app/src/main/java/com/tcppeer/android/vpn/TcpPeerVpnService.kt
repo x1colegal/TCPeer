@@ -206,17 +206,17 @@ class TcpPeerVpnService : VpnService() {
                 .map { it.hostAddress.orEmpty() }
                 .sorted()
                 .joinToString(",")
+            val ipv6Signature = ipv6
+                .map { it.hostAddress?.substringBefore('%').orEmpty() }
+                .sorted()
+                .joinToString(",")
             val ipv6PrefixSignature = effectiveLinks
                 .filter { link -> ipv6.any { it == link.address } }
                 .map { link -> networkPrefixSignature(link.address, link.prefixLength) }
                 .distinct()
                 .sorted()
                 .joinToString(",")
-            val signature = "$network|v4=$ipv4Signature|v6=$ipv6PrefixSignature"
-            val established = TcpPeerRuntime.state.value.status in setOf(
-                ConnectionStatus.TCP4_DIRECT,
-                ConnectionStatus.TCP6_DIRECT,
-            )
+            val signature = "$network|v4=$ipv4Signature|v6=$ipv6Signature|p6=$ipv6PrefixSignature"
             val changed = synchronized(this) {
                 val previousNetwork = underlyingNetwork
                 val previous = underlyingNetworkSignature
@@ -227,7 +227,7 @@ class TcpPeerVpnService : VpnService() {
                 } else if (previousNetwork != network) {
                     true
                 } else {
-                    previous != null && previous != signature && established
+                    previous != null && previous != signature
                 }
             }
             if (tunnel != null) {

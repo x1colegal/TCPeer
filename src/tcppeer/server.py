@@ -124,6 +124,20 @@ def discover_direct_ipv4(excluded_interfaces: set[str] | None = None) -> str | N
     return None
 
 
+def _can_bind_local_address(address: str | None, family: socket.AddressFamily) -> bool:
+    """Return whether an address still belongs to this host."""
+    if not address:
+        return False
+    probe = socket.socket(family, socket.SOCK_STREAM, socket.IPPROTO_TCP)
+    try:
+        probe.bind((address, 0))
+        return True
+    except OSError:
+        return False
+    finally:
+        probe.close()
+
+
 def discover_direct_ipv6(excluded_interfaces: set[str] | None = None) -> str | None:
     """Find a usable IPv6 address on an active physical interface, preferring non-temporary addresses."""
     excluded = excluded_interfaces or set()
@@ -248,7 +262,7 @@ class Server:
         self._last_port_rotate_at: dict[socket.AddressFamily, float] = {}
         self._listeners: list[asyncio.AbstractServer] = []
         self._direct_bind_ipv4 = config.direct_ipv4 or discover_direct_ipv4({config.tun_name})
-        self._direct_bind_ipv6 = config.direct_ipv6
+        self._direct_bind_ipv6 = config.direct_ipv6 or discover_direct_ipv6({config.tun_name})
         self._registered_ipv4 = public_address(self._direct_bind_ipv4)
         self._registered_ipv6 = public_address(config.direct_ipv6)
         self._registered_port_ipv4: int | None = config.direct_port if self._registered_ipv4 else None
@@ -324,6 +338,7 @@ class Server:
                 asyncio.create_task(self._ra_loop(), name="router-advertisement"),
                 asyncio.create_task(self._statistics_loop(), name="statistics"),
                 asyncio.create_task(self._pd_loop(), name="prefix-delegation"),
+                asyncio.create_task(self._address_change_loop(), name="address-change"),
                 asyncio.create_task(self._endpoint_mapping_loop(), name="endpoint-mapping"),
             }
             done, pending = await asyncio.wait(self._tasks, return_when=asyncio.FIRST_EXCEPTION)
@@ -499,7 +514,48 @@ class Server:
                 await self._close_endpoint_mapping_writers()
             await asyncio.sleep(1)
 
+    def _discover_effective_direct_addresses(
+        self, fallback_ipv4: str | None = None,
+    ) -> tuple[str | None, str | None]:
+        """Return current physical direct IPv4/IPv6, ignoring tcppeer0 overlay routes."""
+        current_ipv4 = self.config.direct_ipv4 or discover_direct_ipv4({self.config.tun_name})
+        current_ipv6 = self.config.direct_ipv6 or discover_direct_ipv6({self.config.tun_name})
+        if (
+            getattr(self.config, "use_exit_node", False)
+            and getattr(self, "_configured", None) is not None
+            and self._configured.is_set()
+            and current_ipv4 == str(getattr(self, "_overlay_ipv4", "") or "")
+            and fallback_ipv4
+            and _can_bind_local_address(fallback_ipv4, socket.AF_INET)
+        ):
+            current_ipv4 = fallback_ipv4
+        return current_ipv4, current_ipv6
+
+    def _refresh_direct_bind_addresses(self) -> tuple[str | None, str | None]:
+        current_ipv4, current_ipv6 = self._discover_effective_direct_addresses(self._direct_bind_ipv4)
+        self._direct_bind_ipv4 = current_ipv4
+        self._direct_bind_ipv6 = current_ipv6
+        self._registered_ipv4 = public_address(current_ipv4)
+        self._registered_port_ipv4 = self._direct_port_for(socket.AF_INET) if self._registered_ipv4 else None
+        return current_ipv4, current_ipv6
+
+    async def _address_change_loop(self) -> None:
+        """Reconnect when a usable physical address appears or changes."""
+        initial_ipv4 = self._direct_bind_ipv4
+        initial_ipv6 = self._direct_bind_ipv6
+        while True:
+            await asyncio.sleep(5)
+            current_ipv4, current_ipv6 = self._discover_effective_direct_addresses(initial_ipv4)
+            if current_ipv4 != initial_ipv4 or current_ipv6 != initial_ipv6:
+                LOG.warning(
+                    "Physical addresses changed IPv4=%s->%s IPv6=%s->%s; reconnecting to re-register endpoints",
+                    initial_ipv4 or "none", current_ipv4 or "none",
+                    initial_ipv6 or "none", current_ipv6 or "none",
+                )
+                raise ConnectionError("physical direct addresses changed")
+
     async def _control_session(self) -> None:
+        self._refresh_direct_bind_addresses()
         reader, writer = await self._open_coordinator_connection()
         self._coordinator_writer = writer
         writer.write(ControlMessage("AUTH", {

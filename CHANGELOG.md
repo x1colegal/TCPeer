@@ -2,6 +2,12 @@
 
 All notable changes to TCPeer are documented in this file.
 
+## [1.0-beta.114] - 2026-11-18
+
+### Fixed
+- Detect physical IPv4 and stable IPv6 address changes on the Exit Node (`server.py`) as well as the Linux client (`client.py`), and refresh `_direct_bind_ipv4`/`_direct_bind_ipv6` on every coordinator reconnect so updated local addresses and newly mapped public ports are always advertised.
+- Include exact non-temporary (stable) IPv6 addresses in Android's `handleUnderlyingNetwork` signature and trigger endpoint rediscovery whenever stable local IPv4/IPv6 addresses change, even within the same `/64` prefix or before direct connection adoption.
+
 ## [1.0-beta.113] - 2026-11-16
 
 ### Fixed

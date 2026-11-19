@@ -35,20 +35,6 @@ from tcppeer.tun import TunDevice
 LOG = logging.getLogger("tcppeer.client")
 
 
-def _can_bind_local_address(address: str | None, family: socket.AddressFamily) -> bool:
-    """Return whether an address still belongs to this host."""
-    if not address:
-        return False
-    probe = socket.socket(family, socket.SOCK_STREAM, socket.IPPROTO_TCP)
-    try:
-        probe.bind((address, 0))
-        return True
-    except OSError:
-        return False
-    finally:
-        probe.close()
-
-
 class Client(Server):
     """A non-routing Linux peer; coordinator stays control-only and peers stay direct."""
 
@@ -218,34 +204,6 @@ class Client(Server):
             self.host_isolation.close()
             self._flush_byte_counters()
             self.store.close()
-
-    async def _address_change_loop(self) -> None:
-        """Reconnect when a usable physical address appears or changes."""
-        initial_ipv4 = self._direct_bind_ipv4
-        initial_ipv6 = self._direct_bind_ipv6
-        while True:
-            await asyncio.sleep(5)
-            current_ipv4 = self.config.direct_ipv4 or discover_direct_ipv4({self.config.tun_name})
-            current_ipv6 = self.config.direct_ipv6 or discover_direct_ipv6({self.config.tun_name})
-            # With an Exit Node active, the kernel's IPv4 route probe correctly
-            # selects tcppeer0. That is the VPN overlay, not a physical-address
-            # change. Keep tracking the original underlay source while it is
-            # still locally bindable; a vanished address still triggers the
-            # normal reconnect path below.
-            if (
-                self.config.use_exit_node
-                and self._configured.is_set()
-                and current_ipv4 == str(self._overlay_ipv4 or "")
-                and _can_bind_local_address(initial_ipv4, socket.AF_INET)
-            ):
-                current_ipv4 = initial_ipv4
-            if current_ipv4 != initial_ipv4 or current_ipv6 != initial_ipv6:
-                LOG.warning(
-                    "Physical addresses changed IPv4=%s->%s IPv6=%s->%s; reconnecting to re-register endpoints",
-                    initial_ipv4 or "none", current_ipv4 or "none",
-                    initial_ipv6 or "none", current_ipv6 or "none",
-                )
-                raise ConnectionError("physical direct addresses changed")
 
     async def _before_direct_data(self, reader, writer, peer_id: str) -> None:
         if peer_id != self.config.target_peer or self._configured.is_set():
