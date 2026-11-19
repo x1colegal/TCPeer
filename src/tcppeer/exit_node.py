@@ -91,19 +91,15 @@ class HostIpv6Isolation:
                     "counter drop\n"
                 )
         if overlay_address is not None:
-            prefix_set = ", ".join(str(prefix) for prefix in prefixes)
-            if prefix_set:
-                drop += (
-                    f"    ip6 saddr {{ {prefix_set} }} ip6 daddr {overlay_address} "
-                    "counter drop\n"
-                )
+            drop += (
+                f'    iifname != "{self.interface}" iifname != "lo" ip6 daddr {overlay_address} '
+                "counter drop\n"
+            )
         if overlay_prefix is not None:
-            prefix_set = ", ".join(str(prefix) for prefix in prefixes)
-            if prefix_set:
-                drop += (
-                    f"    ip6 saddr {{ {prefix_set} }} ip6 daddr {overlay_prefix} "
-                    "counter drop\n"
-                )
+            drop += (
+                f'    iifname != "{self.interface}" iifname != "lo" ip6 daddr {overlay_prefix} '
+                "counter drop\n"
+            )
         rules = f'''table inet tcppeer_input {{
   chain input {{
     type filter hook input priority filter; policy accept;
@@ -207,18 +203,15 @@ class ExitNodeFirewall:
         if local_ipv6_addresses:
             addresses = ", ".join(str(address) for address in local_ipv6_addresses)
             local_input_drop = f'    iifname "{tun}" ip6 daddr {{ {addresses} }} counter drop\n'
-        overlay_input_drop = ""
-        if lan_ipv6_prefixes:
-            prefixes = ", ".join(str(prefix) for prefix in lan_ipv6_prefixes)
-            overlay_input_drop = (
-                f"    ip6 saddr {{ {prefixes} }} ip6 daddr "
-                f"{self.ipv6_overlay_address} counter drop\n"
+        overlay_input_drop = (
+            f'    iifname != "{tun}" iifname != "lo" ip6 daddr '
+            f"{self.ipv6_overlay_address} counter drop\n"
+        )
+        if self.ipv6_overlay_prefix is not None:
+            overlay_input_drop += (
+                f'    iifname != "{tun}" iifname != "lo" ip6 daddr '
+                f"{self.ipv6_overlay_prefix} counter drop\n"
             )
-            if self.ipv6_overlay_prefix is not None:
-                overlay_input_drop += (
-                    f"    ip6 saddr {{ {prefixes} }} ip6 daddr "
-                    f"{self.ipv6_overlay_prefix} counter drop\n"
-                )
         flowtable = ""
         flow_rules = ""
         if upstream:
