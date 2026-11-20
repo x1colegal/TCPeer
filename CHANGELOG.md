@@ -2,6 +2,18 @@
 
 All notable changes to TCPeer are documented in this file.
 
+## [1.0-beta.117] - 2026-11-20
+
+### Changed
+- Remove the `Security note` card from the Android Home screen and replace overly verbose/`yet` status messages with concise PeerNet/TCP4/TCP6 connection status strings (`MainActivity.kt`, `TcpPeerRuntime.kt`, `TcpPeerVpnService.kt`).
+
+## [1.0-beta.116] - 2026-11-20
+
+### Fixed
+- Allow a bounded 2-second retry window with 15–75 ms jitter after `ConnectionRefusedError` / `ConnectException` (`TCP RST`) during simultaneous open (`transport.py`, `TcpPeerVpnService.kt`), fixing LTE IPv6 and CGNAT early-SYN `RST` races while still failing fast on dead ports.
+- Disable automatic IPv6 link-local (`fe80::`) address generation on Linux TUN interfaces via `addrgenmode none` and flush `scope link` addresses (`tun.py`), and advertise the Exit Node's GUA/ULA (`_active_server_ipv6`) instead of `fe80::1` in Router Advertisements (`server.py`, `ra.py`).
+- Harden `HostIpv6Isolation` and `ExitNodeFirewall` (`exit_node.py`) to drop all non-TUN, non-loopback ingress destined to PeerNet IPv6 addresses (`iifname != "tcppeer0" iifname != "lo"`), blocking both LAN and internet ingress.
+
 ## [1.0-beta.115] - 2026-11-18
 
 ### Fixed
