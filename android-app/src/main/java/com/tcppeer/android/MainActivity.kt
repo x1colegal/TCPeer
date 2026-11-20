@@ -391,12 +391,6 @@ private fun HomeTab(
                 }
             }
         }
-        item {
-            InfoCard(
-                title = "Security note",
-                body = "Only the Secret Key proof is protected today. The direct transport and VPN payload are still not confidential yet.",
-            )
-        }
     }
 }
 
@@ -1402,16 +1396,17 @@ private fun formatDuration(seconds: Long): String {
 }
 
 private fun String.toFriendlyRuntimeDetail(): String = when {
-    isBlank() -> "TCPeer is waiting for the next connection update."
-    contains("connectivity, not confidentiality", ignoreCase = true) ->
-        "TCPeer is ready to connect. It gives you PeerNet connectivity, but not traffic confidentiality yet."
+    isBlank() -> "Waiting for connection state update."
+    contains("Ready to connect", ignoreCase = true) ||
+        contains("connectivity, not confidentiality", ignoreCase = true) ->
+        "Ready to connect to your PeerNet."
     contains("coordinator", ignoreCase = true) && contains("auth", ignoreCase = true) ->
-        "TCPeer is talking to the coordinator and authenticating this peer before the direct session comes up."
+        "Authenticating with coordinator and discovering endpoints."
     contains("waiting", ignoreCase = true) ->
-        "TCPeer is waiting for the selected peer to become ready for the direct connection."
+        "Waiting for peer readiness to start direct punch."
     contains("retry", ignoreCase = true) && contains("direct", ignoreCase = true) ->
-        "The direct path did not open yet, so TCPeer is retrying the peer-to-peer connection."
+        "Direct punch timed out; retrying peer-to-peer connection."
     contains("lost", ignoreCase = true) && contains("reconnect", ignoreCase = true) ->
-        "The active connection was lost, so TCPeer is reconnecting on the current network."
+        "Connection lost; reconnecting on active network."
     else -> this
 }

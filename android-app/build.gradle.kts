@@ -15,8 +15,8 @@ android {
         applicationId = "com.tcppeer.android"
         minSdk = 23
         targetSdk = 36
-        versionCode = 118
-        versionName = "1.0-beta.116"
+        versionCode = 119
+        versionName = "1.0-beta.117"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

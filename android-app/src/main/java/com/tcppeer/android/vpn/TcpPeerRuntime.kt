@@ -42,7 +42,7 @@ data class VpnRuntimeState(
     val rxBytes: Long = 0,
     val txBytes: Long = 0,
     val connectedAtMillis: Long? = null,
-    val detail: String = "TCPeer provides connectivity, not confidentiality.",
+    val detail: String = "Ready to connect to your PeerNet.",
     val devices: List<NetworkDevice> = emptyList(),
     val activePingPeerId: String? = null,
     val pingStartedAtMillis: Long? = null,

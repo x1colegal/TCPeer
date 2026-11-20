@@ -337,7 +337,7 @@ class TcpPeerVpnService : VpnService() {
         showForeground(ConnectionStatus.CONNECTING)
         TcpPeerRuntime.replace(VpnRuntimeState(
             status = ConnectionStatus.CONNECTING,
-            detail = "Authenticating with the coordinator over cleartext TCP.",
+            detail = "Authenticating with coordinator and discovering endpoints.",
         ))
         connectionJob = serviceScope.launch {
             try {
@@ -501,7 +501,7 @@ class TcpPeerVpnService : VpnService() {
         val controlInput = coordinator.getInputStream()
         val controlOutput = coordinator.getOutputStream()
 
-        updateConnecting("Authenticating with the coordinator over cleartext TCP.")
+        updateConnecting("Authenticating with coordinator and discovering endpoints.")
         writeCoordinatorControl(controlOutput, ControlMessage("AUTH", linkedMapOf(
             "Network" to config.network,
             "Peer-ID" to config.peerId,
@@ -801,7 +801,7 @@ class TcpPeerVpnService : VpnService() {
             overlayIpv4 = addresses.first.address.hostAddress ?: "-",
             overlayIpv6 = addresses.second.address.hostAddress ?: "-",
             connectedAtMillis = System.currentTimeMillis(),
-            detail = "Direct cleartext TCP connection. No relay and no encryption.",
+            detail = "Direct ${if (family == DirectFamily.IPV6) "TCP6" else "TCP4"} peer-to-peer tunnel active.",
         ) }
         updateNotification(status)
 
