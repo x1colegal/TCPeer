@@ -31,10 +31,12 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -1231,13 +1233,14 @@ private fun TppPingSheet(
     ModalBottomSheet(
         onDismissRequest = onClose,
         sheetState = sheetState,
+        contentWindowInsets = { WindowInsets(0, 0, 0, 0) },
     ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .fillMaxHeight(0.72f)
                 .verticalScroll(rememberScrollState())
-                .padding(start = 20.dp, end = 20.dp, bottom = 24.dp),
+                .navigationBarsPadding()
+                .padding(start = 20.dp, end = 20.dp, bottom = 12.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
             Column {
@@ -1403,7 +1406,7 @@ private fun String.toFriendlyRuntimeDetail(): String = when {
     contains("coordinator", ignoreCase = true) && contains("auth", ignoreCase = true) ->
         "Authenticating with coordinator and discovering endpoints."
     contains("waiting", ignoreCase = true) ->
-        "Waiting for peer readiness to start direct punch."
+        "Waiting for peer to be ready for direct punch."
     contains("retry", ignoreCase = true) && contains("direct", ignoreCase = true) ->
         "Direct punch timed out; retrying peer-to-peer connection."
     contains("lost", ignoreCase = true) && contains("reconnect", ignoreCase = true) ->

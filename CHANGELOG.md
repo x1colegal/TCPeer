@@ -2,6 +2,11 @@
 
 All notable changes to TCPeer are documented in this file.
 
+## [1.0-beta.118] - 2026-11-20
+
+### Changed
+- Size the `TppPingSheet` bottom sheet dynamically to its content without extra bottom window-inset padding below the Stop button, scrolling only when content reaches the screen height, and replace `"peer readiness"` wording with `"peer to be ready"` (`MainActivity.kt`).
+
 ## [1.0-beta.117] - 2026-11-20
 
 ### Changed
