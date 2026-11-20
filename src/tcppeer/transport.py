@@ -122,6 +122,7 @@ class DirectConnector:
         # stopped punching.  End just before the lease expires so the next
         # PUNCH-GO can create a fresh, synchronized attempt.
         deadline = loop.time() + self.retry_window
+        first_refused_at: float | None = None
         last_exc = None
 
         while loop.time() < deadline:
@@ -253,7 +254,13 @@ class DirectConnector:
                 sock.close()
 
                 if isinstance(exc, ConnectionRefusedError):
-                    break
+                    now = loop.time()
+                    if first_refused_at is None:
+                        first_refused_at = now
+                    elif now - first_refused_at >= 2.0:
+                        break
+                else:
+                    first_refused_at = None
 
                 if prebound_socket is not None:
                     if self._retry_without_prebound(exc):

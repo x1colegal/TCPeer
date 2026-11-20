@@ -2003,6 +2003,7 @@ class TcpPeerVpnService : VpnService() {
     ): Socket {
         val deadline = android.os.SystemClock.elapsedRealtime() + 12_000L
         var attempt = 0
+        var firstRefusedAtMs: Long? = null
         var lastError: Exception? = null
         while (android.os.SystemClock.elapsedRealtime() < deadline) {
             currentCoroutineContext().ensureActive()
@@ -2072,7 +2073,13 @@ class TcpPeerVpnService : VpnService() {
                 inFlightSockets.remove(socket)
                 socket.close()
                 if (error is ConnectException) {
-                    break
+                    val nowMs = android.os.SystemClock.elapsedRealtime()
+                    val refusedSince = firstRefusedAtMs ?: nowMs.also { firstRefusedAtMs = it }
+                    if (nowMs - refusedSince >= 2_000L) {
+                        break
+                    }
+                } else {
+                    firstRefusedAtMs = null
                 }
                 if (android.os.SystemClock.elapsedRealtime() < deadline) {
                     // A fixed delay on both peers can phase-lock fast RST/

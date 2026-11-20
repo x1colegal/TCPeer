@@ -28,7 +28,7 @@ from tcppeer.dns import discover_upstream_dns
 from tcppeer.exit_node import ExitNodeFirewall
 from tcppeer.packet import build_dhcp_packet, build_tcp_reset, extract_dhcp_payload
 from tcppeer.protocol import ControlMessage, ProtocolError, encode_data, encode_data_plane_control, encode_tpp_control, read_control, read_data
-from tcppeer.ra import ALL_NODES, LINK_LOCAL_ROUTER, build_router_advertisement, ipv6_source, is_router_solicitation
+from tcppeer.ra import ALL_NODES, build_router_advertisement, ipv6_source, is_router_solicitation
 from tcppeer.pd import PrefixDelegationClient, discover_ipv6_upstream, router_address, slaac_subnet
 from tcppeer.state import StateStore
 from tcppeer.transport import (
@@ -2137,7 +2137,7 @@ class Server:
 
     def _ra_packet(self, destination: ipaddress.IPv6Address = ALL_NODES) -> bytes:
         return build_router_advertisement(
-            LINK_LOCAL_ROUTER,
+            self._active_server_ipv6,
             self._active_ipv6_prefix,
             self.config.router_lifetime_seconds,
             self.config.preferred_lifetime_seconds,

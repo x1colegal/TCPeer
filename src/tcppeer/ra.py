@@ -9,7 +9,6 @@ from typing import Iterable
 ICMPV6_ROUTER_ADVERTISEMENT = 134
 IPPROTO_ICMPV6 = 58
 ALL_NODES = ipaddress.ip_address("ff02::1")
-LINK_LOCAL_ROUTER = ipaddress.ip_address("fe80::1")
 
 
 def internet_checksum(data: bytes) -> int:

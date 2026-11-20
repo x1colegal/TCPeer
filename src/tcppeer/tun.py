@@ -40,6 +40,7 @@ class TunDevice:
             raise TunError("TUN interface is not open")
         commands = (
             ("ip", "link", "set", "dev", self.name, "mtu", str(self.mtu)),
+            ("ip", "link", "set", "dev", self.name, "addrgenmode", "none"),
             ("ip", "address", "replace", f"{ipv4}/{ipv4_prefix}", "dev", self.name),
             ("ip", "-6", "address", "replace", f"{ipv6}/{ipv6_prefix}", "dev", self.name),
             ("ip", "link", "set", "dev", self.name, "up"),
@@ -49,6 +50,12 @@ class TunDevice:
                 subprocess.run(command, check=True, capture_output=True, text=True)
             except (OSError, subprocess.CalledProcessError) as exc:
                 raise TunError(f"failed to configure {self.name}: {exc}") from exc
+        subprocess.run(
+            ("ip", "-6", "address", "flush", "dev", self.name, "scope", "link"),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
 
     def remove_address(self, address: str, prefix: int) -> None:
         """Remove a previously negotiated address before its replacement."""
