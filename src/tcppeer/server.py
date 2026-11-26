@@ -272,6 +272,7 @@ class Server:
         self._direct_attempt_counter = 0
         self._byte_counters: dict[tuple[str, str], int] = {}
         self._coordinator_writer = None
+        self._pending_coordinator_connection: tuple[asyncio.StreamReader, asyncio.StreamWriter] | None = None
         # A coordinator connection for the preferred family owns that family's
         # observed NAT mapping.  The auxiliary ENDPOINT-QUERY connection must
         # likewise stay open: closing a TCP flow can make a NAPT immediately
@@ -542,8 +543,12 @@ class Server:
         self._registered_port_ipv4 = self._direct_port_for(socket.AF_INET) if self._registered_ipv4 else None
         return current_ipv4, current_ipv6
 
-    async def _can_reach_coordinator_ipv6(self, local_ipv6: str) -> bool:
-        """Probe whether the coordinator is reachable over IPv6 without touching :7444."""
+    async def _open_coordinator_ipv6_connection(
+        self,
+        local_ipv6: str,
+        timeout: float = 2.0,
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter] | None:
+        """Try opening the main IPv6 coordinator connection on :7444 without closing it on success."""
         loop = asyncio.get_running_loop()
         try:
             results = await resolve_tcp_endpoints(
@@ -551,22 +556,30 @@ class Server:
                 self.config.coordinator_port,
             )
         except OSError:
-            return False
+            return None
         for candidate_family, socktype, protocol, _name, address in results:
             if candidate_family != socket.AF_INET6:
                 continue
             sock = socket.socket(candidate_family, socktype, protocol)
             set_ipv6_prefer_public(sock)
             sock.setblocking(False)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if hasattr(socket, "SO_REUSEPORT"):
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
             try:
-                sock.bind((local_ipv6, 0))
-                await asyncio.wait_for(loop.sock_connect(sock, address), timeout=2.0)
-                return True
+                sock.bind((local_ipv6, self.config.direct_port))
+                await asyncio.wait_for(loop.sock_connect(sock, address), timeout=timeout)
+                selected_address = str(sock.getsockname()[0]).split("%", 1)[0]
+                if is_usable_ipv6(selected_address):
+                    self._direct_bind_ipv6 = selected_address
+                reader, writer = await asyncio.open_connection(sock=sock)
+                transport_socket = writer.get_extra_info("socket")
+                if transport_socket is not None:
+                    transport_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 0)
+                return reader, writer
             except (OSError, asyncio.TimeoutError):
-                pass
-            finally:
                 sock.close()
-        return False
+        return None
 
     async def _address_change_loop(self) -> None:
         """Reconnect when a usable physical address appears or changes."""
@@ -585,13 +598,22 @@ class Server:
                     initial_ipv6 or "none", current_ipv6 or "none",
                 )
                 raise ConnectionError("physical direct addresses changed")
-            if current_ipv6 and not self._registered_ipv6:
-                if await self._can_reach_coordinator_ipv6(current_ipv6):
+            if (
+                current_ipv6
+                and not self._registered_ipv6
+                and self._pending_coordinator_connection is None
+            ):
+                opened = await self._open_coordinator_ipv6_connection(current_ipv6)
+                if opened is not None:
                     LOG.warning(
-                        "Coordinator IPv6 reachable again (local=%s); reconnecting to register IPv6",
+                        "Coordinator IPv6 connected on :%s (local=%s); switching control session to IPv6",
+                        self.config.direct_port,
                         current_ipv6,
                     )
-                    raise ConnectionError("coordinator IPv6 reachable again")
+                    self._pending_coordinator_connection = opened
+                    writer = self._coordinator_writer
+                    if writer is not None:
+                        _close_with_reset(writer)
 
     async def _control_session(self) -> None:
         self._refresh_direct_bind_addresses()
@@ -1123,6 +1145,10 @@ class Server:
 
     async def _open_coordinator_connection(self):
         """Use the direct local TCP port so the observed mapping is relevant."""
+        pending = self._pending_coordinator_connection
+        if pending is not None:
+            self._pending_coordinator_connection = None
+            return pending
         loop = asyncio.get_running_loop()
         results = await resolve_tcp_endpoints(
             self.config.coordinator_address,
