@@ -601,7 +601,7 @@ class Server:
             if (
                 current_ipv6
                 and not self._registered_ipv6
-                and self._pending_coordinator_connection is None
+                and getattr(self, "_pending_coordinator_connection", None) is None
             ):
                 opened = await self._open_coordinator_ipv6_connection(current_ipv6)
                 if opened is not None:
@@ -1145,7 +1145,7 @@ class Server:
 
     async def _open_coordinator_connection(self):
         """Use the direct local TCP port so the observed mapping is relevant."""
-        pending = self._pending_coordinator_connection
+        pending = getattr(self, "_pending_coordinator_connection", None)
         if pending is not None:
             self._pending_coordinator_connection = None
             return pending

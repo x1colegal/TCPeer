@@ -88,6 +88,7 @@ class Client(Server):
         self._direct_attempt_counter = 0
         self._byte_counters = {}
         self._coordinator_writer = None
+        self._pending_coordinator_connection: tuple[asyncio.StreamReader, asyncio.StreamWriter] | None = None
         self._endpoint_mapping_writers: dict[tuple[socket.AddressFamily, int], object] = {}
         self._ipv4_port_pool: list[tuple[int, int]] = []
         self._ipv6_port_pool: list[tuple[int, int]] = []
