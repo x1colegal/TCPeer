@@ -542,6 +542,32 @@ class Server:
         self._registered_port_ipv4 = self._direct_port_for(socket.AF_INET) if self._registered_ipv4 else None
         return current_ipv4, current_ipv6
 
+    async def _can_reach_coordinator_ipv6(self, local_ipv6: str) -> bool:
+        """Probe whether the coordinator is reachable over IPv6 without touching :7444."""
+        loop = asyncio.get_running_loop()
+        try:
+            results = await resolve_tcp_endpoints(
+                self.config.coordinator_address,
+                self.config.coordinator_port,
+            )
+        except OSError:
+            return False
+        for candidate_family, socktype, protocol, _name, address in results:
+            if candidate_family != socket.AF_INET6:
+                continue
+            sock = socket.socket(candidate_family, socktype, protocol)
+            set_ipv6_prefer_public(sock)
+            sock.setblocking(False)
+            try:
+                sock.bind((local_ipv6, 0))
+                await asyncio.wait_for(loop.sock_connect(sock, address), timeout=2.0)
+                return True
+            except (OSError, asyncio.TimeoutError):
+                pass
+            finally:
+                sock.close()
+        return False
+
     async def _address_change_loop(self) -> None:
         """Reconnect when a usable physical address appears or changes."""
         initial_ipv4 = self._direct_bind_ipv4
@@ -559,6 +585,13 @@ class Server:
                     initial_ipv6 or "none", current_ipv6 or "none",
                 )
                 raise ConnectionError("physical direct addresses changed")
+            if current_ipv6 and not self._registered_ipv6:
+                if await self._can_reach_coordinator_ipv6(current_ipv6):
+                    LOG.warning(
+                        "Coordinator IPv6 reachable again (local=%s); reconnecting to register IPv6",
+                        current_ipv6,
+                    )
+                    raise ConnectionError("coordinator IPv6 reachable again")
 
     async def _control_session(self) -> None:
         self._refresh_direct_bind_addresses()
