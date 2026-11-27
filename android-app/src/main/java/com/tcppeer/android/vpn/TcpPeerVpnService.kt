@@ -1177,6 +1177,7 @@ class TcpPeerVpnService : VpnService() {
         } catch (error: Exception) {
             Log.w(TAG, "Direct mesh connection to $peerId failed", error)
             meshConnecting.remove(peerId)
+            prepareDirectListener(activeDirectPorts[family] ?: config.directPort, family)
             return
         }
         try {

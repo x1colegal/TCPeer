@@ -2,6 +2,11 @@
 
 All notable changes to TCPeer are documented in this file.
 
+## [1.0-beta.120] - 2026-11-27
+
+### Fixed
+- Restore the passive `DirectListener` in `connectMeshPeer` whenever `openActiveDirect` fails after closing a conflicting listener (`TcpPeerVpnService.kt`), fixing permanent loss of the IPv6 listener on older kernels (such as GT-P5200) during local mesh punches.
+
 ## [1.0-beta.119] - 2026-11-27
 
 ### Fixed
