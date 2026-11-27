@@ -2,6 +2,11 @@
 
 All notable changes to TCPeer are documented in this file.
 
+## [1.0-beta.119] - 2026-11-27
+
+### Fixed
+- Forbid coordinator connection fallback to IPv4 whenever both local IPv6 and coordinator IPv6 are available (`server.py` and `TcpPeerVpnService.kt`), enforcing TCPeer's strict IPv6-only-when-available policy.
+
 ## [1.0-beta.118] - 2026-11-20
 
 ### Changed

@@ -1154,10 +1154,14 @@ class Server:
             self.config.coordinator_address,
             self.config.coordinator_port,
         )
-        # Try TCP6 first even when no address was configured explicitly. Binding
-        # to :: lets the kernel select the usable local source address. The
-        # coordinator's observed public address is advertised separately.
-        preferred = [socket.AF_INET6, socket.AF_INET]
+        # Enforce TCPeer's no-IPv4-fallback policy: whenever this host has a
+        # usable local IPv6 address and the coordinator resolves to IPv6, only
+        # attempt IPv6 and never fall back to IPv4.
+        has_coord_ipv6 = any(candidate_family == socket.AF_INET6 for candidate_family, *_ in results)
+        if self._direct_bind_ipv6 and has_coord_ipv6:
+            preferred = [socket.AF_INET6]
+        else:
+            preferred = [socket.AF_INET6, socket.AF_INET]
         last_error: OSError | None = None
         for family in preferred:
             local_address = self._direct_bind_ipv6 if family == socket.AF_INET6 else self._direct_bind_ipv4

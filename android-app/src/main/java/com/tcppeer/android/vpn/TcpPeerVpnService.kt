@@ -1840,10 +1840,18 @@ class TcpPeerVpnService : VpnService() {
         preferIpv6: Boolean,
         physicalNetwork: Network?,
     ): Socket {
-        val addresses = resolveCoordinatorAddresses(
+        val resolved = resolveCoordinatorAddresses(
             config.coordinatorAddress, physicalNetwork,
-        ).sortedBy {
-            if (preferIpv6) if (it is Inet6Address) 0 else 1 else if (it is Inet4Address) 0 else 1
+        )
+        val ipv6Addresses = resolved.filterIsInstance<Inet6Address>()
+        // Enforce TCPeer's no-IPv4-fallback policy: when local IPv6 and
+        // coordinator IPv6 are both available, never fall back to IPv4.
+        val addresses = if (preferIpv6 && ipv6Addresses.isNotEmpty()) {
+            ipv6Addresses
+        } else {
+            resolved.sortedBy {
+                if (preferIpv6) if (it is Inet6Address) 0 else 1 else if (it is Inet4Address) 0 else 1
+            }
         }
         var lastError: Exception? = null
         val maxAttempts = 12
