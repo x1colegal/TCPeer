@@ -2,7 +2,7 @@ import asyncio
 import struct
 import unittest
 
-from tcppeer.packet import build_tcp_reset
+from tcppeer.packet import build_tcp_reset, is_tcp_syn
 from tcppeer.protocol import ProtocolError, encode_data, encode_data_plane_control, encode_tpp_control, read_data
 from tcppeer.ra import internet_checksum
 
@@ -137,6 +137,17 @@ class RawIpEncodingTests(unittest.TestCase):
         self.assertEqual(seq, 0)
         self.assertEqual(ack, 2001)
         self.assertEqual(rst[53], 0x14)  # RST | ACK
+
+    def test_is_tcp_syn_distinguishes_syn_from_ack(self):
+        src_ip = b"\x20\x01\x0d\xb8" + b"\x00" * 12
+        dst_ip = b"\x20\x01\x0d\xb8" + b"\x01" * 12
+        syn_tcp = bytearray(20)
+        struct.pack_into("!HHIIBBHHH", syn_tcp, 0, 54321, 443, 2000, 0, 5 << 4, 0x02, 65535, 0, 0)
+        ack_tcp = bytearray(20)
+        struct.pack_into("!HHIIBBHHH", ack_tcp, 0, 54321, 443, 2001, 1, 5 << 4, 0x10, 65535, 0, 0)
+        ip = struct.pack("!IHBB16s16s", 6 << 28, 20, 6, 64, src_ip, dst_ip)
+        self.assertTrue(is_tcp_syn(ip + bytes(syn_tcp)))
+        self.assertFalse(is_tcp_syn(ip + bytes(ack_tcp)))
 
 
 if __name__ == "__main__":

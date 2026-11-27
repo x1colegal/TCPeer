@@ -26,7 +26,7 @@ from tcppeer.auth import authentication_proof, proof_matches
 from tcppeer.dhcp import DhcpServer
 from tcppeer.dns import discover_upstream_dns
 from tcppeer.exit_node import ExitNodeFirewall
-from tcppeer.packet import build_dhcp_packet, build_tcp_reset, extract_dhcp_payload
+from tcppeer.packet import build_dhcp_packet, build_tcp_reset, extract_dhcp_payload, is_tcp_syn
 from tcppeer.protocol import ControlMessage, ProtocolError, encode_data, encode_data_plane_control, encode_tpp_control, read_control, read_data
 from tcppeer.ra import ALL_NODES, build_router_advertisement, ipv6_source, is_router_solicitation
 from tcppeer.pd import PrefixDelegationClient, discover_ipv6_upstream, router_address, slaac_subnet
@@ -1825,7 +1825,13 @@ class Server:
                 self._queue_peer_data(peer_id, writer, packet)
             else:
                 dest_peer = self._destination_peer(packet)
-                if (dest_peer is not None and dest_peer not in self.direct_writers) or self._is_overlay_destination(packet):
+                if (
+                    (
+                        (dest_peer is not None and dest_peer not in self.direct_writers)
+                        or self._is_overlay_destination(packet)
+                    )
+                    and not is_tcp_syn(packet)
+                ):
                     rst = build_tcp_reset(packet)
                     if rst is not None:
                         try:

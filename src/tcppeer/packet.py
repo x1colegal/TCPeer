@@ -17,6 +17,25 @@ class PacketError(ValueError):
     """Raised for malformed inner IP packets."""
 
 
+def is_tcp_syn(packet: bytes) -> bool:
+    """Return True when *packet* is an initial TCP SYN (SYN=1, ACK=0)."""
+    if not packet:
+        return False
+    version = packet[0] >> 4
+    if version == 4:
+        if len(packet) < 40:
+            return False
+        ihl = (packet[0] & 0x0F) * 4
+        if ihl < 20 or len(packet) < ihl + 20 or packet[9] != IPPROTO_TCP:
+            return False
+        return (packet[ihl + 13] & 0x12) == 0x02
+    if version == 6:
+        if len(packet) < 60 or packet[6] != IPPROTO_TCP:
+            return False
+        return (packet[53] & 0x12) == 0x02
+    return False
+
+
 def build_tcp_reset(packet: bytes) -> bytes | None:
     """Generate an RFC 793 TCP RST packet replying to *packet*, or None if not applicable."""
     if not packet:
