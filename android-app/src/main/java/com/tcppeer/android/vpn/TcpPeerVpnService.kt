@@ -179,6 +179,14 @@ class TcpPeerVpnService : VpnService() {
         }
     }
 
+    private fun selectStableLinkAddresses(linkAddresses: List<android.net.LinkAddress>): List<android.net.LinkAddress> {
+        val nonTemp = linkAddresses.filter { (it.flags and 0x49) == 0 }
+        val nonIpv6 = nonTemp.filterNot { TransportPolicy.isUsableIpv6(it.address) }
+        val usableIpv6 = nonTemp.filter { TransportPolicy.isUsableIpv6(it.address) }
+        val preferredIpv6 = usableIpv6.filter { (it.flags and 0x20) == 0 }
+        return nonIpv6 + preferredIpv6.ifEmpty { usableIpv6 }
+    }
+
     private fun handleUnderlyingNetwork(network: Network, linkProperties: LinkProperties, reason: String) {
             val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return
             if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return
@@ -195,7 +203,7 @@ class TcpPeerVpnService : VpnService() {
             }
             physicalLanAddresses = lanAddrs
             physicalLanPrefixes = lanPrefixList
-            val stableLinks = linkProperties.linkAddresses.filter { (it.flags and 0x21) == 0 }
+            val stableLinks = selectStableLinkAddresses(linkProperties.linkAddresses)
             val addresses = stableLinks.map { it.address }
             val (ipv4, ipv6) = TransportPolicy.localAddresses(addresses)
             // Track reachability changes without treating an IPv6 privacy-IID
@@ -485,14 +493,19 @@ class TcpPeerVpnService : VpnService() {
         }
         val activeLinkProperties = physicalNetwork?.let(connectivityManager::getLinkProperties)
         val allLinkAddresses = activeLinkProperties?.linkAddresses.orEmpty()
-        val stableLinkAddresses = allLinkAddresses.filter { (it.flags and 0x21) == 0 }
+        val stableLinkAddresses = selectStableLinkAddresses(allLinkAddresses)
         val activeAddresses = stableLinkAddresses.map { it.address } +
             TransportPolicy.clatIpv4Addresses()
         val (localIpv4, localIpv6) = TransportPolicy.localAddresses(activeAddresses)
+        val rawLinkFlags = if (localIpv6.isEmpty()) {
+            " rawLinks=[${allLinkAddresses.joinToString { "${it.address.hostAddress}(flags=0x${it.flags.toString(16)})" }}]"
+        } else {
+            ""
+        }
         Log.i(
             TAG,
             "Endpoint discovery network=$physicalNetwork IPv4=${localIpv4.joinToString { it.hostAddress.orEmpty() }} " +
-                "IPv6=${localIpv6.joinToString { it.hostAddress?.substringBefore('%').orEmpty() }}",
+                "IPv6=${localIpv6.joinToString { it.hostAddress?.substringBefore('%').orEmpty() }}$rawLinkFlags",
         )
         val coordinator = publishCoordinatorSocket(
             generation,

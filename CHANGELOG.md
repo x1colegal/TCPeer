@@ -2,6 +2,11 @@
 
 All notable changes to TCPeer are documented in this file.
 
+## [1.0-beta.121] - 2026-11-27
+
+### Fixed
+- Prefer non-deprecated stable IPv6 addresses (`selectStableLinkAddresses`) in `TcpPeerVpnService.kt`, falling back to valid non-temporary addresses instead of dropping IPv6 completely when a stable IPv6 address is marked deprecated, and log raw `LinkAddress` flags when IPv6 discovery is empty.
+
 ## [1.0-beta.120] - 2026-11-27
 
 ### Fixed
