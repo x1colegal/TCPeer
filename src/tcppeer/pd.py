@@ -155,7 +155,39 @@ class PrefixDelegationClient:
         self.duid = _duid()
         self.iaid = socket.if_nametoindex(interface)
 
-    async def acquire(self, timeout: float = 5.0) -> DelegatedPrefix | None:
+    async def _recv_matching(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        sock: socket.socket,
+        transaction: bytes,
+        expected_kind: int,
+        timeout: float,
+    ) -> DelegatedPrefix | None:
+        deadline = loop.time() + timeout
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return None
+            try:
+                packet, _ = await asyncio.wait_for(
+                    loop.sock_recvfrom(sock, 65535),
+                    remaining,
+                )
+            except asyncio.TimeoutError:
+                return None
+
+            if not packet or packet[0] != expected_kind:
+                continue
+
+            parsed = _parse_pd(packet, transaction)
+            if parsed is not None:
+                return parsed
+
+    async def acquire(
+        self,
+        timeout: float = 3.0,
+        attempts: int = 3,
+    ) -> DelegatedPrefix | None:
         loop = asyncio.get_running_loop()
         sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
         sock.setblocking(False)
@@ -176,51 +208,47 @@ class PrefixDelegationClient:
                 socket.if_nametoindex(self.interface),
             )
 
-            transaction = os.urandom(3)
-            solicit = _message(SOLICIT, transaction, self.duid, self.iaid)
+            total_attempts = max(1, attempts)
+            for attempt in range(1, total_attempts + 1):
+                transaction = os.urandom(3)
+                solicit = _message(SOLICIT, transaction, self.duid, self.iaid)
 
-            await loop.sock_sendto(sock, solicit, destination)
+                await loop.sock_sendto(sock, solicit, destination)
 
-            try:
-                packet, _ = await asyncio.wait_for(
-                    loop.sock_recvfrom(sock, 65535),
-                    timeout,
+                advertised = await self._recv_matching(
+                    loop, sock, transaction, ADVERTISE, timeout
                 )
-            except asyncio.TimeoutError:
-                return None
+                if advertised is None:
+                    if attempt < total_attempts:
+                        await asyncio.sleep(0.5)
+                    continue
 
-            advertised = _parse_pd(packet, transaction)
-            if advertised is None:
-                return None
-
-            transaction = os.urandom(3)
-            request = _message(
-                REQUEST,
-                transaction,
-                self.duid,
-                self.iaid,
-                advertised.server_id,
-            )
-            await loop.sock_sendto(sock, request, destination)
-
-            try:
-                packet, _ = await asyncio.wait_for(
-                    loop.sock_recvfrom(sock, 65535),
-                    timeout,
+                transaction = os.urandom(3)
+                request = _message(
+                    REQUEST,
+                    transaction,
+                    self.duid,
+                    self.iaid,
+                    advertised.server_id,
                 )
-            except asyncio.TimeoutError:
-                return None
+                await loop.sock_sendto(sock, request, destination)
 
-            delegated = _parse_pd(packet, transaction)
-            if delegated is None or packet[0] != REPLY:
-                return None
+                delegated = await self._recv_matching(
+                    loop, sock, transaction, REPLY, timeout
+                )
+                if delegated is None:
+                    if attempt < total_attempts:
+                        await asyncio.sleep(0.5)
+                    continue
 
-            LOG.info(
-                "DHCPv6-PD acquired %s from upstream interface %s",
-                delegated.prefix,
-                self.interface,
-            )
-            return delegated
+                LOG.info(
+                    "DHCPv6-PD acquired %s from upstream interface %s",
+                    delegated.prefix,
+                    self.interface,
+                )
+                return delegated
+
+            return None
 
         except (OSError, ValueError) as exc:
             LOG.warning(

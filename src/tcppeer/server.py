@@ -287,6 +287,7 @@ class Server:
         self._active_server_ipv6 = config.server_ipv6
         self._pd_active = False
         self._pd_interface: str | None = None
+        self._pd_consecutive_failures = 0
 
     def _registration_role(self) -> str:
         return "Exit-Node"
@@ -2108,6 +2109,7 @@ class Server:
         self._active_ipv6_prefix = subnet
         self._active_server_ipv6 = router_address(subnet)
         self._pd_active = True
+        self._pd_consecutive_failures = 0
         self.exit_node.nat66_enabled = False
         self.exit_node.ipv6_overlay_prefix = subnet
         self.exit_node.ipv6_overlay_address = self._active_server_ipv6
@@ -2121,56 +2123,72 @@ class Server:
         self._active_ipv6_prefix = self.config.ipv6_prefix
         self._active_server_ipv6 = self.config.server_ipv6
         self._pd_active = False
+        self._pd_consecutive_failures = 0
         self.exit_node.nat66_enabled = self.config.nat66
         self.exit_node.ipv6_overlay_prefix = self.config.ipv6_prefix
         self.exit_node.ipv6_overlay_address = self._active_server_ipv6
 
     async def _pd_loop(self) -> None:
+        max_consecutive_failures = 3
         while True:
             await asyncio.sleep(60)
+            await self._refresh_pd_once(max_consecutive_failures)
 
-            interface = discover_ipv6_upstream({self.tun.name})
-            if interface is None:
-                if self._pd_active:
-                    LOG.warning("IPv6 upstream disappeared; enabling NAPT66 fallback")
-                    await self._switch_to_ipv6_fallback()
-                continue
+    async def _refresh_pd_once(self, max_consecutive_failures: int = 3) -> None:
+        interface = discover_ipv6_upstream({self.tun.name})
+        if interface is None:
+            if self._pd_active:
+                LOG.warning("IPv6 upstream disappeared; enabling NAPT66 fallback")
+                await self._switch_to_ipv6_fallback()
+            return
 
-            delegated = await PrefixDelegationClient(interface).acquire()
-            subnet = slaac_subnet(delegated.prefix) if delegated else None
+        delegated = await PrefixDelegationClient(interface).acquire()
+        subnet = slaac_subnet(delegated.prefix) if delegated else None
 
-            if subnet is None:
-                if self._pd_active:
+        if subnet is None:
+            if self._pd_active:
+                self._pd_consecutive_failures += 1
+                if self._pd_consecutive_failures < max_consecutive_failures:
                     LOG.warning(
-                        "DHCPv6-PD is no longer available; enabling NAPT66 fallback"
+                        "DHCPv6-PD renewal failed (%d/%d); keeping delegated prefix %s",
+                        self._pd_consecutive_failures,
+                        max_consecutive_failures,
+                        self._active_ipv6_prefix,
                     )
-                    await self._switch_to_ipv6_fallback()
-                continue
+                    return
+                LOG.warning(
+                    "DHCPv6-PD is no longer available after %d consecutive failures; enabling NAPT66 fallback",
+                    self._pd_consecutive_failures,
+                )
+                await self._switch_to_ipv6_fallback()
+            return
 
-            if self._pd_active and subnet == self._active_ipv6_prefix:
-                continue
+        self._pd_consecutive_failures = 0
 
-            LOG.info("Switching TCPeer SLAAC to delegated prefix %s", subnet)
+        if self._pd_active and subnet == self._active_ipv6_prefix:
+            return
 
-            self._active_ipv6_prefix = subnet
-            self._active_server_ipv6 = router_address(subnet)
-            self._pd_active = True
-            self._pd_interface = interface
+        LOG.info("Switching TCPeer SLAAC to delegated prefix %s", subnet)
 
-            self.tun.configure(
-                str(self.config.server_ipv4),
-                self.config.ipv4_subnet.prefixlen,
-                str(self._active_server_ipv6),
-                self._active_ipv6_prefix.prefixlen,
-            )
+        self._active_ipv6_prefix = subnet
+        self._active_server_ipv6 = router_address(subnet)
+        self._pd_active = True
+        self._pd_interface = interface
 
-            self.exit_node.nat66_enabled = False
-            self.exit_node.ipv6_overlay_prefix = subnet
-            self.exit_node.ipv6_overlay_address = self._active_server_ipv6
-            self.exit_node.apply()
+        self.tun.configure(
+            str(self.config.server_ipv4),
+            self.config.ipv4_subnet.prefixlen,
+            str(self._active_server_ipv6),
+            self._active_ipv6_prefix.prefixlen,
+        )
 
-            await self._announce_overlay_update()
-            await self._broadcast_direct(self._ra_packet())
+        self.exit_node.nat66_enabled = False
+        self.exit_node.ipv6_overlay_prefix = subnet
+        self.exit_node.ipv6_overlay_address = self._active_server_ipv6
+        self.exit_node.apply()
+
+        await self._announce_overlay_update()
+        await self._broadcast_direct(self._ra_packet())
 
     async def _switch_to_ipv6_fallback(self) -> None:
         self._use_ipv6_fallback()
